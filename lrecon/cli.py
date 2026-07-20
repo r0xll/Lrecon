@@ -48,8 +48,8 @@ def main() -> None:
     ap.add_argument("-c", "--concurrency", type=int, default=50)
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("-o", "--out", default="lrecon",
-                    help="output basename — a UTC date/hour stamp is appended so "
-                         "reruns don't overwrite prior output (<basename>_YYYYMMDD_HH.*)")
+                    help="output basename — a UTC timestamp is appended so "
+                         "reruns don't overwrite prior output (<basename>_YYYYMMDD_HHMMSS.*)")
     args = ap.parse_args()
 
     if args.check_backends:
@@ -94,7 +94,7 @@ def main() -> None:
     res = asyncio.run(run(args.domains, args, keys))
     hosts = res["hosts"]
 
-    out_base = f"{args.out}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H')}"
+    out_base = f"{args.out}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     json_path = f"{out_base}.json"
     md_path = f"{out_base}.md"
     html_path = f"{out_base}.html"
