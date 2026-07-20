@@ -53,8 +53,13 @@ lrecon --check-backends --check-active   # also let naabu/nuclei test-scan scanm
 
 `--check-backends` runs each detected tool and reports whether its output parsed
 into the expected fields — if a binary is present but shows `RAN=no`, its output
-format has drifted and the parser in `backends.py` needs a key update. Note: PD's `httpx` binary is auto-distinguished from the Python
-`httpx` library's CLI via a version check, so a name collision won't mis-fire.
+format has drifted and the parser in `backends.py` needs a key update.
+
+**httpx name collision:** the Python `httpx` library ships its own `httpx` CLI that
+shadows ProjectDiscovery's binary inside a venv. LRecon handles this automatically —
+it scans PATH *and* Go install locations (`$GOBIN`, `$GOPATH/bin`, `~/go/bin`) and
+verifies each candidate via `-version`, so it uses the real PD binary without any
+renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 
 ---
 
