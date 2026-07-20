@@ -287,8 +287,18 @@ async def run(domains, args, keys) -> list:
             elif not backends.have("nuclei"):
                 log("[!] --nuclei set but nuclei binary not on PATH — skipping")
 
-    # ---- Diff vs previous run ----
     host_list = sorted(hosts.values(), key=lambda h: h.subdomain)
+
+    # ---- Entry-point summary (red-team signal: what to chase first) ----
+    entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings, nuclei)
+    if entry_points:
+        log(f"[!] {len(entry_points)} potential entry point(s) identified:")
+        for ep in entry_points:
+            log(f"    [ENTRY POINT] [{ep['severity'].upper()}] {ep['target']} — {ep['summary']}")
+    else:
+        log("[+] no high-confidence entry points identified this pass")
+
+    # ---- Diff vs previous run ----
     diff = {}
     if args.diff:
         diff = diff_snapshot(load_prev_snapshot(domains), host_list)
@@ -297,6 +307,6 @@ async def run(domains, args, keys) -> list:
     return {"hosts": host_list, "per_source": dict(per_source), "cf": cf,
             "email": email, "github": github_findings, "buckets": buckets,
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
-            "nuclei": nuclei, "diff": diff}
+            "nuclei": nuclei, "diff": diff, "entry_points": entry_points}
 
 

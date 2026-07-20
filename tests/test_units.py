@@ -56,6 +56,28 @@ def test_in_cf_range_membership():
     assert intel.in_cf("8.8.8.8", nets) is False        # Google DNS
 
 
+def test_summarize_entry_points_ranks_critical_first():
+    hosts = [
+        Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com",
+             takeover="Dangling CNAME -> dev.x.com.s3.amazonaws.com (s3.amazonaws.com); "
+                      "unclaimed-service signature matched"),
+        Host("legacy.x.com", vulns=["CVE-2026-1"]),
+    ]
+    cf = {"detected": True, "candidates": {"1.2.3.4": {"confirmed": True, "evidence": "e"}}}
+    buckets = [{"name": "x-backup", "provider": "s3", "url": "https://x-backup.s3.amazonaws.com",
+                "status": 200, "public": True}]
+    eps = intel.summarize_entry_points(hosts, cf, buckets, {}, [], [])
+    assert [e["type"] for e in eps][0] == "subdomain-takeover"
+    assert eps[0]["severity"] == "critical"
+    assert {"cloudflare-origin-bypass", "public-bucket", "known-cve"} <= {e["type"] for e in eps}
+
+
+def test_summarize_entry_points_empty_when_nothing_found():
+    hosts = [Host("a.x.com")]
+    cf = {"detected": False, "candidates": {}}
+    assert intel.summarize_entry_points(hosts, cf, [], {}, [], []) == []
+
+
 async def test_cloudflare_origin_detects_unproxied_leak():
     nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
     hosts = {

@@ -281,3 +281,71 @@ async def hibp_breaches(client, domain: str) -> list:
     return out
 
 
+
+# --------------------------------------------------------------------------- #
+# Entry-point summary — the highest-signal findings, ranked, across all phases
+# --------------------------------------------------------------------------- #
+ENTRY_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) -> list:
+    """
+    Pull the findings that represent a likely initial-access vector out of the
+    full result set into one ranked list, so they're stated explicitly instead
+    of only implied by per-phase stats. Each entry: type, target, severity,
+    summary, attck (ATT&CK technique).
+    """
+    out = []
+
+    for h in hosts:
+        if h.takeover:
+            sev = "critical" if "unclaimed-service signature matched" in h.takeover else "high"
+            out.append({"type": "subdomain-takeover", "target": h.subdomain, "severity": sev,
+                       "summary": h.takeover, "attck": "T1584.001"})
+
+    if cf.get("detected"):
+        for ip, v in cf.get("candidates", {}).items():
+            if v["confirmed"]:
+                out.append({"type": "cloudflare-origin-bypass", "target": ip, "severity": "high",
+                           "summary": f"Origin IP reachable outside Cloudflare — WAF/DDoS bypass "
+                                      f"({v['evidence']})",
+                           "attck": "T1590.005"})
+
+    for b in buckets:
+        if b["public"]:
+            out.append({"type": "public-bucket", "target": b["name"], "severity": "high",
+                       "summary": f"{b['provider']} bucket publicly listable at {b['url']}",
+                       "attck": "T1530"})
+
+    for n in (nuclei or []):
+        sev = (n.get("severity") or "").lower()
+        if sev in ("critical", "high"):
+            out.append({"type": "nuclei-finding", "target": n.get("host") or "?", "severity": sev,
+                       "summary": f"{n.get('name') or n.get('template')} "
+                                  f"({n.get('cve') or 'no CVE'}) at {n.get('matched')}",
+                       "attck": "T1190"})
+
+    for h in hosts:
+        if h.vulns:
+            out.append({"type": "known-cve", "target": h.subdomain, "severity": "medium",
+                       "summary": f"{len(h.vulns)} reported CVE(s): {', '.join(h.vulns[:5])}",
+                       "attck": "T1190"})
+
+    for d, bs in (breach or {}).items():
+        if bs:
+            out.append({"type": "breach-exposure", "target": d, "severity": "medium",
+                       "summary": f"{len(bs)} known breach(es) — password-spray candidate list",
+                       "attck": "T1110.003"})
+
+    if github_findings:
+        repos = sorted({g["repo"] for g in github_findings if g.get("repo")})
+        out.append({"type": "github-code-exposure",
+                   "target": ", ".join(repos[:5]) + ("…" if len(repos) > 5 else ""),
+                   "severity": "medium",
+                   "summary": f"{len(github_findings)} public code hit(s) referencing scope across "
+                              f"{len(repos)} repo(s) — review for leaked credentials",
+                   "attck": "T1593.003"})
+
+    out.sort(key=lambda e: ENTRY_SEVERITY_ORDER.get(e["severity"], 9))
+    return out
+
