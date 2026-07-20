@@ -42,8 +42,14 @@ async def run(domains, args, keys) -> list:
     headers = {"User-Agent": "lrecon/2.2 (authorized-assessment)"}
     shodan_limiter = RateLimiter(per_second=1.0)
 
-    async with httpx.AsyncClient(limits=limits, headers=headers, verify=False,
-                                follow_redirects=False) as client:
+    # `client` verifies certs — used for calls to trusted third-party APIs (Shodan,
+    # IPinfo, GitHub, HIBP, NVD, crt.sh, etc.), several of which carry API keys/tokens.
+    # `probe_client` skips verification — needed when touching engagement targets
+    # directly (self-signed / mismatched certs are common there).
+    async with httpx.AsyncClient(limits=limits, headers=headers, verify=True,
+                                follow_redirects=False) as client, \
+              httpx.AsyncClient(limits=limits, headers=headers, verify=False,
+                                follow_redirects=False) as probe_client:
 
         if shodan_key:
             try:
@@ -158,11 +164,11 @@ async def run(domains, args, keys) -> list:
                             except Exception:
                                 pass
                     if h.cname:                          # takeover still needs body match
-                        await takeover_check_host(client, h)
+                        await takeover_check_host(probe_client, h)
                 else:
-                    await http_probe(client, h)
+                    await http_probe(probe_client, h)
                     if h.http_status and h.scheme and h.favicon_hash is None:
-                        h.favicon_hash = await favicon_hash(client, f"{h.scheme}://{h.subdomain}")
+                        h.favicon_hash = await favicon_hash(probe_client, f"{h.scheme}://{h.subdomain}")
                 return h
             await _gather_with_progress((do_active(h) for h in active_hosts),
                                         "probing", use_prog)
@@ -173,7 +179,7 @@ async def run(domains, args, keys) -> list:
         if not args.no_cf_origin and not args.passive_only:
             cf_nets = await load_cf_ranges(client)
             cf = await cloudflare_origin_analysis(
-                client, domains, hosts, keys, cf_nets,
+                client, probe_client, domains, hosts, keys, cf_nets,
                 active=not args.passive_only, resolver_ns=ns)
             if cf["detected"]:
                 conf = sum(1 for v in cf["candidates"].values() if v["confirmed"])

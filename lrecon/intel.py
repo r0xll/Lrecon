@@ -33,7 +33,7 @@ def in_cf(ip: str, nets) -> bool:
         return False
 
 
-async def cloudflare_origin_analysis(client, domains, hosts, keys, cf_nets,
+async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys, cf_nets,
                                      active, resolver_ns) -> dict:
     """
     Passive candidate collection + optional active confirmation.
@@ -42,6 +42,10 @@ async def cloudflare_origin_analysis(client, domains, hosts, keys, cf_nets,
       * SPF ip4:/ip6: literals and MX host IPs on the apex
       * Shodan cert search: ssl.cert.subject.CN:"domain" -> non-CF IPs
     Confirmation (active, touches candidate IP): spoofed Host header.
+
+    `client` (cert-verified) is used for the Shodan API lookup; `probe_client`
+    (unverified) is used to touch candidate origin IPs directly, since those
+    rarely present a cert matching the spoofed Host header.
     """
     result = {"detected": False, "fronted": [], "candidates": {}}
 
@@ -112,7 +116,7 @@ async def cloudflare_origin_analysis(client, domains, hosts, keys, cf_nets,
         for ip in list(cands):
             for scheme in ("https", "http"):
                 try:
-                    r = await client.get(f"{scheme}://{ip}", headers={"Host": primary},
+                    r = await probe_client.get(f"{scheme}://{ip}", headers={"Host": primary},
                                         timeout=8, follow_redirects=False)
                     server = (r.headers.get("server") or "").lower()
                     if r.status_code < 500 and "cloudflare" not in server:
