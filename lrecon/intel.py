@@ -290,11 +290,12 @@ _CVSS_SEVERITY = ((9.0, "critical"), (7.0, "high"), (4.0, "medium"))
 
 
 def _cve_severity(cvss) -> str:
-    if cvss is not None:
-        for threshold, sev in _CVSS_SEVERITY:
-            if cvss >= threshold:
-                return sev
-    return "medium"                                  # no CVSS data (e.g. Shodan/InternetDB vulns list)
+    if cvss is None:
+        return "medium"                              # no CVSS data (e.g. Shodan/InternetDB vulns list)
+    for threshold, sev in _CVSS_SEVERITY:
+        if cvss >= threshold:
+            return sev
+    return "low"
 
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) -> list:
