@@ -1,0 +1,160 @@
+from __future__ import annotations
+import asyncio, base64, ipaddress, json
+import httpx
+from .common import *
+
+# --------------------------------------------------------------------------- #
+# Phase 3 — enrichment per UNIQUE IP
+# --------------------------------------------------------------------------- #
+async def enrich_ipinfo(client, ip, token) -> dict:
+    """ASN / org / reverse-DNS / geo. Reliable regardless of scan coverage."""
+    url = f"https://ipinfo.io/{ip}/json" + (f"?token={token}" if token else "")
+    try:
+        r = await client.get(url, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
+
+
+async def enrich_shodan_host(client, ip, key, limiter) -> dict:
+    for attempt in range(3):
+        await limiter.wait()
+        try:
+            r = await client.get(f"https://api.shodan.io/shodan/host/{ip}?key={key}", timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            return {}
+        except Exception:
+            return {}
+    return {}
+
+
+async def enrich_internetdb(client, ip) -> dict:
+    try:
+        r = await client.get(f"https://internetdb.shodan.io/{ip}", timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return {}
+
+
+def apply_ipinfo(h: Host, data: dict) -> None:
+    if not data:
+        return
+    h.enrich_src.add("ipinfo")
+    h.source.add("ipinfo")
+    org = data.get("org")                           # e.g. "AS15169 Google LLC"
+    if org:
+        parts = org.split(" ", 1)
+        if parts[0].startswith("AS"):
+            h.asn = parts[0]
+            h.org = h.org or (parts[1] if len(parts) > 1 else org)
+        else:
+            h.org = h.org or org
+    h.rdns = h.rdns or data.get("hostname")
+    h.country = h.country or data.get("country")
+
+
+def apply_ports(h: Host, data: dict, src: str) -> None:
+    if not data:
+        return
+    h.enrich_src.add(src)
+    h.source.add(src)
+    h.ports = sorted(set(h.ports) | set(data.get("ports", [])))
+    h.vulns = sorted(set(h.vulns) | set(data.get("vulns", []) or []))
+    if src == "shodan":
+        h.isp = h.isp or data.get("isp")
+        h.org = h.org or data.get("org")
+    else:
+        h.cpes = sorted(set(h.cpes) | set(data.get("cpes", [])))
+
+
+
+# --------------------------------------------------------------------------- #
+# Favicon hashing (Shodan-compatible mmh3) + pivot
+# --------------------------------------------------------------------------- #
+def _favicon_mmh3(content: bytes) -> int:
+    import base64
+    try:
+        import mmh3
+    except Exception:
+        return None
+    return mmh3.hash(base64.encodebytes(content))
+
+
+async def favicon_hash(client, base_url: str):
+    try:
+        r = await client.get(base_url.rstrip("/") + "/favicon.ico", timeout=10,
+                            follow_redirects=True)
+        if r.status_code == 200 and r.content:
+            return _favicon_mmh3(r.content)
+    except Exception:
+        pass
+    return None
+
+
+async def shodan_favicon_pivot(client, fhash: int, key: str, cf_nets) -> list:
+    if not key:
+        return []
+    try:
+        r = await client.get("https://api.shodan.io/shodan/host/search",
+                            params={"key": key, "query": f"http.favicon.hash:{fhash}"},
+                            timeout=25)
+        if r.status_code == 200:
+            return [m.get("ip_str") for m in r.json().get("matches", [])
+                    if m.get("ip_str") and not in_cf(m["ip_str"], cf_nets)]
+    except Exception:
+        pass
+    return []
+
+
+
+# --------------------------------------------------------------------------- #
+# NVD CVE enrichment (CPE -> CVE, keyless, cached)
+# --------------------------------------------------------------------------- #
+def _cpe23(cpe: str) -> str:
+    """Best-effort CPE 2.2 -> 2.3 for NVD virtualMatchString."""
+    if cpe.startswith("cpe:2.3:"):
+        return cpe
+    if cpe.startswith("cpe:/"):
+        body = cpe[5:]
+        parts = body.split(":")
+        parts += ["*"] * (11 - len(parts))
+        return "cpe:2.3:" + ":".join(parts)
+    return cpe
+
+
+async def nvd_lookup(client, cpe: str, cache: dict, limiter) -> list:
+    key = _cpe23(cpe)
+    if key in cache:
+        return cache[key]
+    await limiter.wait()
+    out = []
+    try:
+        r = await client.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                            params={"virtualMatchString": key, "resultsPerPage": 20},
+                            timeout=30)
+        if r.status_code == 200:
+            for v in r.json().get("vulnerabilities", []):
+                cve = v.get("cve", {})
+                cid = cve.get("id")
+                score = None
+                metrics = cve.get("metrics", {})
+                for mk in ("cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+                    if metrics.get(mk):
+                        score = metrics[mk][0]["cvssData"]["baseScore"]
+                        break
+                if cid:
+                    out.append({"id": cid, "cvss": score})
+    except Exception:
+        pass
+    cache[key] = out
+    return out
+
+

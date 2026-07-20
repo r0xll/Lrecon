@@ -1,0 +1,20 @@
+# python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.DS_Store
+
+# recon output artifacts (default basename)
+/lrecon.json
+/lrecon.md
+/lrecon.html
+/lrecon.live.txt
+*_shots/
+
+# local secrets / config
+config.json
+.env
