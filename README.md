@@ -254,6 +254,17 @@ subdomain takeover ~T1584.001.
 
 ---
 
+## Development
+
+```fish
+pip install -e '.[dev]'   # pytest + pytest-asyncio
+pytest -q                 # run the unit suite
+```
+
+Tests cover the pure-logic paths and the ProjectDiscovery backend parsers (via
+monkeypatched output) — no network required. CI runs import + `--check-backends`
++ `pytest` across Python 3.10-3.12 on every push.
+
 ## Roadmap
 
 - On-disk enrichment cache with TTL (currently only run-snapshot cache for diffing)
