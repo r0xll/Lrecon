@@ -24,6 +24,7 @@ def write_live_hosts(hosts, path) -> int:
 def write_markdown(hosts, domains, res, path) -> None:
     per_source = res.get("per_source", {})
     cf = res.get("cf", {})
+    entry_points = res.get("entry_points") or []
     live = [h for h in hosts if h.ips or h.http_status]
     vulns = [h for h in hosts if h.vulns]
     takeovers = [h for h in hosts if h.takeover]
@@ -37,8 +38,23 @@ def write_markdown(hosts, domains, res, path) -> None:
         f"- Resolving / live: **{len(live)}**",
         f"- Hosts with reported CVEs: **{len(vulns)}**",
         f"- Subdomain-takeover leads: **{len(takeovers)}**",
-        f"- Wildcard-suspect (filtered): **{len(wildcards)}**", "",
+        f"- Wildcard-suspect (filtered): **{len(wildcards)}**",
+        f"- **Potential entry points: {len(entry_points)}**", "",
     ]
+
+    if entry_points:
+        lines += ["## ⚠ Potential entry points — chase these first", "",
+                  "| Severity | Target | Finding | ATT&CK |", "|---|---|---|---|"]
+        for e in entry_points:
+            lines.append(f"| {e['severity'].upper()} | {e['target']} | {e['summary']} "
+                         f"| {e.get('attck', '—')} |")
+        lines += ["", "> Each row is a lead, not a confirmed compromise — validate per ROE "
+                  "before treating as exploitable. Detail on each is in the sections below.", ""]
+    else:
+        lines += ["## Potential entry points", "",
+                  "No high-confidence entry points identified from this pass "
+                  "(passive/keyless sources only surface leads, not confirmations).", ""]
+
     if per_source:
         lines += ["## Passive source contribution", "",
                   "| Source | In-scope hosts found |", "|---|---|"]
@@ -194,6 +210,7 @@ def write_markdown(hosts, domains, res, path) -> None:
 def write_html(hosts, domains, res, path) -> None:
     import html as _h
     cf = res.get("cf", {})
+    entry_points = res.get("entry_points") or []
     rows = []
     for h in hosts:
         if h.wildcard:
@@ -215,6 +232,15 @@ def write_html(hosts, domains, res, path) -> None:
                 for ip, v in cf["candidates"].items() if v["confirmed"]]
         cf_html = (f"<h2>Cloudflare origin exposure</h2><p>Fronts {len(cf['fronted'])} host(s). "
                    f"Confirmed origin candidates:</p><ul>{''.join(conf) or '<li>none confirmed</li>'}</ul>")
+    ep_html = "<p>No high-confidence entry points identified from this pass.</p>"
+    if entry_points:
+        ep_rows = "".join(
+            f"<tr><td>{_h.escape(e['severity'].upper())}</td><td>{_h.escape(str(e['target']))}</td>"
+            f"<td>{_h.escape(e['summary'])}</td><td>{_h.escape(e.get('attck') or '—')}</td></tr>"
+            for e in entry_points)
+        ep_html = (f"<table><tr><th>Severity</th><th>Target</th><th>Finding</th>"
+                   f"<th>ATT&amp;CK</th></tr>{ep_rows}</table>"
+                   f"<p><i>Leads, not confirmed compromises — validate per ROE.</i></p>")
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>lrecon — {_h.escape(', '.join(domains))}</title><style>
 body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;color:#1a1a1a;max-width:1100px}}
@@ -225,7 +251,9 @@ th{{background:#f4f4f4}} code{{background:#f0f0f0;padding:1px 4px}}
 tr:nth-child(even){{background:#fafafa}}</style></head><body>
 <h1>External Recon — {_h.escape(', '.join(domains))}</h1>
 <p>Authorized engagement. Hosts: {len(hosts)} · Live: {sum(1 for h in hosts if h.http_status)} ·
-Takeover leads: {len(takeovers)}</p>
+Takeover leads: {len(takeovers)} · Potential entry points: {len(entry_points)}</p>
+<h2>⚠ Potential entry points</h2>
+{ep_html}
 {('<h2>Subdomain takeover leads</h2><ul>'+to_html+'</ul>') if takeovers else ''}
 {cf_html}
 <h2>Attack surface</h2><table><tr><th>Subdomain</th><th>IP(s)</th><th>ASN/Org</th>

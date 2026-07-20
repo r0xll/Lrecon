@@ -97,7 +97,8 @@ def main() -> None:
     live_path = f"{args.out}.live.txt"
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
-                                "asn", "favicon_pivots", "nuclei", "diff", "per_source")}
+                                "asn", "favicon_pivots", "nuclei", "diff", "per_source",
+                                "entry_points")}
     full["hosts"] = [h.to_dict() for h in hosts]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
     write_markdown(hosts, args.domains, res, md_path)
@@ -113,7 +114,9 @@ def main() -> None:
             outputs.append(shot_dir + "/")
             log(f"[+] {n} screenshot(s) -> {shot_dir}/")
 
-    log(f"[+] done in {time.time()-t0:.1f}s — {len(hosts)} hosts, {n_live} live URLs")
+    n_entry = len(res.get("entry_points") or [])
+    log(f"[+] done in {time.time()-t0:.1f}s — {len(hosts)} hosts, {n_live} live URLs, "
+        f"{n_entry} potential entry point(s)")
     log(f"[+] {'  '.join(outputs)}")
 
 
