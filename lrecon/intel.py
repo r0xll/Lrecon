@@ -286,6 +286,15 @@ async def hibp_breaches(client, domain: str) -> list:
 # Entry-point summary — the highest-signal findings, ranked, across all phases
 # --------------------------------------------------------------------------- #
 ENTRY_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_CVSS_SEVERITY = ((9.0, "critical"), (7.0, "high"), (4.0, "medium"))
+
+
+def _cve_severity(cvss) -> str:
+    if cvss is not None:
+        for threshold, sev in _CVSS_SEVERITY:
+            if cvss >= threshold:
+                return sev
+    return "medium"                                  # no CVSS data (e.g. Shodan/InternetDB vulns list)
 
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) -> list:
@@ -326,10 +335,16 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) 
                        "attck": "T1190"})
 
     for h in hosts:
-        if h.vulns:
-            out.append({"type": "known-cve", "target": h.subdomain, "severity": "medium",
-                       "summary": f"{len(h.vulns)} reported CVE(s): {', '.join(h.vulns[:5])}",
-                       "attck": "T1190"})
+        nvd = h.nvd_cves or []
+        cve_ids = sorted(set(h.vulns) | {c["id"] for c in nvd if c.get("id")})
+        if not cve_ids:
+            continue
+        max_cvss = max((c["cvss"] for c in nvd if c.get("cvss") is not None), default=None)
+        cvss_note = f" (max CVSS {max_cvss})" if max_cvss is not None else ""
+        out.append({"type": "known-cve", "target": h.subdomain,
+                   "severity": _cve_severity(max_cvss),
+                   "summary": f"{len(cve_ids)} known CVE(s){cvss_note}: {', '.join(cve_ids[:5])}",
+                   "attck": "T1190"})
 
     for d, bs in (breach or {}).items():
         if bs:

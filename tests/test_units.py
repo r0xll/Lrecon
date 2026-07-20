@@ -78,6 +78,27 @@ def test_summarize_entry_points_empty_when_nothing_found():
     assert intel.summarize_entry_points(hosts, cf, [], {}, [], []) == []
 
 
+def test_summarize_entry_points_includes_nvd_only_cves():
+    # InternetDB gave CPEs but no vulns entries; --nvd found a critical CVE via CPE lookup.
+    h = Host("legacy.x.com", nvd_cves=[{"id": "CVE-2026-9999", "cvss": 9.8}])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    assert eps[0]["type"] == "known-cve"
+    assert eps[0]["severity"] == "critical"
+    assert "CVE-2026-9999" in eps[0]["summary"]
+
+
+def test_summarize_entry_points_merges_vulns_and_nvd_by_max_cvss():
+    h = Host("legacy.x.com", vulns=["CVE-2026-1"],
+             nvd_cves=[{"id": "CVE-2026-1", "cvss": 5.0}, {"id": "CVE-2026-2", "cvss": 8.5}])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    assert eps[0]["severity"] == "high"               # driven by max CVSS 8.5, not the default medium
+    assert "CVE-2026-1" in eps[0]["summary"] and "CVE-2026-2" in eps[0]["summary"]
+
+
 async def test_cloudflare_origin_detects_unproxied_leak():
     nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
     hosts = {
