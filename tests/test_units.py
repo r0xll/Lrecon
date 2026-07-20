@@ -63,7 +63,7 @@ async def test_cloudflare_origin_detects_unproxied_leak():
         "dev.x.com": Host("dev.x.com", ips=["45.79.10.20"]),   # leaked origin
     }
     res = await intel.cloudflare_origin_analysis(
-        None, ["x.com"], hosts, {}, nets, active=False, resolver_ns=None)
+        None, None, ["x.com"], hosts, {}, nets, active=False, resolver_ns=None)
     assert res["detected"] is True
     assert "x.com" in res["fronted"]
     assert "45.79.10.20" in res["candidates"]
@@ -99,7 +99,7 @@ async def test_dnsx_parse(monkeypatch):
 
 
 async def test_httpx_parse(monkeypatch):
-    monkeypatch.setattr(backends, "is_pd_httpx", lambda: True)
+    monkeypatch.setattr(backends, "pd_httpx_bin", lambda: "httpx")
     async def fake_run(cmd, stdin=None, timeout=900):
         return ('{"input":"x.com","url":"https://x.com","status_code":200,'
                 '"title":"Home","webserver":"nginx","tech":["React"],"favicon":"-9"}')
