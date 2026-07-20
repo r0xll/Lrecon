@@ -11,7 +11,9 @@ fingerprint + favicon), naabu (port scan), nuclei (templated vuln scan).
 from __future__ import annotations
 import asyncio
 import json
+import os
 import shutil
+from pathlib import Path
 
 from .common import log
 
@@ -20,17 +22,59 @@ def have(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
+_HTTPX_NAMES = ("httpx", "httpx-pd", "pdhttpx")
+
+
+def _candidate_httpx_paths() -> list:
+    """
+    Every plausible httpx executable, so we can pick the ProjectDiscovery one even
+    when a venv's `httpx` (the Python library's CLI stub) shadows it on PATH.
+
+    Order: explicit override, then PATH dirs, then Go install locations.
+    Set LRECON_HTTPX to a full path to force a specific binary.
+    """
+    override = os.environ.get("LRECON_HTTPX")
+    if override:
+        return [override]
+
+    dirs = list(os.environ.get("PATH", "").split(os.pathsep))
+    if os.environ.get("GOBIN"):
+        dirs.append(os.environ["GOBIN"])
+    for g in os.environ.get("GOPATH", "").split(os.pathsep):
+        if g:
+            dirs.append(str(Path(g) / "bin"))
+    dirs.append(str(Path.home() / "go" / "bin"))
+
+    out, seen = [], set()
+    for d in dirs:
+        if not d:
+            continue
+        for name in _HTTPX_NAMES:
+            p = Path(d) / name
+            key = str(p)
+            if key not in seen and p.is_file() and os.access(p, os.X_OK):
+                seen.add(key)
+                out.append(key)
+    return out
+
+
+def pd_httpx_bin() -> str | None:
+    """Full path to the ProjectDiscovery httpx binary, or None. Verified via -version
+    so the Python `httpx` CLI stub is never mistaken for it — no renaming required."""
+    import subprocess
+    for path in _candidate_httpx_paths():
+        try:
+            out = subprocess.run([path, "-version"], capture_output=True,
+                                 text=True, timeout=10)
+            if "projectdiscovery" in (out.stdout + out.stderr).lower():
+                return path
+        except Exception:
+            continue
+    return None
+
+
 def is_pd_httpx() -> bool:
-    """The Python `httpx` lib also ships an `httpx` CLI — disambiguate from PD's."""
-    if not have("httpx"):
-        return False
-    try:
-        import subprocess
-        out = subprocess.run(["httpx", "-version"], capture_output=True, text=True,
-                             timeout=10)
-        return "projectdiscovery" in (out.stdout + out.stderr).lower()
-    except Exception:
-        return False
+    return pd_httpx_bin() is not None
 
 
 async def _run(cmd: list, stdin: bytes | None = None, timeout: int = 900) -> str:
@@ -79,10 +123,11 @@ async def dnsx_resolve(subdomains) -> dict | None:
 
 async def httpx_probe(hosts) -> dict | None:
     """HTTP probe + tech fingerprint + favicon. Returns {host: {...}} or None."""
-    if not is_pd_httpx():
+    binname = pd_httpx_bin()
+    if not binname:
         return None
     inp = "\n".join(hosts).encode()
-    out = await _run(["httpx", "-json", "-silent", "-td", "-title", "-status-code",
+    out = await _run([binname, "-json", "-silent", "-td", "-title", "-status-code",
                       "-web-server", "-favicon", "-follow-redirects",
                       "-no-color", "-timeout", "10"], stdin=inp)
     res = {}
