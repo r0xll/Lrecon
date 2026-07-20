@@ -99,6 +99,20 @@ def test_summarize_entry_points_merges_vulns_and_nvd_by_max_cvss():
     assert "CVE-2026-1" in eps[0]["summary"] and "CVE-2026-2" in eps[0]["summary"]
 
 
+def test_cve_severity_below_medium_threshold_is_low_not_medium():
+    assert intel._cve_severity(3.1) == "low"
+    assert intel._cve_severity(0.0) == "low"
+    assert intel._cve_severity(None) == "medium"      # missing CVSS still falls back to medium
+
+
+def test_summarize_entry_points_low_cvss_nvd_cve_ranks_low():
+    h = Host("legacy.x.com", nvd_cves=[{"id": "CVE-2026-1", "cvss": 3.1}])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    assert eps[0]["severity"] == "low"
+
+
 async def test_cloudflare_origin_detects_unproxied_leak():
     nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
     hosts = {
