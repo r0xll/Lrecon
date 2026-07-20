@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
@@ -46,7 +47,9 @@ def main() -> None:
     ap.add_argument("--config", help="config json path (default ~/.config/lrecon/config.json)")
     ap.add_argument("-c", "--concurrency", type=int, default=50)
     ap.add_argument("--no-progress", action="store_true")
-    ap.add_argument("-o", "--out", default="lrecon", help="output basename")
+    ap.add_argument("-o", "--out", default="lrecon",
+                    help="output basename — a UTC date/hour stamp is appended so "
+                         "reruns don't overwrite prior output (<basename>_YYYYMMDD_HH.*)")
     args = ap.parse_args()
 
     if args.check_backends:
@@ -91,10 +94,11 @@ def main() -> None:
     res = asyncio.run(run(args.domains, args, keys))
     hosts = res["hosts"]
 
-    json_path = f"{args.out}.json"
-    md_path = f"{args.out}.md"
-    html_path = f"{args.out}.html"
-    live_path = f"{args.out}.live.txt"
+    out_base = f"{args.out}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H')}"
+    json_path = f"{out_base}.json"
+    md_path = f"{out_base}.md"
+    html_path = f"{out_base}.html"
+    live_path = f"{out_base}.live.txt"
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
@@ -108,7 +112,7 @@ def main() -> None:
     outputs = [json_path, md_path, html_path, live_path]
     if args.screenshots:
         urls = [l for l in Path(live_path).read_text().splitlines() if l]
-        shot_dir = f"{args.out}_shots"
+        shot_dir = f"{out_base}_shots"
         n = asyncio.run(screenshot_hosts(urls, shot_dir))
         if n:
             outputs.append(shot_dir + "/")
