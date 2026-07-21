@@ -2,7 +2,7 @@
 import ipaddress
 
 import lrecon
-from lrecon import enrich, intel, state, backends
+from lrecon import enrich, intel, state, backends, sources
 from lrecon.common import Host, CF_FALLBACK
 
 
@@ -39,6 +39,55 @@ def test_apply_ports_merges_and_tags_source():
     assert h.ports == [80, 443]
     assert h.vulns == ["CVE-2026-1"]
     assert "internetdb" in h.enrich_src
+
+
+# --------------------------------------------------------------------------- #
+# Passive enum: crt.sh retry/backoff hardening
+# --------------------------------------------------------------------------- #
+class _FakeResp:
+    def __init__(self, status_code, data=None):
+        self.status_code = status_code
+        self._data = data
+
+    def json(self):
+        return self._data
+
+
+class _FlakyClient:
+    """Replays canned responses/exceptions in order; counts calls."""
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def get(self, url, timeout=None):
+        self.calls += 1
+        resp = self._responses.pop(0)
+        if isinstance(resp, Exception):
+            raise resp
+        return resp
+
+
+async def test_enum_crtsh_retries_non_200_then_succeeds_and_includes_common_name(monkeypatch):
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(sources.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([
+        _FakeResp(429),
+        _FakeResp(200, [{"name_value": "a.x.com\nb.x.com", "common_name": "c.x.com"}]),
+    ])
+    out = await sources.enum_crtsh(client, "x.com")
+    assert out == {"a.x.com", "b.x.com", "c.x.com"}
+    assert client.calls == 2
+
+
+async def test_enum_crtsh_gives_up_after_max_attempts(monkeypatch):
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(sources.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([_FakeResp(503)] * 4)
+    out = await sources.enum_crtsh(client, "x.com")
+    assert out == set()
+    assert client.calls == 4
 
 
 def test_parse_nvd_vuln_extracts_cvss_vector_desc_and_dos_flag():
