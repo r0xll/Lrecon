@@ -289,13 +289,20 @@ ENTRY_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _CVSS_SEVERITY = ((9.0, "critical"), (7.0, "high"), (4.0, "medium"))
 
 
-def _cve_severity(cvss) -> str:
+def _cve_severity(cvss, has_poc: bool = False) -> str:
     if cvss is None:
-        return "medium"                              # no CVSS data (e.g. Shodan/InternetDB vulns list)
-    for threshold, sev in _CVSS_SEVERITY:
-        if cvss >= threshold:
-            return sev
-    return "low"
+        sev = "medium"                               # no CVSS data (e.g. Shodan/InternetDB vulns list)
+    else:
+        sev = "low"
+        for threshold, s in _CVSS_SEVERITY:
+            if cvss >= threshold:
+                sev = s
+                break
+    # A working public exploit is a stronger red-team signal than raw CVSS
+    # alone — floor at "high" rather than leaving it at medium/low.
+    if has_poc and ENTRY_SEVERITY_ORDER[sev] > ENTRY_SEVERITY_ORDER["high"]:
+        sev = "high"
+    return sev
 
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) -> list:
@@ -348,28 +355,38 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) 
         cve_ids = all_ids - dos_ids
         if not cve_ids:
             continue
-        # Highest-CVSS first, unscored ones (no --nvd data) last — alphabetical
-        # order put arbitrary old low-priority CVEs ahead of the ones that
-        # actually matter, and buried them past the display cap below.
+        # PoC-confirmed CVEs first — a working public exploit outranks raw
+        # CVSS as a red-team signal — then by CVSS descending, unscored last.
         ranked = sorted(cve_ids, key=lambda cid: (
+            0 if nvd_by_id.get(cid, {}).get("poc") else 1,
             -(nvd_by_id.get(cid, {}).get("cvss") if nvd_by_id.get(cid, {}).get("cvss") is not None else -1),
             cid))
-        scored = [cid for cid in ranked if nvd_by_id.get(cid, {}).get("cvss") is not None]
-        max_cvss = nvd_by_id[scored[0]]["cvss"] if scored else None
+        cvss_values = [nvd_by_id[cid]["cvss"] for cid in cve_ids
+                       if nvd_by_id.get(cid, {}).get("cvss") is not None]
+        max_cvss = max(cvss_values) if cvss_values else None
+        poc_ids = [cid for cid in cve_ids if nvd_by_id.get(cid, {}).get("poc")]
+        unscored = len(cve_ids) - len(cvss_values)
+
+        severity = min(
+            (_cve_severity(nvd_by_id.get(cid, {}).get("cvss"), has_poc=bool(nvd_by_id.get(cid, {}).get("poc")))
+             for cid in cve_ids),
+            key=lambda s: ENTRY_SEVERITY_ORDER.get(s, 9))
+
         cvss_note = f" (max CVSS {max_cvss})" if max_cvss is not None else ""
+        poc_note = f" [{len(poc_ids)} with public PoC]" if poc_ids else ""
         dos_note = f" [{len(dos_ids)} DoS-only CVE(s) excluded]" if dos_ids else ""
-        unscored = len(ranked) - len(scored)
-        unscored_note = f" [{unscored} unscored — run --nvd for full data]" if unscored and not scored else \
+        unscored_note = f" [{unscored} unscored — run --nvd for full data]" if unscored and not cvss_values else \
                          (f" [{unscored} unscored]" if unscored else "")
         detail = "; ".join(
             cid + (f" (CVSS {nvd_by_id[cid]['cvss']})" if nvd_by_id.get(cid, {}).get("cvss") is not None else "")
+            + (" [PoC]" if nvd_by_id.get(cid, {}).get("poc") else "")
             + (f" — {nvd_by_id[cid]['desc']}" if nvd_by_id.get(cid, {}).get("desc") else "")
             for cid in ranked[:known_cve_cap])
         if len(ranked) > known_cve_cap:
             detail += f"; +{len(ranked) - known_cve_cap} more"
         out.append({"type": "known-cve", "target": h.subdomain,
-                   "severity": _cve_severity(max_cvss),
-                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{dos_note}{unscored_note}: {detail}",
+                   "severity": severity,
+                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{poc_note}{dos_note}{unscored_note}: {detail}",
                    "attck": "T1190"})
 
     for d, bs in (breach or {}).items():
