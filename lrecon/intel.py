@@ -337,14 +337,26 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) 
 
     for h in hosts:
         nvd = h.nvd_cves or []
-        cve_ids = sorted(set(h.vulns) | {c["id"] for c in nvd if c.get("id")})
+        nvd_by_id = {c["id"]: c for c in nvd if c.get("id")}
+        all_ids = set(h.vulns) | set(nvd_by_id)
+        # DoS-only CVEs aren't useful as an initial-access lead — drop them from
+        # consideration (and from severity ranking) wherever NVD data classifies
+        # them as such. IDs we have no NVD data for (no --nvd, or lookup miss)
+        # can't be classified and are kept as-is.
+        dos_ids = {cid for cid in all_ids if nvd_by_id.get(cid, {}).get("dos_only")}
+        cve_ids = sorted(all_ids - dos_ids)
         if not cve_ids:
             continue
-        max_cvss = max((c["cvss"] for c in nvd if c.get("cvss") is not None), default=None)
+        max_cvss = max((nvd_by_id[cid]["cvss"] for cid in cve_ids
+                        if nvd_by_id.get(cid, {}).get("cvss") is not None), default=None)
         cvss_note = f" (max CVSS {max_cvss})" if max_cvss is not None else ""
+        dos_note = f" [{len(dos_ids)} DoS-only CVE(s) excluded]" if dos_ids else ""
+        detail = "; ".join(
+            cid + (f" — {nvd_by_id[cid]['desc']}" if nvd_by_id.get(cid, {}).get("desc") else "")
+            for cid in cve_ids[:3]) + ("; …" if len(cve_ids) > 3 else "")
         out.append({"type": "known-cve", "target": h.subdomain,
                    "severity": _cve_severity(max_cvss),
-                   "summary": f"{len(cve_ids)} known CVE(s){cvss_note}: {', '.join(cve_ids[:5])}",
+                   "summary": f"{len(cve_ids)} known CVE(s){cvss_note}{dos_note}: {detail}",
                    "attck": "T1190"})
 
     for d, bs in (breach or {}).items():
