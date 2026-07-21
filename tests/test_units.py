@@ -149,6 +149,34 @@ async def test_poc_lookup_404_means_no_poc_and_caches():
     assert client.calls == 1
 
 
+async def test_poc_lookup_transient_failures_retried_not_cached_as_no_poc(monkeypatch):
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(enrich.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([_FakeResp(429), _FakeResp(503), _FakeResp(500)])
+    cache = {}
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await enrich.poc_lookup(client, "CVE-2024-5555", cache, limiter)
+    assert out is None                            # unresolved, not a confirmed absence
+    assert "CVE-2024-5555" not in cache           # must not be cached as a false negative
+    assert client.calls == 3                      # exhausted all 3 attempts
+
+
+async def test_poc_lookup_recovers_after_a_transient_failure(monkeypatch):
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(enrich.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([
+        _FakeResp(429),
+        _FakeResp(200, [{"html_url": "https://github.com/a/poc", "stargazers_count": 1}]),
+    ])
+    cache = {}
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await enrich.poc_lookup(client, "CVE-2024-6666", cache, limiter)
+    assert out == [{"url": "https://github.com/a/poc", "stars": 1}]
+    assert cache["CVE-2024-6666"] == out
+
+
 def test_cve_severity_poc_floors_medium_and_low_to_high():
     assert intel._cve_severity(3.1, has_poc=True) == "high"     # low -> high
     assert intel._cve_severity(5.0, has_poc=True) == "high"     # medium -> high

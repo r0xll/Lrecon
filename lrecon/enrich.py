@@ -208,32 +208,48 @@ async def nvd_lookup_by_id(client, cve_id: str, cache: dict, limiter) -> dict | 
     return out
 
 
-async def poc_lookup(client, cve_id: str, cache: dict, limiter) -> list:
+async def poc_lookup(client, cve_id: str, cache: dict, limiter) -> list | None:
     """
     Public PoC availability via nomi-sec/PoC-in-GitHub — a keyless aggregator
     that maintains one JSON file per CVE (<year>/<CVE-ID>.json) listing GitHub
-    repos referencing it, with star counts. 404 means no known public PoC.
-    Returns [{"url":..., "stars":...}, ...] sorted by stars desc, or [].
+    repos referencing it, with star counts. A 404 is the only authoritative
+    "no known public PoC" signal — retry everything else (403/429/5xx,
+    network errors) rather than treating it as absence, and don't cache a
+    failure as []: doing so would permanently and silently suppress the
+    PoC-aware severity bump for every host sharing that CVE for the rest of
+    the run whenever GitHub's raw endpoint has a transient hiccup.
+    Returns [{"url":..., "stars":...}, ...] sorted by stars desc, [] on a
+    confirmed 404, or None if the lookup couldn't be completed.
     """
     if cve_id in cache:
         return cache[cve_id]
-    out = []
     parts = cve_id.split("-")
     year = parts[1] if len(parts) == 3 and parts[0] == "CVE" else None
-    if year:
+    if not year:
+        return None
+    url = f"https://raw.githubusercontent.com/nomi-sec/PoC-in-GitHub/master/{year}/{cve_id}.json"
+    attempts = 3
+    for attempt in range(attempts):
         await limiter.wait()
-        url = f"https://raw.githubusercontent.com/nomi-sec/PoC-in-GitHub/master/{year}/{cve_id}.json"
         try:
             r = await client.get(url, timeout=15)
+            if r.status_code == 404:
+                cache[cve_id] = []
+                return []
             if r.status_code == 200:
+                out = []
                 for item in r.json():
                     repo_url = item.get("html_url")
                     if repo_url:
                         out.append({"url": repo_url, "stars": item.get("stargazers_count", 0)})
                 out.sort(key=lambda p: -p["stars"])
+                cache[cve_id] = out
+                return out
+            # non-200/404 (403/429/5xx) — transient, retry below
         except Exception:
             pass
-    cache[cve_id] = out
-    return out
+        if attempt < attempts - 1:
+            await asyncio.sleep(min(2 ** (attempt + 1), 10))
+    return None            # gave up — left uncached, treated as unknown rather than "no PoC"
 
 
