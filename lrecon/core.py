@@ -300,12 +300,16 @@ async def run(domains, args, keys) -> list:
             poc_limiter = RateLimiter(per_second=5.0)
             unique_cve_ids = sorted({c["id"] for h in nvd_hosts for c in (h.nvd_cves or []) if c.get("id")})
             if unique_cve_ids:
-                await _gather_with_progress(
+                poc_results = await _gather_with_progress(
                     (poc_lookup(client, cid, poc_cache, poc_limiter) for cid in unique_cve_ids),
                     f"PoC lookup ({len(unique_cve_ids)} CVE(s))", use_prog)
                 n_with_poc = sum(1 for v in poc_cache.values() if v)
+                n_failed = sum(1 for r in poc_results if r is None)
                 if n_with_poc:
                     log(f"[+] public PoC found for {n_with_poc}/{len(unique_cve_ids)} resolved CVE(s)")
+                if n_failed:
+                    log(f"[!] PoC lookup failed for {n_failed}/{len(unique_cve_ids)} CVE(s) after "
+                        f"retries — treated as unknown, not confirmed absent")
                 for h in nvd_hosts:
                     for c in (h.nvd_cves or []):
                         if c.get("id") in poc_cache:
