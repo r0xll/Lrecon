@@ -1,8 +1,11 @@
 """Unit tests for LRecon pure-logic and backend parsers (no network required)."""
+import csv
 import ipaddress
+import tempfile
+from pathlib import Path
 
 import lrecon
-from lrecon import enrich, intel, state, backends, sources
+from lrecon import enrich, intel, state, backends, sources, report
 from lrecon.common import Host, CF_FALLBACK
 
 
@@ -197,6 +200,34 @@ def test_summarize_entry_points_skips_host_with_only_dos_cves():
     assert intel.summarize_entry_points([h], cf, [], {}, [], []) == []
 
 
+def test_summarize_entry_points_ranks_by_cvss_not_alphabetically():
+    # Alphabetically CVE-2007-... sorts first; by severity it should sort last.
+    h = Host("legacy.x.com", vulns=["CVE-2007-4723", "CVE-2024-9999"],
+             nvd_cves=[
+                 {"id": "CVE-2007-4723", "cvss": 2.1, "desc": "Minor info leak"},
+                 {"id": "CVE-2024-9999", "cvss": 9.8, "desc": "Unauthenticated RCE"},
+             ])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    summary = eps[0]["summary"]
+    assert summary.index("CVE-2024-9999") < summary.index("CVE-2007-4723")
+    assert eps[0]["severity"] == "critical"
+
+
+def test_summarize_entry_points_truncates_large_cve_lists_with_a_count():
+    vulns = [f"CVE-2026-{i}" for i in range(63)]              # unscored — no --nvd data
+    h = Host("legacy.x.com", vulns=vulns)
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    summary = eps[0]["summary"]
+    assert summary.startswith("63 known CVE(s)")
+    assert "+58 more" in summary                              # 63 - 5 shown
+    assert "run --nvd for full data" in summary                # all 63 unscored -> hint to enrich
+    assert eps[0]["severity"] == "medium"                      # no CVSS data at all -> fallback
+
+
 def test_cve_severity_below_medium_threshold_is_low_not_medium():
     assert intel._cve_severity(3.1) == "low"
     assert intel._cve_severity(0.0) == "low"
@@ -290,3 +321,25 @@ def test_available_backends_shape():
     bk = backends.available_backends()
     assert set(bk) == {"subfinder", "dnsx", "httpx", "naabu", "nuclei"}
     assert all(isinstance(v, bool) for v in bk.values())
+
+
+# --------------------------------------------------------------------------- #
+# Reporting: CSV target list
+# --------------------------------------------------------------------------- #
+def test_write_csv_includes_wildcard_flag_and_target_fields():
+    hosts = [
+        Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC",
+             country="US", scheme="https", http_status=200, source={"crtsh"}),
+        Host("wild.x.com", ips=["9.9.9.9"], wildcard=True, source={"seed"}),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "targets.csv"
+        n = report.write_csv(hosts, str(path))
+        assert n == 2
+        rows = list(csv.DictReader(path.open()))
+    assert rows[0]["subdomain"] == "a.x.com"
+    assert rows[0]["ips"] == "1.2.3.4"
+    assert rows[0]["org"] == "Google LLC"
+    assert rows[0]["wildcard"] == ""
+    assert rows[1]["subdomain"] == "wild.x.com"
+    assert rows[1]["wildcard"] == "yes"

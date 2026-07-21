@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
 from .core import run
-from .report import write_markdown, write_html, write_live_hosts, screenshot_hosts
+from .report import write_markdown, write_html, write_live_hosts, write_csv, screenshot_hosts
 from .backends import available_backends
 from . import backends
 
@@ -32,6 +32,10 @@ def main() -> None:
     ap.add_argument("--buckets", action="store_true", help="cloud bucket permutation enum")
     ap.add_argument("--bucket-keywords", help="extra comma-separated bucket keywords")
     ap.add_argument("--nvd", action="store_true", help="resolve CPEs to CVEs via NVD (slow)")
+    ap.add_argument("--nvd-max-cves", type=int, default=25,
+                    help="per-host cap on bare Shodan/InternetDB CVE IDs resolved via NVD "
+                         "for CVSS/severity/description (default 25; raise for hosts with many "
+                         "reported CVEs at the cost of more rate-limited NVD requests)")
     ap.add_argument("--nuclei", action="store_true",
                     help="run nuclei templated vuln scan on live hosts (needs nuclei binary)")
     ap.add_argument("--nuclei-severity", help="min nuclei severity (e.g. medium,high,critical)")
@@ -99,6 +103,7 @@ def main() -> None:
     md_path = f"{out_base}.md"
     html_path = f"{out_base}.html"
     live_path = f"{out_base}.live.txt"
+    csv_path = f"{out_base}.targets.csv"
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
@@ -108,8 +113,9 @@ def main() -> None:
     write_markdown(hosts, args.domains, res, md_path)
     write_html(hosts, args.domains, res, html_path)
     n_live = write_live_hosts(hosts, live_path)
+    write_csv(hosts, csv_path)
 
-    outputs = [json_path, md_path, html_path, live_path]
+    outputs = [json_path, md_path, html_path, live_path, csv_path]
     if args.screenshots:
         urls = [l for l in Path(live_path).read_text().splitlines() if l]
         shot_dir = f"{out_base}_shots"

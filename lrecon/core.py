@@ -265,13 +265,14 @@ async def run(domains, args, keys) -> list:
             nvd_cache, nvd_id_cache = {}, {}
             nvd_limiter = RateLimiter(per_second=0.16)        # ~5 req / 30s keyless
             nvd_hosts = [h for h in hosts.values() if h.cpes or h.vulns]
+            cap = args.nvd_max_cves                           # per-host cap on bare vuln IDs resolved
 
             # Resolve each unique bare CVE ID once, up front. Hosts sharing an IP
             # (CDN/vhost) get an identical h.vulns list from apply_ports(), so
             # without this every host's concurrent do_nvd() below would miss the
             # cache at the same time and each fire its own duplicate, serialized
             # lookup for the same shared CVE ID against the 0.16 req/s limiter.
-            unique_vuln_ids = sorted({vid for h in nvd_hosts for vid in h.vulns[:10]})
+            unique_vuln_ids = sorted({vid for h in nvd_hosts for vid in h.vulns[:cap]})
             if unique_vuln_ids:
                 await _gather_with_progress(
                     (nvd_lookup_by_id(client, vid, nvd_id_cache, nvd_limiter)
@@ -284,7 +285,7 @@ async def run(domains, args, keys) -> list:
                     for cve in await nvd_lookup(client, cpe, nvd_cache, nvd_limiter):
                         if cve["id"]:
                             seen[cve["id"]] = cve
-                for vid in h.vulns[:10]:
+                for vid in h.vulns[:cap]:
                     if vid not in seen:
                         enriched = await nvd_lookup_by_id(client, vid, nvd_id_cache, nvd_limiter)
                         if enriched:
