@@ -63,7 +63,7 @@ async def run(domains, args, keys) -> list:
                 pass
 
         # ---- Phase 1: passive enum (with source attribution) ----
-        host_sources, per_source = await passive_enum(client, domains, keys)
+        host_sources, per_source = await passive_enum(client, domains, keys, no_pd=args.no_pd)
         hosts = {n: Host(subdomain=n, source=set(srcs)) for n, srcs in host_sources.items()}
         breakdown = "  ".join(f"{s}={per_source[s]}" for s in sorted(per_source)) or "none"
         log(f"[+] {len(hosts)} unique subdomains  |  by source: {breakdown}")

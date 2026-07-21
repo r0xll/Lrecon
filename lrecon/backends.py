@@ -1,12 +1,15 @@
 """
-ProjectDiscovery backend wiring.
+External binary backend wiring (ProjectDiscovery tools + psql).
 
 Each function is an OPTIONAL native accelerator. If the binary isn't on PATH the
 function returns None and the caller falls back to the pure-Python path. Nothing
 here is required to run lrecon.
 
 Tools: subfinder (passive enum), dnsx (mass resolution), httpx (HTTP probe + tech
-fingerprint + favicon), naabu (port scan), nuclei (templated vuln scan).
+fingerprint + favicon), naabu (port scan), nuclei (templated vuln scan), psql
+(direct query against crt.sh's public Postgres replica — bypasses its flaky
+HTTP/JSON frontend; not a ProjectDiscovery tool, but same optional-accelerator
+pattern).
 """
 from __future__ import annotations
 import asyncio
@@ -181,9 +184,35 @@ async def nuclei_scan(urls, severity=None, rate=150) -> list | None:
     return findings
 
 
+async def crtsh_psql(domain: str) -> list | None:
+    """
+    Direct query against crt.sh's public PostgreSQL replica (host crt.sh, port
+    5432, read-only 'guest' account — documented by crt.sh itself), bypassing
+    its notoriously flaky HTTP/JSON frontend entirely. Optional: only used if
+    `psql` is on PATH; returns None (caller falls back to the HTTP path)
+    otherwise, or if the query produced no usable output (covers both a
+    connection failure and a genuinely empty result the same way — either
+    way the HTTP path is cheap insurance).
+
+    The domain is passed via psql's :'var' substitution (psql handles the SQL
+    quoting/escaping), never string-interpolated into the query text.
+    """
+    if not have("psql"):
+        return None
+    query = ("SELECT DISTINCT ci.NAME_VALUE FROM certificate_and_identities ci "
+             "WHERE ci.NAME_VALUE ILIKE :'pattern' AND ci.NAME_VALUE NOT ILIKE '%@%';")
+    cmd = ["psql", "-h", "crt.sh", "-p", "5432", "-U", "guest", "-d", "certwatch",
+          "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-v", f"pattern=%.{domain}",
+          "-c", query]
+    out = await _run(cmd, timeout=45)
+    rows = [line.strip() for line in out.splitlines() if line.strip()]
+    return rows or None
+
+
 def available_backends() -> dict:
     return {"subfinder": have("subfinder"), "dnsx": have("dnsx"),
-            "httpx": is_pd_httpx(), "naabu": have("naabu"), "nuclei": have("nuclei")}
+            "httpx": is_pd_httpx(), "naabu": have("naabu"), "nuclei": have("nuclei"),
+            "psql (crt.sh)": have("psql")}
 
 
 async def selfcheck(active: bool = False) -> list:
@@ -249,5 +278,14 @@ async def selfcheck(active: bool = False) -> list:
             row("nuclei", True, bool(v), 0, "binary OK (use --check-active to test-scan)")
     else:
         row("nuclei", False, False, 0, "not on PATH")
+
+    # psql (crt.sh direct-Postgres) — passive, read-only
+    if bk["psql (crt.sh)"]:
+        rows = await crtsh_psql("example.com")
+        n = len(rows or [])
+        row("psql (crt.sh)", True, rows is not None, n,
+            f"{n} name(s) parsed" if rows else "ran but no rows — check connectivity/query")
+    else:
+        row("psql (crt.sh)", False, False, 0, "not on PATH")
 
     return out

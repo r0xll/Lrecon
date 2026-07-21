@@ -24,10 +24,10 @@ lrecon/
   state.py       cache + diff               report.py    markdown / html / live / screenshots
 ```
 
-## ProjectDiscovery backends
+## Optional backends (ProjectDiscovery + psql)
 
-lrecon uses PD tools as **optional native accelerators** when their binaries are on
-PATH, falling back to pure-Python otherwise (nothing is required):
+lrecon uses external binaries as **optional native accelerators** when they're on
+PATH, falling back to pure-Python/HTTP otherwise (nothing is required):
 
 | Tool | Accelerates | Fallback |
 |---|---|---|
@@ -36,15 +36,24 @@ PATH, falling back to pure-Python otherwise (nothing is required):
 | `httpx` | HTTP probe + tech fingerprint + favicon | built-in probe |
 | `naabu` | port scan (`--active-ports`) | async TCP connect scan |
 | `nuclei` | templated vuln scan (`--nuclei`) | — (no fallback; skipped if absent) |
+| `psql` | crt.sh subdomain enum via its **direct Postgres replica**, bypassing the flaky HTTP/JSON frontend entirely | hardened HTTP/JSON (retry + backoff) |
 
-Install them (Go):
+`psql` isn't a ProjectDiscovery tool, but gets the same optional-accelerator
+treatment: `crt.sh -h crt.sh -p 5432 -U guest -d certwatch` is a public, read-only,
+keyless replica documented by crt.sh itself. If `psql` is on PATH, lrecon queries it
+directly for each domain; if it's absent or returns nothing, it falls back to the
+HTTP JSON endpoint (4 attempts, exponential backoff).
+
+Install them (Go, plus `psql` from your package manager):
 
 ```fish
 go install github.com/projectdiscovery/{subfinder/v2/cmd/subfinder,dnsx/cmd/dnsx,httpx/cmd/httpx,naabu/v2/cmd/naabu,nuclei/v3/cmd/nuclei}@latest
 ```
 
-Startup logs which backends are active. `--no-pd` forces pure-Python (reproducible
-runs / debugging). Validate the integration before an engagement:
+Startup logs which backends are active. `--no-pd` forces pure-Python/HTTP for
+everything, including `psql` (reproducible runs / debugging / sandboxed
+environments with no external binaries). Validate the integration before an
+engagement:
 
 ```fish
 lrecon --check-backends           # detect binaries + confirm parser mapping (safe/passive)
@@ -182,7 +191,7 @@ httpx -l client.live.txt -tech-detect -title
 | `--diff` | diff against previous run snapshot |
 | `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei) |
 | `--nuclei-severity` | min nuclei severity, e.g. `medium,high,critical` |
-| `--no-pd` | force pure-Python; ignore ProjectDiscovery binaries |
+| `--no-pd` | force pure-Python/HTTP; ignore ProjectDiscovery binaries and the psql-based crt.sh accelerator |
 | `--screenshots` | capture live-host screenshots (needs playwright) |
 | `--resolvers` | comma-separated DNS servers (default 1.1.1.1,8.8.8.8,9.9.9.9,8.8.4.4) |
 | `-c, --concurrency` | max concurrent operations (default 50) |
@@ -213,6 +222,8 @@ Run snapshots are cached under `~/.local/share/lrecon/` to power `--diff`.
 **Per-source attribution.** Every run prints and reports how many in-scope hosts
 each passive source returned, so you can see whether crt.sh (frequently down) is
 actually contributing or whether the other CT sources are carrying the run.
+crt.sh itself prefers a direct Postgres query over its flaky HTTP frontend when
+`psql` is available — see [Optional backends](#optional-backends-projectdiscovery--psql).
 
 **Unique-IP enrichment.** Enrichment runs once per distinct IP, not per subdomain.
 On CDN-fronted targets where hundreds of hosts share a few IPs this cuts API calls
