@@ -295,6 +295,22 @@ async def run(domains, args, keys) -> list:
                 await _gather_with_progress((do_nvd(h) for h in nvd_hosts),
                                             f"NVD lookup ({len(nvd_hosts)} hosts)", use_prog)
 
+            # ---- Public PoC lookup for the CVEs NVD just resolved (dedup once) ----
+            poc_cache = {}
+            poc_limiter = RateLimiter(per_second=5.0)
+            unique_cve_ids = sorted({c["id"] for h in nvd_hosts for c in (h.nvd_cves or []) if c.get("id")})
+            if unique_cve_ids:
+                await _gather_with_progress(
+                    (poc_lookup(client, cid, poc_cache, poc_limiter) for cid in unique_cve_ids),
+                    f"PoC lookup ({len(unique_cve_ids)} CVE(s))", use_prog)
+                n_with_poc = sum(1 for v in poc_cache.values() if v)
+                if n_with_poc:
+                    log(f"[+] public PoC found for {n_with_poc}/{len(unique_cve_ids)} resolved CVE(s)")
+                for h in nvd_hosts:
+                    for c in (h.nvd_cves or []):
+                        if c.get("id") in poc_cache:
+                            c["poc"] = poc_cache[c["id"]]
+
         # ---- nuclei templated vuln scan (opt-in; ProjectDiscovery backend) ----
         nuclei = []
         if args.nuclei and not args.passive_only and not args.no_pd:

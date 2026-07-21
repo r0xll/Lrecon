@@ -208,3 +208,32 @@ async def nvd_lookup_by_id(client, cve_id: str, cache: dict, limiter) -> dict | 
     return out
 
 
+async def poc_lookup(client, cve_id: str, cache: dict, limiter) -> list:
+    """
+    Public PoC availability via nomi-sec/PoC-in-GitHub — a keyless aggregator
+    that maintains one JSON file per CVE (<year>/<CVE-ID>.json) listing GitHub
+    repos referencing it, with star counts. 404 means no known public PoC.
+    Returns [{"url":..., "stars":...}, ...] sorted by stars desc, or [].
+    """
+    if cve_id in cache:
+        return cache[cve_id]
+    out = []
+    parts = cve_id.split("-")
+    year = parts[1] if len(parts) == 3 and parts[0] == "CVE" else None
+    if year:
+        await limiter.wait()
+        url = f"https://raw.githubusercontent.com/nomi-sec/PoC-in-GitHub/master/{year}/{cve_id}.json"
+        try:
+            r = await client.get(url, timeout=15)
+            if r.status_code == 200:
+                for item in r.json():
+                    repo_url = item.get("html_url")
+                    if repo_url:
+                        out.append({"url": repo_url, "stars": item.get("stargazers_count", 0)})
+                out.sort(key=lambda p: -p["stars"])
+        except Exception:
+            pass
+    cache[cve_id] = out
+    return out
+
+

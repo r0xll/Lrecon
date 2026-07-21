@@ -121,6 +121,72 @@ def test_is_dos_only_handles_v2_vectors_and_missing_vector():
     assert enrich._is_dos_only(None) is False                           # no vector data -> can't classify
 
 
+async def test_poc_lookup_parses_and_sorts_by_stars(monkeypatch):
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(enrich.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([_FakeResp(200, [
+        {"html_url": "https://github.com/a/low-stars", "stargazers_count": 2},
+        {"html_url": "https://github.com/b/high-stars", "stargazers_count": 50},
+    ])])
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await enrich.poc_lookup(client, "CVE-2024-1234", {}, limiter)
+    assert [p["url"] for p in out] == [
+        "https://github.com/b/high-stars", "https://github.com/a/low-stars"]
+
+
+async def test_poc_lookup_404_means_no_poc_and_caches():
+    client = _FlakyClient([_FakeResp(404)])
+    cache = {}
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await enrich.poc_lookup(client, "CVE-2024-9999", cache, limiter)
+    assert out == []
+    assert cache["CVE-2024-9999"] == []
+    assert client.calls == 1
+    # second call hits the cache, no further request
+    out2 = await enrich.poc_lookup(client, "CVE-2024-9999", cache, limiter)
+    assert out2 == []
+    assert client.calls == 1
+
+
+def test_cve_severity_poc_floors_medium_and_low_to_high():
+    assert intel._cve_severity(3.1, has_poc=True) == "high"     # low -> high
+    assert intel._cve_severity(5.0, has_poc=True) == "high"     # medium -> high
+    assert intel._cve_severity(9.8, has_poc=True) == "critical"  # already above high -> unchanged
+    assert intel._cve_severity(3.1, has_poc=False) == "low"     # no poc -> unaffected
+
+
+def test_summarize_entry_points_poc_confirmed_cve_ranks_ahead_of_higher_cvss():
+    h = Host("legacy.x.com", nvd_cves=[
+        {"id": "CVE-2024-HIGH", "cvss": 8.8, "desc": "High CVSS, no known exploit"},
+        {"id": "CVE-2024-POC", "cvss": 4.5, "desc": "Medium CVSS but has a public PoC",
+         "poc": [{"url": "https://github.com/x/poc", "stars": 10}]},
+    ])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    summary = eps[0]["summary"]
+    # PoC-confirmed CVE (lower CVSS) still sorts ahead of the higher-CVSS one.
+    assert summary.index("CVE-2024-POC") < summary.index("CVE-2024-HIGH")
+    assert "1 with public PoC" in summary
+    assert "[PoC]" in summary
+
+
+def test_summarize_entry_points_poc_bump_raises_aggregate_severity():
+    # Both CVEs are medium-tier on raw CVSS alone (neither reaches the 7.0
+    # "high" threshold); the PoC bump should raise the host's overall severity
+    # to "high" even though max_cvss stays in medium range.
+    h = Host("legacy.x.com", nvd_cves=[
+        {"id": "CVE-2024-A", "cvss": 5.0, "desc": "Medium, no PoC"},
+        {"id": "CVE-2024-B", "cvss": 4.5, "desc": "Medium but has a public PoC",
+         "poc": [{"url": "https://github.com/x/poc", "stars": 3}]},
+    ])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    assert eps[0]["severity"] == "high"
+
+
 # --------------------------------------------------------------------------- #
 # Intel: buckets + Cloudflare
 # --------------------------------------------------------------------------- #
