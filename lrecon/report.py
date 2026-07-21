@@ -10,23 +10,15 @@ from .common import *
 def write_csv(hosts, path) -> int:
     """
     Flat target list for client scope confirmation — one row per discovered
-    host (including wildcard-suspect ones, flagged so the client can weigh in
-    on those too). Deliberately excludes CVE/vuln detail: this is "here's what
-    we found in your scope, please confirm ownership," not a vuln report.
+    host (including wildcard-suspect ones, so the client can weigh in on
+    those too). Deliberately just subdomain + IPs: this is "here's what we
+    found in your scope, please confirm ownership," not a vuln report.
     """
-    fields = ["subdomain", "ips", "cname", "asn", "org", "country", "wildcard",
-             "scheme", "http_status", "source"]
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(fields)
+        w.writerow(["subdomain", "ips"])
         for h in hosts:
-            w.writerow([
-                h.subdomain, ", ".join(h.ips), h.cname or "",
-                h.asn or "", h.org or "", h.country or "",
-                "yes" if h.wildcard else "",
-                h.scheme or "", h.http_status or "",
-                ", ".join(sorted(h.source)),
-            ])
+            w.writerow([h.subdomain, ", ".join(h.ips)])
     return len(hosts)
 
 
