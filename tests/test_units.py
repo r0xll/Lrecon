@@ -480,20 +480,19 @@ def test_available_backends_shape():
 # --------------------------------------------------------------------------- #
 # Reporting: CSV target list
 # --------------------------------------------------------------------------- #
-def test_write_csv_includes_wildcard_flag_and_target_fields():
+def test_write_csv_has_only_subdomain_and_ips():
     hosts = [
         Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC",
              country="US", scheme="https", http_status=200, source={"crtsh"}),
-        Host("wild.x.com", ips=["9.9.9.9"], wildcard=True, source={"seed"}),
+        Host("wild.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"}),
     ]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
         n = report.write_csv(hosts, str(path))
         assert n == 2
         rows = list(csv.DictReader(path.open()))
+    assert list(rows[0].keys()) == ["subdomain", "ips"]
     assert rows[0]["subdomain"] == "a.x.com"
     assert rows[0]["ips"] == "1.2.3.4"
-    assert rows[0]["org"] == "Google LLC"
-    assert rows[0]["wildcard"] == ""
     assert rows[1]["subdomain"] == "wild.x.com"
-    assert rows[1]["wildcard"] == "yes"
+    assert rows[1]["ips"] == "9.9.9.9, 8.8.8.8"
