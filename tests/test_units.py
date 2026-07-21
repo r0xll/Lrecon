@@ -41,6 +41,34 @@ def test_apply_ports_merges_and_tags_source():
     assert "internetdb" in h.enrich_src
 
 
+def test_parse_nvd_vuln_extracts_cvss_vector_desc_and_dos_flag():
+    v = {"cve": {"id": "CVE-2026-1",
+                 "descriptions": [{"lang": "en", "value": "Auth bypass allows remote code execution."}],
+                 "metrics": {"cvssMetricV31": [{"cvssData": {
+                     "baseScore": 9.8,
+                     "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}}]}}}
+    parsed = enrich._parse_nvd_vuln(v)
+    assert parsed["id"] == "CVE-2026-1"
+    assert parsed["cvss"] == 9.8
+    assert parsed["dos_only"] is False
+    assert "Auth bypass" in parsed["desc"]
+
+
+def test_parse_nvd_vuln_flags_availability_only_impact_as_dos():
+    v = {"cve": {"id": "CVE-2026-2", "descriptions": [],
+                 "metrics": {"cvssMetricV31": [{"cvssData": {
+                     "baseScore": 7.5,
+                     "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"}}]}}}
+    parsed = enrich._parse_nvd_vuln(v)
+    assert parsed["dos_only"] is True
+
+
+def test_is_dos_only_handles_v2_vectors_and_missing_vector():
+    assert enrich._is_dos_only("AV:N/AC:L/Au:N/C:N/I:N/A:C") is True     # CVSS v2 DoS-only
+    assert enrich._is_dos_only("AV:N/AC:L/Au:N/C:C/I:C/A:C") is False    # v2, also confidentiality/integrity
+    assert enrich._is_dos_only(None) is False                           # no vector data -> can't classify
+
+
 # --------------------------------------------------------------------------- #
 # Intel: buckets + Cloudflare
 # --------------------------------------------------------------------------- #
@@ -97,6 +125,27 @@ def test_summarize_entry_points_merges_vulns_and_nvd_by_max_cvss():
     assert len(eps) == 1
     assert eps[0]["severity"] == "high"               # driven by max CVSS 8.5, not the default medium
     assert "CVE-2026-1" in eps[0]["summary"] and "CVE-2026-2" in eps[0]["summary"]
+
+
+def test_summarize_entry_points_excludes_dos_only_cves_and_surfaces_descriptions():
+    h = Host("legacy.x.com", vulns=["CVE-2026-DOS", "CVE-2026-RCE"],
+             nvd_cves=[
+                 {"id": "CVE-2026-DOS", "cvss": 7.5, "dos_only": True, "desc": "Denial of service crash"},
+                 {"id": "CVE-2026-RCE", "cvss": 6.1, "dos_only": False, "desc": "Auth bypass leads to RCE"},
+             ])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert len(eps) == 1
+    assert "CVE-2026-DOS" not in eps[0]["summary"]
+    assert "CVE-2026-RCE" in eps[0]["summary"] and "Auth bypass leads to RCE" in eps[0]["summary"]
+    assert "1 DoS-only CVE(s) excluded" in eps[0]["summary"]
+    assert eps[0]["severity"] == "medium"              # driven by the surviving CVE's CVSS 6.1, not the DoS one's 7.5
+
+
+def test_summarize_entry_points_skips_host_with_only_dos_cves():
+    h = Host("dos-only.x.com", nvd_cves=[{"id": "CVE-2026-DOS", "cvss": 7.5, "dos_only": True}])
+    cf = {"detected": False, "candidates": {}}
+    assert intel.summarize_entry_points([h], cf, [], {}, [], []) == []
 
 
 def test_cve_severity_below_medium_threshold_is_low_not_medium():

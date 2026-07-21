@@ -258,19 +258,28 @@ async def run(domains, args, keys) -> list:
             log(f"[+] breach: {sum(len(v) for v in breach.values())} known breach(es) for scope")
 
         # ---- NVD CVE enrichment (opt-in; cached) ----
+        # Resolves CPEs to CVEs, and also enriches bare Shodan/InternetDB CVE IDs
+        # (h.vulns) with CVSS/vector/description, so entry-point severity ranking
+        # and DoS filtering (see intel.summarize_entry_points) apply to both.
         if args.nvd and not args.passive_only:
-            nvd_cache = {}
+            nvd_cache, nvd_id_cache = {}, {}
             nvd_limiter = RateLimiter(per_second=0.16)        # ~5 req / 30s keyless
-            cpe_hosts = [h for h in hosts.values() if h.cpes]
+            nvd_hosts = [h for h in hosts.values() if h.cpes or h.vulns]
             async def do_nvd(h):
                 seen = {}
                 for cpe in h.cpes[:5]:
                     for cve in await nvd_lookup(client, cpe, nvd_cache, nvd_limiter):
-                        seen[cve["id"]] = cve
+                        if cve["id"]:
+                            seen[cve["id"]] = cve
+                for vid in h.vulns[:10]:
+                    if vid not in seen:
+                        enriched = await nvd_lookup_by_id(client, vid, nvd_id_cache, nvd_limiter)
+                        if enriched:
+                            seen[vid] = enriched
                 h.nvd_cves = sorted(seen.values(), key=lambda c: -(c["cvss"] or 0))
-            if cpe_hosts:
-                await _gather_with_progress((do_nvd(h) for h in cpe_hosts),
-                                            f"NVD lookup ({len(cpe_hosts)} hosts)", use_prog)
+            if nvd_hosts:
+                await _gather_with_progress((do_nvd(h) for h in nvd_hosts),
+                                            f"NVD lookup ({len(nvd_hosts)} hosts)", use_prog)
 
         # ---- nuclei templated vuln scan (opt-in; ProjectDiscovery backend) ----
         nuclei = []
