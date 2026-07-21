@@ -10,21 +10,33 @@ except Exception:
 # Phase 1 — passive enumeration sources (keyless unless noted)
 # --------------------------------------------------------------------------- #
 async def enum_crtsh(client, domain: str) -> set:
+    """
+    crt.sh's web frontend is notoriously flaky under load (slow queries, 429s,
+    5xx, or a truncated/non-JSON body on a 200) — retry with exponential
+    backoff + jitter rather than giving up after one retry. Non-200/bad-JSON
+    responses are retried too, not just network exceptions.
+    """
     out = set()
-    for attempt in range(2):                       # crt.sh is flaky; one retry
+    last_err = None
+    attempts = 4
+    for attempt in range(attempts):
         try:
-            r = await client.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=30)
+            r = await client.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=45)
             if r.status_code == 200:
                 for row in r.json():
-                    for n in row.get("name_value", "").splitlines():
+                    names = f"{row.get('name_value', '')}\n{row.get('common_name') or ''}"
+                    for n in names.splitlines():
                         n = n.strip().lstrip("*.").lower()
-                        if n.endswith(domain) and " " not in n:
+                        if n and n.endswith(domain) and " " not in n:
                             out.add(n)
                 return out
+            last_err = f"HTTP {r.status_code}"
         except Exception as e:
-            if attempt == 1:
-                log(f"[!] crt.sh {domain}: {e}")
-            await asyncio.sleep(1.5)
+            last_err = str(e)
+        if attempt < attempts - 1:
+            await asyncio.sleep(min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
+    if last_err:
+        log(f"[!] crt.sh {domain}: {last_err} (gave up after {attempts} attempts)")
     return out
 
 
