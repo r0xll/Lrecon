@@ -335,6 +335,7 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) 
                                   f"({n.get('cve') or 'no CVE'}) at {n.get('matched')}",
                        "attck": "T1190"})
 
+    known_cve_cap = 5
     for h in hosts:
         nvd = h.nvd_cves or []
         nvd_by_id = {c["id"]: c for c in nvd if c.get("id")}
@@ -344,19 +345,31 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) 
         # them as such. IDs we have no NVD data for (no --nvd, or lookup miss)
         # can't be classified and are kept as-is.
         dos_ids = {cid for cid in all_ids if nvd_by_id.get(cid, {}).get("dos_only")}
-        cve_ids = sorted(all_ids - dos_ids)
+        cve_ids = all_ids - dos_ids
         if not cve_ids:
             continue
-        max_cvss = max((nvd_by_id[cid]["cvss"] for cid in cve_ids
-                        if nvd_by_id.get(cid, {}).get("cvss") is not None), default=None)
+        # Highest-CVSS first, unscored ones (no --nvd data) last — alphabetical
+        # order put arbitrary old low-priority CVEs ahead of the ones that
+        # actually matter, and buried them past the display cap below.
+        ranked = sorted(cve_ids, key=lambda cid: (
+            -(nvd_by_id.get(cid, {}).get("cvss") if nvd_by_id.get(cid, {}).get("cvss") is not None else -1),
+            cid))
+        scored = [cid for cid in ranked if nvd_by_id.get(cid, {}).get("cvss") is not None]
+        max_cvss = nvd_by_id[scored[0]]["cvss"] if scored else None
         cvss_note = f" (max CVSS {max_cvss})" if max_cvss is not None else ""
         dos_note = f" [{len(dos_ids)} DoS-only CVE(s) excluded]" if dos_ids else ""
+        unscored = len(ranked) - len(scored)
+        unscored_note = f" [{unscored} unscored — run --nvd for full data]" if unscored and not scored else \
+                         (f" [{unscored} unscored]" if unscored else "")
         detail = "; ".join(
-            cid + (f" — {nvd_by_id[cid]['desc']}" if nvd_by_id.get(cid, {}).get("desc") else "")
-            for cid in cve_ids[:3]) + ("; …" if len(cve_ids) > 3 else "")
+            cid + (f" (CVSS {nvd_by_id[cid]['cvss']})" if nvd_by_id.get(cid, {}).get("cvss") is not None else "")
+            + (f" — {nvd_by_id[cid]['desc']}" if nvd_by_id.get(cid, {}).get("desc") else "")
+            for cid in ranked[:known_cve_cap])
+        if len(ranked) > known_cve_cap:
+            detail += f"; +{len(ranked) - known_cve_cap} more"
         out.append({"type": "known-cve", "target": h.subdomain,
                    "severity": _cve_severity(max_cvss),
-                   "summary": f"{len(cve_ids)} known CVE(s){cvss_note}{dos_note}: {detail}",
+                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{dos_note}{unscored_note}: {detail}",
                    "attck": "T1190"})
 
     for d, bs in (breach or {}).items():
