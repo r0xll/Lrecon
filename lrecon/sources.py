@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio, ipaddress, random, shutil, string
 from .common import *
+from . import backends
 try:
     import dns.asyncresolver
 except Exception:
@@ -9,6 +10,26 @@ except Exception:
 # --------------------------------------------------------------------------- #
 # Phase 1 — passive enumeration sources (keyless unless noted)
 # --------------------------------------------------------------------------- #
+async def enum_crtsh_best(client, domain: str, use_psql: bool = True) -> set:
+    """
+    Prefer a direct query against crt.sh's public Postgres replica (psql, if
+    on PATH) over its HTTP/JSON frontend — the direct-DB path bypasses that
+    frontend's well-documented flakiness (429s/5xx/outright outages) entirely
+    rather than just retrying it. Falls back to enum_crtsh() (HTTP, already
+    hardened with its own retry/backoff) when psql isn't available, or when
+    it ran but produced nothing — cheap insurance against a silent
+    connection failure looking identical to a genuinely empty result.
+    """
+    if use_psql:
+        rows = await backends.crtsh_psql(domain)
+        if rows:
+            out = {n.strip().lstrip("*.").lower() for n in rows}
+            out = {n for n in out if n and n.endswith(domain) and " " not in n}
+            if out:
+                return out
+    return await enum_crtsh(client, domain)
+
+
 async def enum_crtsh(client, domain: str) -> set:
     """
     crt.sh's web frontend is notoriously flaky under load (slow queries, 429s,
@@ -133,7 +154,7 @@ async def enum_subfinder(domain: str) -> set:
         return set()
 
 
-async def passive_enum(client, domains, keys) -> tuple[dict, dict]:
+async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict, dict]:
     """
     Returns (host_sources, per_source_counts):
       host_sources: {hostname -> set(source_names)}
@@ -143,7 +164,7 @@ async def passive_enum(client, domains, keys) -> tuple[dict, dict]:
     jobs = []                                       # (source_name, coroutine)
     for d in domains:
         jobs += [
-            ("crtsh",       enum_crtsh(client, d)),
+            ("crtsh",       enum_crtsh_best(client, d, use_psql=not no_pd)),
             ("certspotter", enum_certspotter(client, d)),
             ("otx",         enum_otx(client, d)),
             ("anubis",      enum_anubis(client, d)),

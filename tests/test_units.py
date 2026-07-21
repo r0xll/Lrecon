@@ -93,6 +93,66 @@ async def test_enum_crtsh_gives_up_after_max_attempts(monkeypatch):
     assert client.calls == 4
 
 
+# --------------------------------------------------------------------------- #
+# crt.sh direct-Postgres fallback (bypasses the flaky HTTP frontend entirely)
+# --------------------------------------------------------------------------- #
+async def test_crtsh_psql_parses_rows(monkeypatch):
+    monkeypatch.setattr(backends, "have", lambda t: True)
+    async def fake_run(cmd, stdin=None, timeout=900):
+        return "a.x.com\nb.x.com\n"
+    monkeypatch.setattr(backends, "_run", fake_run)
+    rows = await backends.crtsh_psql("x.com")
+    assert rows == ["a.x.com", "b.x.com"]
+
+
+async def test_crtsh_psql_not_on_path_returns_none(monkeypatch):
+    monkeypatch.setattr(backends, "have", lambda t: False)
+    assert await backends.crtsh_psql("x.com") is None
+
+
+async def test_crtsh_psql_empty_output_returns_none(monkeypatch):
+    # Covers both a genuinely empty result and a silent connection failure —
+    # either way the caller falls back to the HTTP path as cheap insurance.
+    monkeypatch.setattr(backends, "have", lambda t: True)
+    async def fake_run(cmd, stdin=None, timeout=900):
+        return ""
+    monkeypatch.setattr(backends, "_run", fake_run)
+    assert await backends.crtsh_psql("x.com") is None
+
+
+async def test_enum_crtsh_best_uses_psql_when_it_succeeds(monkeypatch):
+    async def fake_psql(domain):
+        return ["a.x.com", "*.b.x.com", "unrelated.example.com"]
+    monkeypatch.setattr(backends, "crtsh_psql", fake_psql)
+    async def fail_if_called(client, domain):
+        raise AssertionError("must not fall back to HTTP when psql already succeeded")
+    monkeypatch.setattr(sources, "enum_crtsh", fail_if_called)
+    out = await sources.enum_crtsh_best(None, "x.com")
+    assert out == {"a.x.com", "b.x.com"}
+
+
+async def test_enum_crtsh_best_falls_back_to_http_when_psql_unavailable(monkeypatch):
+    async def fake_psql(domain):
+        return None
+    monkeypatch.setattr(backends, "crtsh_psql", fake_psql)
+    async def fake_http(client, domain):
+        return {"c.x.com"}
+    monkeypatch.setattr(sources, "enum_crtsh", fake_http)
+    out = await sources.enum_crtsh_best(None, "x.com")
+    assert out == {"c.x.com"}
+
+
+async def test_enum_crtsh_best_no_pd_skips_psql_entirely(monkeypatch):
+    async def fail_if_called(domain):
+        raise AssertionError("psql must not be tried when use_psql=False (--no-pd)")
+    monkeypatch.setattr(backends, "crtsh_psql", fail_if_called)
+    async def fake_http(client, domain):
+        return {"d.x.com"}
+    monkeypatch.setattr(sources, "enum_crtsh", fake_http)
+    out = await sources.enum_crtsh_best(None, "x.com", use_psql=False)
+    assert out == {"d.x.com"}
+
+
 def test_parse_nvd_vuln_extracts_cvss_vector_desc_and_dos_flag():
     v = {"cve": {"id": "CVE-2026-1",
                  "descriptions": [{"lang": "en", "value": "Auth bypass allows remote code execution."}],
@@ -413,7 +473,7 @@ async def test_naabu_parse(monkeypatch):
 
 def test_available_backends_shape():
     bk = backends.available_backends()
-    assert set(bk) == {"subfinder", "dnsx", "httpx", "naabu", "nuclei"}
+    assert set(bk) == {"subfinder", "dnsx", "httpx", "naabu", "nuclei", "psql (crt.sh)"}
     assert all(isinstance(v, bool) for v in bk.values())
 
 

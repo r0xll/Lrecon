@@ -16,7 +16,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="LRecon (Let's Recon) v3.2 — external recon (authorized use only)")
     ap.add_argument("domains", nargs="*", help="root domain(s) in scope")
     ap.add_argument("--check-backends", action="store_true",
-                    help="validate ProjectDiscovery backends + parser mapping, then exit")
+                    help="validate optional backends (ProjectDiscovery tools + psql) + "
+                         "parser mapping, then exit")
     ap.add_argument("--check-active", action="store_true",
                     help="with --check-backends: let naabu/nuclei test-scan scanme.nmap.org")
     ap.add_argument("--passive-only", action="store_true",
@@ -40,7 +41,8 @@ def main() -> None:
                     help="run nuclei templated vuln scan on live hosts (needs nuclei binary)")
     ap.add_argument("--nuclei-severity", help="min nuclei severity (e.g. medium,high,critical)")
     ap.add_argument("--no-pd", action="store_true",
-                    help="force pure-Python paths; ignore ProjectDiscovery binaries")
+                    help="force pure-Python/HTTP paths; ignore ProjectDiscovery binaries "
+                         "and the psql-based crt.sh direct-DB accelerator")
     ap.add_argument("--diff", action="store_true", help="diff against previous run snapshot")
     ap.add_argument("--screenshots", action="store_true",
                     help="capture live-host screenshots (needs playwright)")
@@ -92,7 +94,7 @@ def main() -> None:
     else:
         bk = available_backends()
         active = [t for t, ok in bk.items() if ok]
-        log(f"[i] ProjectDiscovery backends: {', '.join(active) if active else 'none on PATH (pure-Python)'}")
+        log(f"[i] optional backends: {', '.join(active) if active else 'none on PATH (pure-Python)'}")
 
     t0 = time.time()
     res = asyncio.run(run(args.domains, args, keys))
