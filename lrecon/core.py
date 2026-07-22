@@ -10,6 +10,7 @@ from .enrich import *
 from .intel import *
 from .active import *
 from .state import *
+from .people import *
 from . import backends
 
 # --------------------------------------------------------------------------- #
@@ -230,9 +231,9 @@ async def run(domains, args, keys) -> list:
                 if g:
                     log(f"[+] email {d}: {g} ({len(email[d].get('issues', []))} issue(s))")
 
+        gh_limiter = RateLimiter(per_second=0.2)              # code search ~10/min; shared below
         github_findings = []
         if keys.get("github"):
-            gh_limiter = RateLimiter(per_second=0.2)          # code search ~10/min
             for d in domains:
                 github_findings += await github_dork(client, d, keys["github"], gh_limiter)
             if github_findings:
@@ -256,6 +257,30 @@ async def run(domains, args, keys) -> list:
                 breach[d] = b
         if breach:
             log(f"[+] breach: {sum(len(v) for v in breach.values())} known breach(es) for scope")
+
+        # ---- OSINT user enumeration (opt-in: runs if hunter/rocketreach/github
+        # keys are configured, same "presence of a key = opt-in" convention as
+        # the rest of lrecon's keyed enrichment) ----
+        people = []
+        if keys.get("hunter") or keys.get("rocketreach") or keys.get("github"):
+            for d in domains:
+                people += await enumerate_people(client, d, keys, gh_limiter, args.company_name)
+            if people:
+                log(f"[+] people-enum: {len(people)} company-affiliated email(s) discovered")
+
+            if args.verify_emails and people and not args.passive_only:
+                for d in domains:
+                    d_people = [p for p in people if p.email.endswith(f"@{d}")]
+                    if not d_people:
+                        continue
+                    statuses = await verify_emails(d, [p.email for p in d_people], ns)
+                    for p in d_people:
+                        p.smtp_status = statuses.get(p.email)
+                n_valid = sum(1 for p in people if p.smtp_status == "valid")
+                n_catchall = sum(1 for p in people if p.smtp_status == "catch-all")
+                n_invalid = sum(1 for p in people if p.smtp_status == "invalid")
+                log(f"[+] email verify: {n_valid} valid, {n_catchall} catch-all/inconclusive, "
+                    f"{n_invalid} invalid")
 
         # ---- NVD CVE enrichment (opt-in; cached) ----
         # Resolves CPEs to CVEs, and also enriches bare Shodan/InternetDB CVE IDs
@@ -350,6 +375,6 @@ async def run(domains, args, keys) -> list:
     return {"hosts": host_list, "per_source": dict(per_source), "cf": cf,
             "email": email, "github": github_findings, "buckets": buckets,
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
-            "nuclei": nuclei, "diff": diff, "entry_points": entry_points}
+            "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people}
 
 

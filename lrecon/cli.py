@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
 from .core import run
-from .report import write_markdown, write_html, write_live_hosts, write_csv, screenshot_hosts
+from .report import write_markdown, write_html, write_live_hosts, write_csv, write_users_csv, screenshot_hosts
 from .backends import available_backends
 from . import backends
 
@@ -49,6 +49,15 @@ def main() -> None:
     ap.add_argument("--resolvers", help=f"comma-separated DNS servers (default {','.join(DEFAULT_RESOLVERS)})")
     ap.add_argument("--shodan-key", help="Shodan API key (else env/config)")
     ap.add_argument("--ipinfo-key", help="IPinfo token (else env/config)")
+    ap.add_argument("--hunter-key", help="Hunter.io API key — company email OSINT (else env/config)")
+    ap.add_argument("--rocketreach-key", help="RocketReach API key — company people OSINT (else env/config)")
+    ap.add_argument("--company-name",
+                    help="company name override for people-enum sources that search by name "
+                         "rather than domain (e.g. RocketReach); defaults to the domain's label")
+    ap.add_argument("--verify-emails", action="store_true",
+                    help="SMTP RCPT-TO probe discovered company emails against the domain's MX "
+                         "(active — touches target mail infra; detects and flags catch-all domains "
+                         "rather than reporting false positives)")
     ap.add_argument("--ask-keys", action="store_true", help="prompt for keys via getpass")
     ap.add_argument("--config", help="config json path (default ~/.config/lrecon/config.json)")
     ap.add_argument("-c", "--concurrency", type=int, default=50)
@@ -79,6 +88,9 @@ def main() -> None:
 
     if args.active_ports and args.passive_only:
         ap.error("--active-ports conflicts with --passive-only")
+    if args.verify_emails and args.passive_only:
+        ap.error("--verify-emails conflicts with --passive-only (it opens an SMTP "
+                 "connection to the target's own MX)")
     args.ports = [int(p) for p in args.ports.split(",")] if args.ports else TOP_PORTS
 
     if not _HAVE_DNS and not args.passive_only:
@@ -89,6 +101,10 @@ def main() -> None:
         f" | ASN/org/rDNS via {'IPinfo' if keys['ipinfo'] else 'disabled'}"
         f" | github {'on' if keys['github'] else 'off'}"
         f" | hibp {'key' if keys['hibp'] else 'keyless'}")
+    people_sources = [n for n, k in (("hunter", keys["hunter"]), ("rocketreach", keys["rocketreach"]),
+                                     ("github", keys["github"])) if k]
+    log(f"[i] people-enum: {', '.join(people_sources) if people_sources else 'off (no hunter/rocketreach/github key)'}"
+        f" | email verify: {'on (active)' if args.verify_emails else 'off'}")
     if args.no_pd:
         log("[i] backends: forced pure-Python (--no-pd)")
     else:
@@ -106,11 +122,13 @@ def main() -> None:
     html_path = f"{out_base}.html"
     live_path = f"{out_base}.live.txt"
     csv_path = f"{out_base}.targets.csv"
+    users_path = f"{out_base}.users.csv"
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
                                 "entry_points")}
     full["hosts"] = [h.to_dict() for h in hosts]
+    full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
     write_markdown(hosts, args.domains, res, md_path)
     write_html(hosts, args.domains, res, html_path)
@@ -118,6 +136,10 @@ def main() -> None:
     write_csv(hosts, csv_path)
 
     outputs = [json_path, md_path, html_path, live_path, csv_path]
+    people = res.get("people") or []
+    if people:
+        write_users_csv(people, users_path)
+        outputs.append(users_path)
     if args.screenshots:
         urls = [l for l in Path(live_path).read_text().splitlines() if l]
         shot_dir = f"{out_base}_shots"
@@ -128,7 +150,7 @@ def main() -> None:
 
     n_entry = len(res.get("entry_points") or [])
     log(f"[+] done in {time.time()-t0:.1f}s — {len(hosts)} hosts, {n_live} live URLs, "
-        f"{n_entry} potential entry point(s)")
+        f"{n_entry} potential entry point(s), {len(people)} enumerated user(s)")
     log(f"[+] {'  '.join(outputs)}")
 
 
