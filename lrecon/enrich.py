@@ -44,7 +44,7 @@ async def enrich_internetdb(client, ip) -> dict:
     return {}
 
 
-def apply_ipinfo(h: Host, data: dict) -> None:
+def apply_ipinfo(h: Host, data: dict, ip: str | None = None) -> None:
     if not data:
         return
     h.enrich_src.add("ipinfo")
@@ -55,6 +55,8 @@ def apply_ipinfo(h: Host, data: dict) -> None:
         if parts[0].startswith("AS"):
             h.asn = parts[0]
             h.org = h.org or (parts[1] if len(parts) > 1 else org)
+            if ip:
+                h.ip_asn[ip] = parts[0]
         else:
             h.org = h.org or org
     h.rdns = h.rdns or data.get("hostname")

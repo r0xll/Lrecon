@@ -34,6 +34,15 @@ def test_apply_ipinfo_parses_asn_and_org():
     assert h.org == "Google LLC"
     assert h.rdns == "a.x.com"
     assert h.country == "US"
+    assert h.ip_asn == {}                        # no ip passed -> per-IP map untouched
+
+
+def test_apply_ipinfo_records_per_ip_asn_for_multi_ip_hosts():
+    h = Host("a.x.com", ips=["1.2.3.4", "5.6.7.8"])
+    enrich.apply_ipinfo(h, {"org": "AS15169 Google LLC"}, "1.2.3.4")
+    enrich.apply_ipinfo(h, {"org": "AS13335 Cloudflare"}, "5.6.7.8")
+    assert h.ip_asn == {"1.2.3.4": "AS15169", "5.6.7.8": "AS13335"}
+    assert h.asn == "AS13335"                    # scalar field: still last-IP-wins
 
 
 def test_apply_ports_merges_and_tags_source():
@@ -480,19 +489,25 @@ def test_available_backends_shape():
 # --------------------------------------------------------------------------- #
 # Reporting: CSV target list
 # --------------------------------------------------------------------------- #
-def test_write_csv_has_only_subdomain_and_ips():
+def test_write_csv_has_subdomain_ips_and_per_ip_asn():
     hosts = [
         Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC",
-             country="US", scheme="https", http_status=200, source={"crtsh"}),
-        Host("wild.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"}),
+             country="US", scheme="https", http_status=200, source={"crtsh"},
+             ip_asn={"1.2.3.4": "AS15169"}),
+        # multi-IP host, only one IP resolved to an ASN — asn column stays
+        # positionally parallel to ips, blank where unresolved.
+        Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"},
+             ip_asn={"8.8.8.8": "AS15169"}),
     ]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
         n = report.write_csv(hosts, str(path))
         assert n == 2
         rows = list(csv.DictReader(path.open()))
-    assert list(rows[0].keys()) == ["subdomain", "ips"]
+    assert list(rows[0].keys()) == ["subdomain", "ips", "asn"]
     assert rows[0]["subdomain"] == "a.x.com"
     assert rows[0]["ips"] == "1.2.3.4"
-    assert rows[1]["subdomain"] == "wild.x.com"
+    assert rows[0]["asn"] == "AS15169"
+    assert rows[1]["subdomain"] == "multi.x.com"
     assert rows[1]["ips"] == "9.9.9.9, 8.8.8.8"
+    assert rows[1]["asn"] == ", AS15169"          # blank for 9.9.9.9, resolved for 8.8.8.8

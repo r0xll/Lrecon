@@ -181,6 +181,7 @@ class Host:
     org: str | None = None
     isp: str | None = None
     asn: str | None = None
+    ip_asn: dict = field(default_factory=dict)   # {ip: "ASxxxxx"} — asn above is last-IP-wins
     rdns: str | None = None
     country: str | None = None
     http_status: int | None = None
