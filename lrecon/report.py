@@ -11,14 +11,24 @@ def write_csv(hosts, path) -> int:
     """
     Flat target list for client scope confirmation — one row per discovered
     host (including wildcard-suspect ones, so the client can weigh in on
-    those too). Deliberately just subdomain + IPs: this is "here's what we
-    found in your scope, please confirm ownership," not a vuln report.
+    those too). Deliberately just subdomain + IPs (+ per-IP ASN): this is
+    "here's what we found in your scope, please confirm ownership," not a
+    vuln report. The asn column is positionally parallel to ips — the ASN
+    at index i belongs to the IP at index i, blank where unresolved (e.g.
+    no IPinfo token configured for that run). For single-IP hosts, falls
+    back to the scalar h.asn if ip_asn wasn't populated for that IP —
+    unambiguous with only one IP, and guards against any future caller of
+    apply_ipinfo() that omits the optional ip argument.
     """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["subdomain", "ips"])
+        w.writerow(["subdomain", "ips", "asn"])
         for h in hosts:
-            w.writerow([h.subdomain, ", ".join(h.ips)])
+            if len(h.ips) == 1:
+                asn_col = h.ip_asn.get(h.ips[0]) or h.asn or ""
+            else:
+                asn_col = ", ".join(h.ip_asn.get(ip, "") for ip in h.ips)
+            w.writerow([h.subdomain, ", ".join(h.ips), asn_col])
     return len(hosts)
 
 

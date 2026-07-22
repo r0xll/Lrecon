@@ -124,7 +124,7 @@ async def run(domains, args, keys) -> list:
             for ip, ports_data, info in results:
                 for h in ip_to_hosts[ip]:
                     apply_ports(h, ports_data, ports_src)
-                    apply_ipinfo(h, info)
+                    apply_ipinfo(h, info, ip)
 
         # ---- Phase 4: active probe / port scan / favicon ----
         if not args.passive_only:
