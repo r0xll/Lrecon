@@ -34,9 +34,97 @@ async def _gather_with_progress(coros, desc, use_progress):
     return await asyncio.gather(*coros)
 
 
+async def verify_keys(client, keys: dict) -> None:
+    """
+    On-boot API key verification — one cheap, non-quota-consuming call per
+    configured key (account-info endpoints where available, not the actual
+    feature endpoints), so a bad/expired key surfaces immediately as
+    "Invalid" instead of silently degrading whatever phase uses it later.
+    Nulls out rejected keys in keys (in place) so the rest of the pipeline
+    automatically falls back to keyless/skips that service, same as the
+    prior Shodan-only check this replaces.
+    """
+    if keys.get("shodan"):
+        try:
+            r = await client.get(f"https://api.shodan.io/api-info?key={keys['shodan']}", timeout=15)
+            if r.status_code == 200:
+                log(f"[+] Shodan API: Ready — query credits: {r.json().get('query_credits', '?')}")
+            elif r.status_code == 401:
+                log("[!] Shodan API: Invalid — falling back to keyless InternetDB")
+                keys["shodan"] = None
+            else:
+                log(f"[!] Shodan API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
+        except Exception as e:
+            log(f"[!] Shodan API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("ipinfo"):
+        try:
+            r = await client.get("https://ipinfo.io/json", params={"token": keys["ipinfo"]}, timeout=15)
+            body = r.json() if r.content else {}
+            if r.status_code == 200 and "error" not in body:
+                log("[+] IPinfo API: Ready")
+            elif r.status_code in (401, 403) or "error" in body:
+                log("[!] IPinfo API: Invalid — falling back to keyless (ASN/org/rDNS disabled)")
+                keys["ipinfo"] = None
+            else:
+                log(f"[!] IPinfo API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
+        except Exception as e:
+            log(f"[!] IPinfo API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("github"):
+        try:
+            r = await client.get("https://api.github.com/user",
+                                headers={"Authorization": f"Bearer {keys['github']}",
+                                        "User-Agent": "lrecon"}, timeout=15)
+            if r.status_code == 200:
+                log(f"[+] GitHub API: Ready (as {r.json().get('login', '?')})")
+            elif r.status_code == 401:
+                log("[!] GitHub API: Invalid — code dorking / email harvest disabled")
+                keys["github"] = None
+            else:
+                log(f"[!] GitHub API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
+        except Exception as e:
+            log(f"[!] GitHub API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("hunter"):
+        try:
+            r = await client.get("https://api.hunter.io/v2/account",
+                                params={"api_key": keys["hunter"]}, timeout=15)
+            if r.status_code == 200:
+                searches = r.json().get("data", {}).get("requests", {}).get("searches", {})
+                left = searches.get("available", "?") if isinstance(searches, dict) else "?"
+                log(f"[+] Hunter.io API: Ready — searches available: {left}")
+            elif r.status_code in (401, 403):
+                log("[!] Hunter.io API: Invalid — company email OSINT via Hunter disabled")
+                keys["hunter"] = None
+            else:
+                log(f"[!] Hunter.io API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
+        except Exception as e:
+            log(f"[!] Hunter.io API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("rocketreach"):
+        try:
+            r = await client.get("https://api.rocketreach.co/v2/api/account/",
+                                headers={"Api-Key": keys["rocketreach"]}, timeout=15)
+            if r.status_code == 200:
+                log("[+] RocketReach API: Ready")
+            elif r.status_code in (401, 403):
+                log("[!] RocketReach API: Invalid — company people search via RocketReach disabled")
+                keys["rocketreach"] = None
+            else:
+                log(f"[!] RocketReach API: unexpected response (HTTP {r.status_code}) "
+                    "— best-effort check (see people.py), proceeding anyway")
+        except Exception as e:
+            log(f"[!] RocketReach API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("hibp"):
+        # hibp_breaches() only calls HIBP's keyless domain-breaches endpoint —
+        # there's nothing keyed to verify here yet, so just say so plainly
+        # rather than pretending to validate a key that isn't sent anywhere.
+        log("[i] HIBP: key configured but not required — domain-breach lookup uses HIBP's keyless endpoint")
+
+
 async def run(domains, args, keys) -> list:
-    shodan_key = keys.get("shodan")
-    ipinfo_token = keys.get("ipinfo")
     ns = args.resolvers.split(",") if args.resolvers else DEFAULT_RESOLVERS
     use_prog = _HAVE_RICH and not args.no_progress
     limits = httpx.Limits(max_connections=args.concurrency)
@@ -52,16 +140,9 @@ async def run(domains, args, keys) -> list:
               httpx.AsyncClient(limits=limits, headers=headers, verify=False,
                                 follow_redirects=False) as probe_client:
 
-        if shodan_key:
-            try:
-                r = await client.get(f"https://api.shodan.io/api-info?key={shodan_key}", timeout=15)
-                if r.status_code == 200:
-                    log(f"[+] Shodan key OK — query credits: {r.json().get('query_credits','?')}")
-                elif r.status_code == 401:
-                    log("[!] Shodan key rejected — falling back to keyless InternetDB")
-                    shodan_key = None
-            except Exception:
-                pass
+        await verify_keys(client, keys)
+        shodan_key = keys.get("shodan")           # re-sync: verify_keys() may have nulled either
+        ipinfo_token = keys.get("ipinfo")
 
         # ---- Phase 1: passive enum (with source attribution) ----
         host_sources, per_source = await passive_enum(client, domains, keys, no_pd=args.no_pd)

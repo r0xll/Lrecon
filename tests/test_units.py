@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import enrich, intel, state, backends, sources, report, people, cli
+from lrecon import enrich, intel, state, backends, sources, report, people, cli, core
 from lrecon.common import Host, Person, CF_FALLBACK
 
 
@@ -63,6 +63,7 @@ class _FakeResp:
     def __init__(self, status_code, data=None):
         self.status_code = status_code
         self._data = data
+        self.content = b"1" if data is not None else b""
 
     def json(self):
         return self._data
@@ -776,3 +777,68 @@ async def test_verify_emails_non_550_rejection_is_unknown_not_invalid(monkeypatc
 
     out = await people.verify_emails("x.com", ["jane.doe@x.com"], None)
     assert out == {"jane.doe@x.com": "unknown"}
+
+
+# --------------------------------------------------------------------------- #
+# On-boot API key verification
+# --------------------------------------------------------------------------- #
+class _FakeKeyCheckClient:
+    """Routes GET requests to canned responses by URL substring."""
+    def __init__(self, responses: dict):
+        self._responses = responses
+        self.calls = []
+
+    async def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(url)
+        for needle, resp in self._responses.items():
+            if needle in url:
+                return resp
+        return _FakeResp(404)
+
+
+async def test_verify_keys_marks_ready_and_invalid_and_nulls_bad_keys():
+    client = _FakeKeyCheckClient({
+        "shodan.io/api-info": _FakeResp(200, {"query_credits": 100}),
+        "ipinfo.io": _FakeResp(401),
+        "api.github.com/user": _FakeResp(200, {"login": "octocat"}),
+        "hunter.io/v2/account": _FakeResp(401),
+        "rocketreach.co": _FakeResp(200, {}),
+    })
+    keys = {"shodan": "sk", "ipinfo": "ik", "github": "gk", "hibp": "hk",
+            "hunter": "hnk", "rocketreach": "rrk"}
+    await core.verify_keys(client, keys)
+    assert keys["shodan"] == "sk"                 # 200 -> kept
+    assert keys["ipinfo"] is None                 # 401 -> nulled
+    assert keys["github"] == "gk"                 # 200 -> kept
+    assert keys["hunter"] is None                 # 401 -> nulled
+    assert keys["rocketreach"] == "rrk"            # 200 -> kept
+    assert keys["hibp"] == "hk"                    # never touched (keyless endpoint, not checked)
+
+
+async def test_verify_keys_ipinfo_error_in_200_body_counts_as_invalid():
+    # IPinfo sometimes returns HTTP 200 with an {"error": ...} body for a bad token.
+    client = _FakeKeyCheckClient({"ipinfo.io": _FakeResp(200, {"error": {"title": "Wrong Token"}})})
+    keys = {"shodan": None, "ipinfo": "bad", "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
+    await core.verify_keys(client, keys)
+    assert keys["ipinfo"] is None
+
+
+async def test_verify_keys_skips_unconfigured_services():
+    client = _FakeKeyCheckClient({})
+    keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
+    await core.verify_keys(client, keys)
+    assert client.calls == []                     # nothing configured -> zero requests made
+
+
+async def test_verify_keys_check_failure_does_not_null_the_key():
+    # A network error/timeout during the check isn't proof the key is bad —
+    # only an explicit 401/403 should null it out.
+    class _RaisingClient:
+        async def get(self, *a, **kw):
+            raise TimeoutError("connect timed out")
+    keys = {"shodan": "sk", "ipinfo": None, "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
+    await core.verify_keys(_RaisingClient(), keys)
+    assert keys["shodan"] == "sk"
