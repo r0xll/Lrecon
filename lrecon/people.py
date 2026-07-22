@@ -60,7 +60,16 @@ async def hunter_domain_search(client, domain: str, api_key: str) -> tuple[str |
 # the same ~10/min code-search quota).
 # --------------------------------------------------------------------------- #
 def _extract_emails_from_text_matches(items: list, domain: str) -> set:
-    pattern = re.compile(r"[A-Za-z0-9._%+\-]+@" + re.escape(domain), re.IGNORECASE)
+    # Boundary check after the domain so "alice@example.com.au" or
+    # "alice@example.company" (a different, longer domain) can't be truncated
+    # into a false in-scope "alice@example.com" hit. Two lookaheads: reject an
+    # immediately-following alnum/hyphen (unambiguous continuation, e.g.
+    # ".company"), and reject a "." that's itself followed by an alnum (a
+    # continuing label, e.g. ".com.au") — but allow a bare trailing "." as
+    # ordinary sentence punctuation ("reach out to alice@example.com.").
+    pattern = re.compile(
+        r"[A-Za-z0-9._%+\-]+@" + re.escape(domain) + r"(?![A-Za-z0-9\-])(?!\.[A-Za-z0-9])",
+        re.IGNORECASE)
     out = set()
     for item in items or []:
         for tm in item.get("text_matches", []) or []:
@@ -171,6 +180,21 @@ def generate_candidate_emails(names: list, domain: str, pattern: str | None) -> 
 # anything blocking port 25 from cloud/datacenter source IPs) will make this
 # come back "unknown" for the whole domain — expected, not a bug.
 # --------------------------------------------------------------------------- #
+def _rcpt_status(code: int) -> str:
+    """
+    Only 550 ("no such user") is a definitive rejection. Everything else
+    outside 250/251 — 4xx temp-fail/greylisting, and other 5xx policy codes
+    (mailbox full, relay restrictions, syntax quibbles) — is not proof the
+    address doesn't exist, so it stays "unknown" rather than a false-negative
+    "invalid" that would wrongly drop a real target from the candidate list.
+    """
+    if code in (250, 251):
+        return "valid"
+    if code == 550:
+        return "invalid"
+    return "unknown"
+
+
 async def _smtp_read_response(reader) -> int:
     """Read a full (possibly multi-line '250-' continuation) SMTP response; return the status code."""
     code = 0
@@ -219,14 +243,22 @@ async def verify_emails(domain: str, emails: list, resolver_ns, mail_from: str |
 
         rand_local = "lrecon-verify-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=12))
         catchall_code = await cmd(f"RCPT TO:<{rand_local}@{domain}>")
-        if catchall_code in (250, 251):
+        catchall_result = _rcpt_status(catchall_code)
+        if catchall_result == "valid":
             log(f"[!] email verify {domain}: catch-all domain — results are inconclusive")
             for e in emails:
                 out[e] = "catch-all"
-        else:
+        elif catchall_result == "unknown":
+            # Ambiguous/temp-fail response even for a garbage address (e.g.
+            # greylisting) — every real address probed on this connection
+            # would hit the same ambiguity, so leave everything at the
+            # "unknown" default rather than probing further.
+            log(f"[!] email verify {domain}: ambiguous RCPT response (code {catchall_code}) "
+                f"— treating as unknown rather than probing further")
+        else:   # "invalid" — the server does reject nonexistent users, so real checks are meaningful
             for e in emails:
                 code = await cmd(f"RCPT TO:<{e}>")
-                out[e] = "valid" if code in (250, 251) else "invalid"
+                out[e] = _rcpt_status(code)
         await cmd("QUIT")
     except Exception as e:
         log(f"[!] email verify {domain}: {e}")

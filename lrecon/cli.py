@@ -88,6 +88,9 @@ def main() -> None:
 
     if args.active_ports and args.passive_only:
         ap.error("--active-ports conflicts with --passive-only")
+    if args.verify_emails and args.passive_only:
+        ap.error("--verify-emails conflicts with --passive-only (it opens an SMTP "
+                 "connection to the target's own MX)")
     args.ports = [int(p) for p in args.ports.split(",")] if args.ports else TOP_PORTS
 
     if not _HAVE_DNS and not args.passive_only:

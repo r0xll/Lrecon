@@ -268,7 +268,7 @@ async def run(domains, args, keys) -> list:
             if people:
                 log(f"[+] people-enum: {len(people)} company-affiliated email(s) discovered")
 
-            if args.verify_emails and people:
+            if args.verify_emails and people and not args.passive_only:
                 for d in domains:
                     d_people = [p for p in people if p.email.endswith(f"@{d}")]
                     if not d_people:

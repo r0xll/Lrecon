@@ -1,11 +1,14 @@
 """Unit tests for LRecon pure-logic and backend parsers (no network required)."""
 import csv
 import ipaddress
+import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 import lrecon
-from lrecon import enrich, intel, state, backends, sources, report, people
+from lrecon import enrich, intel, state, backends, sources, report, people, cli
 from lrecon.common import Host, Person, CF_FALLBACK
 
 
@@ -557,6 +560,29 @@ def test_extract_emails_from_text_matches_finds_addresses_at_domain():
     assert out == {"john.smith@x.com", "jane@x.com"}
 
 
+def test_extract_emails_from_text_matches_rejects_longer_domain_suffix():
+    # alice@x.com.au and alice@x.company are NOT x.com addresses — a missing
+    # boundary check after the domain would truncate them into false hits.
+    items = [{"text_matches": [{"fragment": "alice@x.com.au reached out, so did bob@x.company"}]}]
+    assert people._extract_emails_from_text_matches(items, "x.com") == set()
+
+
+def test_extract_emails_from_text_matches_accepts_domain_at_string_end_or_before_punctuation():
+    items = [{"text_matches": [{"fragment": "contact: alice@x.com."}]},
+             {"text_matches": [{"fragment": "bob@x.com"}]}]
+    out = people._extract_emails_from_text_matches(items, "x.com")
+    assert out == {"alice@x.com", "bob@x.com"}
+
+
+def test_verify_emails_conflicts_with_passive_only(monkeypatch, capsys):
+    # --verify-emails opens an SMTP connection to the target's own MX — that
+    # must be rejected under --passive-only's zero-target-touch guarantee.
+    monkeypatch.setattr(sys, "argv", ["lrecon", "--passive-only", "--verify-emails", "x.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--verify-emails conflicts with --passive-only" in capsys.readouterr().err
+
+
 def test_apply_pattern_supports_first_last_f_l_tokens():
     assert people._apply_pattern("{first}.{last}", "Jane", "Doe", "x.com") == "jane.doe@x.com"
     assert people._apply_pattern("{f}{last}", "Jane", "Doe", "x.com") == "jdoe@x.com"
@@ -693,5 +719,60 @@ async def test_verify_emails_no_mx_returns_unknown(monkeypatch):
         async def resolve(self, domain, rtype):
             raise Exception("NXDOMAIN")
     monkeypatch.setattr(people, "get_resolver", lambda ns: _NoMXResolver())
+    out = await people.verify_emails("x.com", ["jane.doe@x.com"], None)
+    assert out == {"jane.doe@x.com": "unknown"}
+
+
+def test_rcpt_status_only_550_is_definitive_rejection():
+    assert people._rcpt_status(250) == "valid"
+    assert people._rcpt_status(251) == "valid"
+    assert people._rcpt_status(550) == "invalid"
+    # temp-fail/greylisting and other policy codes are NOT proof of absence
+    assert people._rcpt_status(450) == "unknown"
+    assert people._rcpt_status(451) == "unknown"
+    assert people._rcpt_status(452) == "unknown"
+    assert people._rcpt_status(421) == "unknown"
+    assert people._rcpt_status(553) == "unknown"
+
+
+async def test_verify_emails_greylisted_catchall_probe_stays_unknown(monkeypatch):
+    # The catch-all probe itself gets a temp-fail (greylisting) — every real
+    # address on this connection would hit the same ambiguity, so results
+    # must stay at the "unknown" default rather than being probed further
+    # and potentially misclassified.
+    reader = _FakeSMTPReader([
+        b"220 mail.x.com ESMTP\r\n",           # banner
+        b"250 mail.x.com\r\n",                 # EHLO
+        b"250 OK\r\n",                          # MAIL FROM
+        b"450 Greylisted, try again later\r\n", # RCPT TO (catch-all probe) -> ambiguous
+    ])
+    writer = _FakeSMTPWriter()
+    monkeypatch.setattr(people, "get_resolver", lambda ns: _FakeResolver("mail.x.com"))
+    async def fake_open_connection(host, port):
+        return reader, writer
+    monkeypatch.setattr(people.asyncio, "open_connection", fake_open_connection)
+
+    out = await people.verify_emails("x.com", ["jane.doe@x.com"], None)
+    assert out == {"jane.doe@x.com": "unknown"}
+    # no RCPT TO was sent for the real candidate — only the catch-all probe
+    rcpt_lines = [s for s in writer.sent if s.startswith("RCPT")]
+    assert len(rcpt_lines) == 1
+
+
+async def test_verify_emails_non_550_rejection_is_unknown_not_invalid(monkeypatch):
+    reader = _FakeSMTPReader([
+        b"220 mail.x.com ESMTP\r\n",           # banner
+        b"250 mail.x.com\r\n",                 # EHLO
+        b"250 OK\r\n",                          # MAIL FROM
+        b"550 No such user\r\n",                # RCPT TO (catch-all probe) -> definitive reject
+        b"452 Too many recipients\r\n",         # RCPT TO jane.doe@x.com -> temp-fail, not definitive
+        b"221 Bye\r\n",                         # QUIT
+    ])
+    writer = _FakeSMTPWriter()
+    monkeypatch.setattr(people, "get_resolver", lambda ns: _FakeResolver("mail.x.com"))
+    async def fake_open_connection(host, port):
+        return reader, writer
+    monkeypatch.setattr(people.asyncio, "open_connection", fake_open_connection)
+
     out = await people.verify_emails("x.com", ["jane.doe@x.com"], None)
     assert out == {"jane.doe@x.com": "unknown"}
