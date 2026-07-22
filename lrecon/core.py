@@ -104,7 +104,7 @@ async def verify_keys(client, keys: dict) -> None:
 
     if keys.get("rocketreach"):
         try:
-            r = await client.get("https://api.rocketreach.co/v2/api/account/",
+            r = await client.get("https://api.rocketreach.co/api/v2/account",
                                 headers={"Api-Key": keys["rocketreach"]}, timeout=15)
             if r.status_code == 200:
                 log("[+] RocketReach API: Ready")
@@ -112,8 +112,7 @@ async def verify_keys(client, keys: dict) -> None:
                 log("[!] RocketReach API: Invalid — company people search via RocketReach disabled")
                 keys["rocketreach"] = None
             else:
-                log(f"[!] RocketReach API: unexpected response (HTTP {r.status_code}) "
-                    "— best-effort check (see people.py), proceeding anyway")
+                log(f"[!] RocketReach API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
         except Exception as e:
             log(f"[!] RocketReach API: check failed ({e}) — proceeding anyway")
 
