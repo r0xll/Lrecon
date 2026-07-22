@@ -511,3 +511,14 @@ def test_write_csv_has_subdomain_ips_and_per_ip_asn():
     assert rows[1]["subdomain"] == "multi.x.com"
     assert rows[1]["ips"] == "9.9.9.9, 8.8.8.8"
     assert rows[1]["asn"] == ", AS15169"          # blank for 9.9.9.9, resolved for 8.8.8.8
+
+
+def test_write_csv_single_ip_host_falls_back_to_scalar_asn():
+    # ip_asn wasn't populated (e.g. a caller of apply_ipinfo() that omitted
+    # the optional ip arg), but h.asn is known and unambiguous for one IP.
+    h = Host("a.x.com", ips=["1.2.3.4"], asn="AS15169")
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "targets.csv"
+        report.write_csv([h], str(path))
+        rows = list(csv.DictReader(path.open()))
+    assert rows[0]["asn"] == "AS15169"
