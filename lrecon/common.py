@@ -15,7 +15,9 @@ Enrichment note: Shodan/InternetDB only hold data for IPs they've scanned, so
 they're often empty — that's expected. IPinfo fills ASN/org/rDNS regardless.
 
 Key precedence (each): --<svc>-key  >  $<SVC>_API_KEY / $IPINFO_TOKEN  >  config
-Config: ~/.config/lrecon/config.json  {"shodan_api_key":"...","ipinfo_token":"..."}
+Config: ~/.config/lrecon/config.json  {"shodan_api_key":"...","ipinfo_token":"...",
+  "github_token":"...", "hibp_api_key":"...", "hunter_api_key":"...",
+  "rocketreach_api_key":"..."}
 
 ROE tiers: --passive-only | (default active) | --active-ports
 ATT&CK: TA0043. Passive ~T1596/T1593. Active ~T1595/T1590. Takeover ~T1584.001.
@@ -67,7 +69,7 @@ def log(msg: str) -> None:
 
 # names re-exported to sibling modules via `from .common import *`
 __all__ = [
-    "log", "Host", "RateLimiter", "load_keys",
+    "log", "Host", "Person", "RateLimiter", "load_keys",
     "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
     "_HAVE_DNS", "_HAVE_RICH", "_console",
     "Progress", "SpinnerColumn", "BarColumn", "TextColumn",
@@ -119,7 +121,8 @@ CF_FALLBACK = [
 # Config / API keys
 # --------------------------------------------------------------------------- #
 def load_keys(args) -> dict:
-    keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None}
+    keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
     cfg = Path(args.config) if args.config else CONFIG_PATH
     if cfg.exists():
         try:
@@ -128,16 +131,24 @@ def load_keys(args) -> dict:
             keys["ipinfo"] = data.get("ipinfo_token")
             keys["github"] = data.get("github_token")
             keys["hibp"] = data.get("hibp_api_key")
+            keys["hunter"] = data.get("hunter_api_key")
+            keys["rocketreach"] = data.get("rocketreach_api_key")
         except Exception as e:
             log(f"[!] config read failed: {e}")
     keys["shodan"] = os.environ.get("SHODAN_API_KEY") or keys["shodan"]
     keys["ipinfo"] = os.environ.get("IPINFO_TOKEN") or keys["ipinfo"]
     keys["github"] = os.environ.get("GITHUB_TOKEN") or keys["github"]
     keys["hibp"] = os.environ.get("HIBP_API_KEY") or keys["hibp"]
+    keys["hunter"] = os.environ.get("HUNTER_API_KEY") or keys["hunter"]
+    keys["rocketreach"] = os.environ.get("ROCKETREACH_API_KEY") or keys["rocketreach"]
     if args.shodan_key:
         keys["shodan"] = args.shodan_key
     if args.ipinfo_key:
         keys["ipinfo"] = args.ipinfo_key
+    if args.hunter_key:
+        keys["hunter"] = args.hunter_key
+    if args.rocketreach_key:
+        keys["rocketreach"] = args.rocketreach_key
     if args.ask_keys:
         import getpass
         if not keys["shodan"]:
@@ -202,6 +213,28 @@ class Host:
         d = asdict(self)
         d["source"] = sorted(self.source)
         d["enrich_src"] = sorted(self.enrich_src)
+        return d
+
+
+@dataclass
+class Person:
+    """
+    One company-affiliated person discovered via OSINT — deliberately just
+    professional/company data (name, title, company email), never personal
+    accounts/contact info, matching the intended use as a red-team phishing/
+    password-spray candidate list, not a broader people-search result.
+    """
+    email: str
+    name: str | None = None
+    position: str | None = None
+    confidence: int | None = None        # 0-100 where the source provides one (e.g. Hunter)
+    generated: bool = False              # True if pattern-generated, not directly observed
+    smtp_status: str | None = None       # "valid" | "invalid" | "catch-all" | "unknown" | None
+    source: set = field(default_factory=set)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["source"] = sorted(self.source)
         return d
 
 

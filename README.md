@@ -83,6 +83,8 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | CF origin | Cloudflare detection + origin-IP candidates (+ optional confirm) | confirm step only |
 | Expansion | ASN->netblock (RIPEstat) + reverse-DNS sweep, rDNS wire-back | DNS only |
 | Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
+| People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
+| Email verify | SMTP RCPT-TO probe of discovered emails (opt-in, `--verify-emails`) | yes, mail infra |
 | CVE | NVD CPE->CVE resolution (opt-in, cached) | none (API) |
 | Diff | change vs previous run snapshot | none |
 
@@ -130,8 +132,10 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 |---|---|---|---|---|
 | Shodan | ports/CVE enrichment, passive DNS, cert search | `--shodan-key` | `SHODAN_API_KEY` | limited |
 | IPinfo | ASN / org / reverse-DNS / geo | `--ipinfo-key` | `IPINFO_TOKEN` | 50k/mo |
-| GitHub | code dorking for leaked secrets/hostnames | — | `GITHUB_TOKEN` | free |
+| GitHub | code dorking for leaked secrets/hostnames; also company email harvest (see [People OSINT](#people-osint-user-enumeration)) | — | `GITHUB_TOKEN` | free |
 | HIBP | breach-by-domain (keyless list endpoint) | — | `HIBP_API_KEY` | keyless list |
+| Hunter.io | company email enumeration + naming-pattern detection | `--hunter-key` | `HUNTER_API_KEY` | limited |
+| RocketReach | company people search (name/title only — see below) | `--rocketreach-key` | `ROCKETREACH_API_KEY` | limited |
 
 ```fish
 # persistent (fish universal vars — visible inside the venv)
@@ -140,7 +144,7 @@ set -Ux IPINFO_TOKEN   "..."
 
 # or config file
 mkdir -p ~/.config/lrecon
-echo '{"shodan_api_key":"...","ipinfo_token":"..."}' > ~/.config/lrecon/config.json
+echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"..."}' > ~/.config/lrecon/config.json
 
 # or interactive (stays out of shell history)
 lrecon example.com --ask-keys
@@ -188,6 +192,8 @@ httpx -l client.live.txt -tech-detect -title
 | `--buckets` | cloud bucket permutation enumeration (S3/GCS/Azure) |
 | `--bucket-keywords` | extra comma-separated bucket name keywords |
 | `--nvd` | resolve CPEs to CVEs via NVD (slow, rate-limited, cached) |
+| `--company-name` | company name override for name-based people-enum sources (default: domain label) |
+| `--verify-emails` | SMTP RCPT-TO probe of discovered company emails (active, ROE-gated) |
 | `--diff` | diff against previous run snapshot |
 | `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei) |
 | `--nuclei-severity` | min nuclei severity, e.g. `medium,high,critical` |
@@ -209,8 +215,11 @@ Per run, `<out>.*`:
   leads, favicon pivots, full attack-surface table, CVE hits.
 - **`<out>.html`** — self-contained styled HTML report for client sharing.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
-  favicon_pivots, diff, per_source).
+  favicon_pivots, diff, per_source, entry_points, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
+- **`<out>.targets.csv`** — flat subdomain/IP/ASN list for client scope confirmation.
+- **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
+  key is configured (see [People OSINT](#people-osint-user-enumeration)).
 - **`<out>_shots/`** — live-host screenshots (with `--screenshots`).
 
 Run snapshots are cached under `~/.local/share/lrecon/` to power `--diff`.
@@ -246,6 +255,44 @@ ranges / Authenticated Origin Pulls / cloudflared tunnel).
 
 ---
 
+## People OSINT (user enumeration)
+
+Builds a red-team phishing/password-spray candidate list — **company-affiliated
+data only**, never personal accounts or personal contact info. Runs automatically
+whenever a Hunter.io, RocketReach, or GitHub key is configured (same "presence of
+a key = opt-in" convention as the rest of lrecon's keyed enrichment); output goes
+to `<out>.users.csv` and the `people` block in the JSON.
+
+| Source | What it gives you | Notes |
+|---|---|---|
+| **Hunter.io** | known company emails + the detected naming pattern (e.g. `{first}.{last}`) | official domain-search API |
+| **GitHub** | company emails leaked in public commit/code history | reuses your `GITHUB_TOKEN`; shares the code-search rate limit with `--github` dorking |
+| **RocketReach** | name + title (no email) via their official search API | see caveat below |
+
+**No LinkedIn scraping.** lrecon does not scrape LinkedIn (or RocketReach's site)
+directly — that would mean defeating anti-automation measures and violating
+those platforms' terms of service, a materially different risk than the
+official, documented APIs above. RocketReach support is via their official API
+only, and deliberately skips their credit-consuming "reveal" endpoint — you get
+name/title/LinkedIn-URL, not a spent-credit email. When Hunter has detected a
+naming pattern, lrecon applies it to RocketReach names to produce a **candidate**
+company email — always marked `generated=yes` in the CSV, never claimed as
+observed.
+
+**`--company-name`** overrides the company-name guess (derived from the domain
+label by default) for sources that search by name rather than domain.
+
+**`--verify-emails`** (opt-in, separate from discovery) does an SMTP `RCPT TO`
+probe of every discovered email against the domain's MX — an **active**
+technique that directly touches the target's live mail infrastructure; many
+orgs alert on it. It detects catch-all domains first (a deliberately-nonexistent
+address accepted too) and marks every result `catch-all` rather than reporting
+false `valid` positives. Many providers (Microsoft 365, Google Workspace, or
+anything blocking port 25 from cloud/datacenter source IPs) will make this come
+back `unknown` for the whole domain — expected, not a bug.
+
+---
+
 ## ROE tiers
 
 | Mode | Resolution | HTTP probe | Port scan | CF confirm |
@@ -254,9 +301,11 @@ ranges / Authenticated Origin Pulls / cloudflared tunnel).
 | default | yes | yes | no | yes |
 | `--active-ports` | yes | yes | yes | yes |
 
-The only steps that touch target-owned infrastructure directly are the HTTP probe,
-the optional TCP scan, and the Cloudflare origin **confirmation** request. All
-subdomain/enrichment/candidate collection is passive.
+The steps that touch target-owned infrastructure directly are the HTTP probe,
+the optional TCP scan, the Cloudflare origin **confirmation** request, and (if
+`--verify-emails` is set) the SMTP `RCPT TO` probe of the target's mail servers.
+All subdomain/enrichment/candidate collection — including all people-OSINT
+discovery, before `--verify-emails` — is passive.
 
 ---
 

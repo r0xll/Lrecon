@@ -32,6 +32,26 @@ def write_csv(hosts, path) -> int:
     return len(hosts)
 
 
+def write_users_csv(people, path) -> int:
+    """
+    Company-affiliated user enumeration (OSINT) output — a red-team phishing/
+    password-spray candidate list. generated=True means the email is a
+    pattern-applied guess (not directly observed); smtp_status is only
+    populated with --verify-emails.
+    """
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["email", "name", "position", "confidence", "generated",
+                   "smtp_status", "source"])
+        for p in people:
+            w.writerow([p.email, p.name or "", p.position or "",
+                       p.confidence if p.confidence is not None else "",
+                       "yes" if p.generated else "",
+                       p.smtp_status or "",
+                       ", ".join(sorted(p.source))])
+    return len(people)
+
+
 def write_live_hosts(hosts, path) -> int:
     urls = []
     for h in hosts:
