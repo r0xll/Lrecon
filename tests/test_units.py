@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import enrich, intel, state, backends, sources, report, people, cli, core
+from lrecon import enrich, intel, state, backends, sources, report, people, cli, core, dorking
 from lrecon.common import Host, Person, CF_FALLBACK
 
 
@@ -301,6 +301,128 @@ def test_in_cf_range_membership():
     nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
     assert intel.in_cf("104.16.5.5", nets) is True      # Cloudflare edge
     assert intel.in_cf("8.8.8.8", nets) is False        # Google DNS
+
+
+# --------------------------------------------------------------------------- #
+# Domain registration (WHOIS via RDAP)
+# --------------------------------------------------------------------------- #
+_EXAMPLE_COM_RDAP = {
+    "status": ["client delete prohibited", "client transfer prohibited"],
+    "entities": [{"roles": ["registrar"],
+                 "vcardArray": ["vcard", [["version", {}, "text", "4.0"],
+                                          ["fn", {}, "text", "RESERVED-IANA"]]]}],
+    "events": [{"eventAction": "registration", "eventDate": "1995-08-14T04:00:00Z"},
+              {"eventAction": "expiration", "eventDate": "2026-08-13T04:00:00Z"},
+              {"eventAction": "last changed", "eventDate": "2026-01-16T18:26:50Z"}],
+    "nameservers": [{"ldhName": "ELLIOTT.NS.CLOUDFLARE.COM"}, {"ldhName": "HERA.NS.CLOUDFLARE.COM"}],
+}
+
+
+def test_parse_rdap_extracts_registrar_dates_nameservers_status():
+    out = intel._parse_rdap(_EXAMPLE_COM_RDAP)
+    assert out["registrar"] == "RESERVED-IANA"
+    assert out["created"] == "1995-08-14T04:00:00Z"
+    assert out["expires"] == "2026-08-13T04:00:00Z"
+    assert out["last_changed"] == "2026-01-16T18:26:50Z"
+    assert out["nameservers"] == ["elliott.ns.cloudflare.com", "hera.ns.cloudflare.com"]
+    assert len(out["status"]) == 2
+
+
+def test_parse_rdap_handles_missing_fields_gracefully():
+    out = intel._parse_rdap({})
+    assert out == {"registrar": None, "created": None, "expires": None,
+                   "last_changed": None, "nameservers": [], "status": []}
+
+
+def test_rdap_entity_name_returns_none_when_no_fn_field():
+    assert intel._rdap_entity_name({"vcardArray": ["vcard", [["version", {}, "text", "4.0"]]]}) is None
+    assert intel._rdap_entity_name({}) is None
+
+
+def test_domain_expiring_soon():
+    from datetime import datetime, timezone, timedelta
+    soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
+    far = (datetime.now(timezone.utc) + timedelta(days=365)).isoformat()
+    assert intel.domain_expiring_soon(soon) is True
+    assert intel.domain_expiring_soon(far) is False
+    assert intel.domain_expiring_soon(None) is False
+    assert intel.domain_expiring_soon("not-a-date") is False
+
+
+async def test_rdap_lookup_returns_empty_dict_on_404(monkeypatch):
+    async def fake_get(url, timeout=None, follow_redirects=None):
+        return _FakeResp(404)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await intel.rdap_lookup(client, "nonexistent-domain-xyz.test")
+    assert out == {}
+
+
+async def test_rdap_lookup_parses_200_response():
+    async def fake_get(url, timeout=None, follow_redirects=None):
+        assert follow_redirects is True   # rdap.org redirects to the authoritative registry
+        return _FakeResp(200, _EXAMPLE_COM_RDAP)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await intel.rdap_lookup(client, "example.com")
+    assert out["registrar"] == "RESERVED-IANA"
+
+
+# --------------------------------------------------------------------------- #
+# Search-engine dorking (Google Custom Search API)
+# --------------------------------------------------------------------------- #
+def test_parse_cse_response_extracts_hits():
+    data = {"items": [{"title": "Admin", "link": "https://x.com/admin", "snippet": "login"},
+                      {"title": "No link"}]}   # missing link -> skipped
+    out = dorking._parse_cse_response(data)
+    assert out == [{"title": "Admin", "link": "https://x.com/admin", "snippet": "login"}]
+
+
+def test_parse_cse_response_empty_on_missing_items():
+    assert dorking._parse_cse_response({}) == []
+    assert dorking._parse_cse_response({"error": {"code": 403}}) == []
+
+
+async def test_google_dork_tags_category_severity_and_dedupes_by_link(monkeypatch):
+    calls = []
+
+    async def fake_get(url, params=None, timeout=None):
+        calls.append(params["q"])
+        # every category "finds" the same URL -> should collapse to one hit
+        return _FakeResp(200, {"items": [{"title": "Admin", "link": "https://x.com/admin",
+                                          "snippet": "s"}]})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await dorking.google_dork(client, "x.com", "key", "cx", limiter)
+    assert len(calls) == len(dorking.DORK_TEMPLATES)          # one query per template
+    assert len(out) == 1                                       # deduped by link
+    assert out[0]["category"] == dorking.DORK_TEMPLATES[0][0]  # first template wins
+    assert out[0]["severity"] == dorking.DORK_TEMPLATES[0][2]
+    assert all(q.startswith("site:x.com ") for q in calls)     # scoped to the domain
+
+
+async def test_google_dork_stops_on_403_quota_or_bad_key(monkeypatch):
+    async def fake_get(url, params=None, timeout=None):
+        return _FakeResp(403)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await dorking.google_dork(client, "x.com", "bad-key", "cx", limiter)
+    assert out == []
+
+
+def test_summarize_entry_points_includes_dork_hits():
+    dorks = [{"category": "git-exposure", "severity": "high", "title": "Index of /.git",
+             "link": "https://x.com/.git/", "snippet": "Index of /.git"}]
+    eps = intel.summarize_entry_points([], {"detected": False, "candidates": {}}, [], {}, [], [],
+                                       dorks=dorks)
+    assert len(eps) == 1
+    assert eps[0]["type"] == "dork-hit"
+    assert eps[0]["severity"] == "high"
+    assert eps[0]["target"] == "https://x.com/.git/"
+    assert eps[0]["attck"] == "T1593.002"
+
+
+def test_summarize_entry_points_dorks_default_to_none_backward_compatible():
+    # existing 6-positional-arg call sites (pre-dorking) must still work
+    assert intel.summarize_entry_points([], {"detected": False, "candidates": {}}, [], {}, [], []) == []
 
 
 def test_summarize_entry_points_ranks_critical_first():
@@ -641,6 +763,29 @@ def test_extract_emails_from_text_matches_accepts_domain_at_string_end_or_before
              {"text_matches": [{"fragment": "bob@x.com"}]}]
     out = people._extract_emails_from_text_matches(items, "x.com")
     assert out == {"alice@x.com", "bob@x.com"}
+
+
+# --------------------------------------------------------------------------- #
+# -iL / --domains-file
+# --------------------------------------------------------------------------- #
+def test_read_domains_file_skips_blank_lines_and_comments():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "domains.txt"
+        path.write_text("a.com\n# a comment\n\nb.com\n  \nc.com\n")
+        assert cli.read_domains_file(str(path)) == ["a.com", "b.com", "c.com"]
+
+
+def test_merge_domains_dedupes_and_preserves_order():
+    assert cli.merge_domains(["c.com"], ["a.com", "b.com", "a.com"]) == ["c.com", "a.com", "b.com"]
+    assert cli.merge_domains([], ["a.com"]) == ["a.com"]
+    assert cli.merge_domains(["a.com"], []) == ["a.com"]
+
+
+def test_domains_file_missing_raises_cli_error(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["lrecon", "-iL", "/nonexistent/path/domains.txt"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--domains-file" in capsys.readouterr().err
 
 
 def test_verify_emails_conflicts_with_passive_only(monkeypatch, capsys):

@@ -107,6 +107,18 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"| {s} | {per_source[s]} |")
         lines.append("")
 
+    whois = res.get("whois") or {}
+    if whois:
+        lines += ["## Domain registration (WHOIS/RDAP)", "",
+                  "| Domain | Registrar | Created | Expires | Status | Nameservers |",
+                  "|---|---|---|---|---|---|"]
+        for d, w in whois.items():
+            status = ", ".join(w.get("status", [])[:3]) or "—"
+            ns = ", ".join(w.get("nameservers", [])[:4]) or "—"
+            lines.append(f"| {d} | {w.get('registrar') or '—'} | {w.get('created') or '—'} "
+                         f"| {w.get('expires') or '—'} | {status} | {ns} |")
+        lines.append("")
+
     if takeovers:
         lines += ["## Subdomain takeover leads (T1584.001) — priority", ""]
         for h in takeovers:
@@ -172,6 +184,16 @@ def write_markdown(hosts, domains, res, path) -> None:
         lines += ["", "> Review each hit for leaked credentials, internal hostnames, "
                   "or keys. Public code referencing the target is an information-disclosure "
                   "finding worth triaging by hand.", ""]
+
+    dorks = res.get("dorks") or []
+    if dorks:
+        lines += ["## Search-engine dork hits (T1593.002)", "",
+                  "| Category | Severity | Title | Link |", "|---|---|---|---|"]
+        for d in dorks:
+            lines.append(f"| {d['category']} | {d['severity'].upper()} | {d['title']} | {d['link']} |")
+        lines += ["", "> Google-indexed pages matching admin/login/config/backup dork "
+                  "patterns for this domain — verify each is actually reachable and "
+                  "exposed before reporting; a search-engine hit can be stale.", ""]
 
     buckets = res.get("buckets") or []
     if buckets:
@@ -283,6 +305,8 @@ def write_html(hosts, domains, res, path) -> None:
     fp = res.get("favicon_pivots") or {}
     nuclei = res.get("nuclei") or []
     people = res.get("people") or []
+    whois = res.get("whois") or {}
+    dorks = res.get("dorks") or []
 
     takeovers = [h for h in hosts if h.takeover]
     vulns = [h for h in hosts if h.vulns]
@@ -318,6 +342,18 @@ def write_html(hosts, domains, res, path) -> None:
                        for s in sorted(per_source, key=lambda k: -per_source[k]))
         body = (f'<table id="t-sources"><tr><th>Source</th><th>In-scope hosts found</th></tr>{rows}</table>')
         sections.append(_html_section("sources", "Passive source contribution", len(per_source), body))
+
+    # ---- Domain registration (WHOIS/RDAP) ----
+    if whois:
+        rows = "".join(
+            f"<tr><td>{esc(d)}</td><td>{esc(w.get('registrar'))}</td><td>{esc(w.get('created'))}</td>"
+            f"<td>{esc(w.get('expires'))}</td><td>{esc(', '.join(w.get('status', [])[:3]))}</td>"
+            f"<td>{esc(', '.join(w.get('nameservers', [])[:4]))}</td></tr>"
+            for d, w in whois.items())
+        body = (f'{_html_export_button("t-whois", "whois.csv")}'
+                f'<table id="t-whois"><tr><th>Domain</th><th>Registrar</th><th>Created</th>'
+                f'<th>Expires</th><th>Status</th><th>Nameservers</th></tr>{rows}</table>')
+        sections.append(_html_section("whois", "Domain registration (WHOIS/RDAP)", len(whois), body))
 
     # ---- Subdomain takeover leads ----
     if takeovers:
@@ -401,6 +437,22 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<table id="t-github"><tr><th>Repo</th><th>Path</th><th>URL</th></tr>{rows}</table>'
                 f'<p class="note">Review each hit for leaked credentials, internal hostnames, or keys.</p>')
         sections.append(_html_section("github", "GitHub code exposure (T1593.003)", len(gh), body))
+
+    # ---- Search-engine dork hits ----
+    if dorks:
+        rows = "".join(
+            f'<tr><td>{esc(d["category"])}</td><td>{sev_badge(d["severity"])}</td>'
+            f'<td>{esc(d["title"])}</td>'
+            f'<td><a href="{_h.escape(d["link"])}">{esc(d["link"])}</a></td>'
+            f'<td>{esc(d["snippet"])}</td></tr>'
+            for d in dorks)
+        body = (f'{_html_export_button("t-dorks", "dork_hits.csv")}'
+                f'<table id="t-dorks"><tr><th>Category</th><th>Severity</th><th>Title</th>'
+                f'<th>Link</th><th>Snippet</th></tr>{rows}</table>'
+                f'<p class="note">Google-indexed pages matching admin/login/config/backup dork '
+                f'patterns — verify each is actually reachable before reporting; a search-engine '
+                f'hit can be stale.</p>')
+        sections.append(_html_section("dorks", "Search-engine dork hits (T1593.002)", len(dorks), body))
 
     # ---- Cloud storage exposure ----
     if buckets:

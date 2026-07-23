@@ -11,6 +11,7 @@ from .intel import *
 from .active import *
 from .state import *
 from .people import *
+from .dorking import *
 from . import backends
 
 # --------------------------------------------------------------------------- #
@@ -150,6 +151,17 @@ async def run(domains, args, keys) -> list:
         log(f"[+] {len(hosts)} unique subdomains  |  by source: {breakdown}")
         if per_source.get("crtsh", 0) == 0:
             log("[!] crt.sh returned 0 (down/rate-limited?) — other CT sources covering")
+
+        # ---- Domain registration data (WHOIS via RDAP) ----
+        # Keyless, third-party-registry-only — runs even in --passive-only,
+        # same tier as the passive-enum sources above.
+        whois = {}
+        for d in domains:
+            w = await rdap_lookup(client, d)
+            if w:
+                whois[d] = w
+                if domain_expiring_soon(w.get("expires")):
+                    log(f"[!] {d}: domain registration expires {w['expires']} — flag to client")
 
         # ---- Phase 2: resolution + wildcard filter ----
         if not args.passive_only:
@@ -330,6 +342,26 @@ async def run(domains, args, keys) -> list:
             pub = sum(1 for b in buckets if b["public"])
             log(f"[+] buckets: {len(buckets)} exist ({pub} public-listable)")
 
+        # ---- Search-engine dorking (opt-in --dork; needs Google CSE key+cx) ----
+        # Explicit flag even with a key configured — the 100/day free quota is
+        # tight enough (7 dork categories per domain) that it must not run
+        # silently just because a key happens to be set. Allowed under
+        # --passive-only: this only queries Google's own API, never the
+        # target directly (same tier as bucket_enum and the People OSINT
+        # sources, none of which are passive-only-gated either).
+        dorks = []
+        if args.dork:
+            if keys.get("google_cse") and keys.get("google_cse_cx"):
+                dork_limiter = RateLimiter(per_second=1.0)
+                for d in domains:
+                    dorks += await google_dork(client, d, keys["google_cse"],
+                                               keys["google_cse_cx"], dork_limiter)
+                if dorks:
+                    n_cat = len({d["category"] for d in dorks})
+                    log(f"[+] google dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
+            else:
+                log("[!] --dork set but --google-cse-key/--google-cse-cx not configured — skipping")
+
         breach = {}
         for d in domains:
             b = await hibp_breaches(client, d)
@@ -438,7 +470,7 @@ async def run(domains, args, keys) -> list:
     host_list = sorted(hosts.values(), key=lambda h: h.subdomain)
 
     # ---- Entry-point summary (red-team signal: what to chase first) ----
-    entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings, nuclei)
+    entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings, nuclei, dorks)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
@@ -455,6 +487,7 @@ async def run(domains, args, keys) -> list:
     return {"hosts": host_list, "per_source": dict(per_source), "cf": cf,
             "email": email, "github": github_findings, "buckets": buckets,
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
-            "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people}
+            "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
+            "whois": whois, "dorks": dorks}
 
 
