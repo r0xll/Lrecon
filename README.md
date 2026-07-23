@@ -152,6 +152,23 @@ lrecon example.com --ask-keys
 
 Without a Shodan key, lrecon falls back to keyless **InternetDB** for ports/CVEs.
 
+**On-boot verification.** Every configured key gets one cheap, non-quota-consuming
+check (an account-info endpoint, not the actual feature endpoint) right at startup,
+so a bad/expired key shows up immediately instead of silently degrading a phase
+later in the run:
+
+```
+[+] Shodan API: Ready — query credits: 100
+[!] IPinfo API: Invalid — falling back to keyless (ASN/org/rDNS disabled)
+[+] GitHub API: Ready (as octocat)
+[!] Hunter.io API: Invalid — company email OSINT via Hunter disabled
+```
+
+An invalid key is nulled out for the rest of the run (same automatic fallback
+behavior as always relied on for Shodan) — you don't need to re-run without it.
+HIBP gets a neutral note instead of a check: its breach-by-domain lookup uses
+HIBP's keyless endpoint, so a configured `hibp_api_key` isn't sent anywhere yet.
+
 ---
 
 ## Usage
@@ -213,7 +230,10 @@ Per run, `<out>.*`:
 - **`<out>.md`** — the deliverable: summary, source-contribution table, change-since-last-run,
   breach/GitHub/bucket exposure, nuclei findings, email posture, Cloudflare origin exposure, subdomain-takeover
   leads, favicon pivots, full attack-surface table, CVE hits.
-- **`<out>.html`** — self-contained styled HTML report for client sharing.
+- **`<out>.html`** — self-contained styled HTML report for client sharing. Same section
+  coverage as the Markdown report, each in a collapsible panel (expand/collapse-all
+  toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
+  no server, no external JS/CSS, works fully offline from the file.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
   favicon_pivots, diff, per_source, entry_points, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.

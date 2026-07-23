@@ -101,9 +101,16 @@ async def github_email_harvest(client, domain: str, token: str, limiter) -> set:
 # credit-consuming "lookup/reveal" endpoint, so results here are name/title/
 # LinkedIn-URL only (no personal contact fields, no email — see
 # generate_candidate_emails for turning a name into a candidate company
-# address instead). Implemented from documented behavior rather than a live
-# account; degrades to an empty list rather than raising if a plan/response
-# shape differs from what's expected here.
+# address instead).
+#
+# URL and request-body shape (base /api/v2/, POST {query, start, page_size})
+# are confirmed against the official rocketreach_python client's source. The
+# "current_employer_domain" filter field name is still best-effort — could
+# not verify it against RocketReach's own API reference (docs pages return
+# 403 to automated fetches) — but a wrong/unsupported filter field degrades
+# to an empty result set rather than an error, and _parse_rocketreach_response
+# degrades to an empty list rather than raising on any other unexpected
+# response shape too.
 # --------------------------------------------------------------------------- #
 def _parse_rocketreach_response(data: dict) -> list:
     out = []
@@ -118,7 +125,7 @@ def _parse_rocketreach_response(data: dict) -> list:
 
 async def rocketreach_search(client, domain: str, company_name: str, api_key: str) -> list:
     try:
-        r = await client.post("https://api.rocketreach.co/v2/api/search",
+        r = await client.post("https://api.rocketreach.co/api/v2/search",
                              headers={"Api-Key": api_key, "User-Agent": "lrecon"},
                              json={"start": 1, "page_size": 25,
                                    "query": {"current_employer_domain": [domain]}},

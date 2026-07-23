@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import enrich, intel, state, backends, sources, report, people, cli
+from lrecon import enrich, intel, state, backends, sources, report, people, cli, core
 from lrecon.common import Host, Person, CF_FALLBACK
 
 
@@ -63,6 +63,7 @@ class _FakeResp:
     def __init__(self, status_code, data=None):
         self.status_code = status_code
         self._data = data
+        self.content = b"1" if data is not None else b""
 
     def json(self):
         return self._data
@@ -528,6 +529,74 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_asn():
 
 
 # --------------------------------------------------------------------------- #
+# Reporting: HTML report — collapsible sections + escaping
+# --------------------------------------------------------------------------- #
+def test_write_html_minimal_data_does_not_crash_and_has_attack_surface():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"], http_status=200, scheme="https")]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert content.startswith("<!doctype html>")
+    assert 'id="attacksurface"' in content
+    assert "a.x.com" in content
+    # sections with no data must not render at all
+    for absent in ("id=\"sources\"", "id=\"takeover\"", "id=\"cforigin\"", "id=\"people\""):
+        assert absent not in content
+
+
+def test_write_html_escapes_attacker_controlled_strings():
+    hosts = [Host("<script>alert(1)</script>.x.com", ips=["1.2.3.4"],
+                  server="<img src=x onerror=alert(2)>",
+                  takeover='XSS" onmouseover="alert(3)')]
+    res = {"entry_points": [{"severity": "critical", "target": hosts[0].subdomain,
+                            "summary": "<script>evil()</script>", "attck": "T1"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert "<script>alert(1)</script>" not in content
+    assert "<img src=x onerror=alert(2)>" not in content
+    assert 'onmouseover="alert(3)' not in content
+    assert "<script>evil()</script>" not in content
+    assert "&lt;script&gt;" in content
+
+
+def test_write_html_renders_sections_only_when_data_present():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {
+        "per_source": {"crtsh": 5},
+        "breach": {"x.com": [{"name": "BigBreach", "date": "2022-01-01", "pwned": 100, "data": ["Emails"]}]},
+        "buckets": [{"name": "x-backup", "provider": "s3", "url": "https://x", "status": 200, "public": True}],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert 'id="sources"' in content
+    assert 'id="breach"' in content
+    assert 'id="buckets"' in content
+    assert "BigBreach" in content
+    assert "x-backup" in content
+    # sections with no data still absent
+    assert 'id="nuclei"' not in content
+    assert 'id="people"' not in content
+
+
+def test_write_html_export_buttons_reference_a_table_id_that_exists():
+    import re
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {"entry_points": [{"severity": "high", "target": "a.x.com", "summary": "x", "attck": "T1"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    referenced_ids = set(re.findall(r"exportTableToCSV\('([^']+)'", content))
+    table_ids = set(re.findall(r'<table id="([^"]+)"', content))
+    assert referenced_ids and referenced_ids <= table_ids
+
+
+# --------------------------------------------------------------------------- #
 # OSINT user enumeration (people.py) — pure-logic parsers + pattern generation
 # --------------------------------------------------------------------------- #
 def test_parse_hunter_response_extracts_pattern_and_people():
@@ -776,3 +845,68 @@ async def test_verify_emails_non_550_rejection_is_unknown_not_invalid(monkeypatc
 
     out = await people.verify_emails("x.com", ["jane.doe@x.com"], None)
     assert out == {"jane.doe@x.com": "unknown"}
+
+
+# --------------------------------------------------------------------------- #
+# On-boot API key verification
+# --------------------------------------------------------------------------- #
+class _FakeKeyCheckClient:
+    """Routes GET requests to canned responses by URL substring."""
+    def __init__(self, responses: dict):
+        self._responses = responses
+        self.calls = []
+
+    async def get(self, url, params=None, headers=None, timeout=None):
+        self.calls.append(url)
+        for needle, resp in self._responses.items():
+            if needle in url:
+                return resp
+        return _FakeResp(404)
+
+
+async def test_verify_keys_marks_ready_and_invalid_and_nulls_bad_keys():
+    client = _FakeKeyCheckClient({
+        "shodan.io/api-info": _FakeResp(200, {"query_credits": 100}),
+        "ipinfo.io": _FakeResp(401),
+        "api.github.com/user": _FakeResp(200, {"login": "octocat"}),
+        "hunter.io/v2/account": _FakeResp(401),
+        "rocketreach.co": _FakeResp(200, {}),
+    })
+    keys = {"shodan": "sk", "ipinfo": "ik", "github": "gk", "hibp": "hk",
+            "hunter": "hnk", "rocketreach": "rrk"}
+    await core.verify_keys(client, keys)
+    assert keys["shodan"] == "sk"                 # 200 -> kept
+    assert keys["ipinfo"] is None                 # 401 -> nulled
+    assert keys["github"] == "gk"                 # 200 -> kept
+    assert keys["hunter"] is None                 # 401 -> nulled
+    assert keys["rocketreach"] == "rrk"            # 200 -> kept
+    assert keys["hibp"] == "hk"                    # never touched (keyless endpoint, not checked)
+
+
+async def test_verify_keys_ipinfo_error_in_200_body_counts_as_invalid():
+    # IPinfo sometimes returns HTTP 200 with an {"error": ...} body for a bad token.
+    client = _FakeKeyCheckClient({"ipinfo.io": _FakeResp(200, {"error": {"title": "Wrong Token"}})})
+    keys = {"shodan": None, "ipinfo": "bad", "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
+    await core.verify_keys(client, keys)
+    assert keys["ipinfo"] is None
+
+
+async def test_verify_keys_skips_unconfigured_services():
+    client = _FakeKeyCheckClient({})
+    keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
+    await core.verify_keys(client, keys)
+    assert client.calls == []                     # nothing configured -> zero requests made
+
+
+async def test_verify_keys_check_failure_does_not_null_the_key():
+    # A network error/timeout during the check isn't proof the key is bad —
+    # only an explicit 401/403 should null it out.
+    class _RaisingClient:
+        async def get(self, *a, **kw):
+            raise TimeoutError("connect timed out")
+    keys = {"shodan": "sk", "ipinfo": None, "github": None, "hibp": None,
+            "hunter": None, "rocketreach": None}
+    await core.verify_keys(_RaisingClient(), keys)
+    assert keys["shodan"] == "sk"
