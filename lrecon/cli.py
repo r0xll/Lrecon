@@ -158,7 +158,7 @@ def main() -> None:
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
-                                "entry_points", "whois", "dorks")}
+                                "entry_points", "whois", "dorks", "dns", "mail_infra")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))

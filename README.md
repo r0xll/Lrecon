@@ -83,6 +83,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | CF origin | Cloudflare detection + origin-IP candidates (+ optional confirm) | confirm step only |
 | Expansion | ASN->netblock (RIPEstat) + reverse-DNS sweep, rDNS wire-back | DNS only |
 | Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
+| DNS records | apex A/AAAA/MX/NS/SOA snapshot + mail infrastructure ID (provider/ASN/org per MX host) | DNS only |
 | WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status (always on) | none (third-party registry) |
 | People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
@@ -241,14 +242,14 @@ Per run, `<out>.*`:
 
 - **`<out>.md`** — the deliverable: summary, source-contribution table, change-since-last-run,
   breach/GitHub/bucket exposure, nuclei findings, email posture, domain registration (WHOIS/RDAP),
-  search-engine dork hits, Cloudflare origin exposure, subdomain-takeover
-  leads, favicon pivots, full attack-surface table, CVE hits.
+  DNS records, mail infrastructure, search-engine dork hits, Cloudflare origin exposure,
+  subdomain-takeover leads, favicon pivots, full attack-surface table, CVE hits.
 - **`<out>.html`** — self-contained styled HTML report for client sharing. Same section
   coverage as the Markdown report, each in a collapsible panel (expand/collapse-all
   toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
   no server, no external JS/CSS, works fully offline from the file.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
-  favicon_pivots, diff, per_source, entry_points, whois, dorks, people).
+  favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
 - **`<out>.targets.csv`** — flat subdomain/IP/ASN list for client scope confirmation.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
@@ -366,6 +367,25 @@ the target's own infrastructure. A domain expiring within 30 days is flagged
 in the run log as worth raising with the client. Some domains — privacy-
 protected registrants, a few ccTLDs without RDAP support yet — simply won't
 resolve; that's expected, not an error.
+
+## DNS records & mail infrastructure
+
+Every run (outside `--passive-only`) captures an apex-level DNS snapshot per
+domain — `A`/`AAAA`/`MX`/`NS`/`SOA` — reported in its own **DNS records**
+section, distinct from the per-subdomain resolution table and from the
+SPF/DMARC/DKIM-only view in the email security section. It's gated the same
+way as the rest of Phase 2 resolution (a DNS query against the domain's own
+authoritative nameservers, not a third-party API), so it doesn't run under
+`--passive-only`, unlike the keyless RDAP/WHOIS lookup above.
+
+Each MX host found is then resolved to an IP and enriched (ASN/org/country,
+reusing the same IPinfo enrichment as host IPs) and labeled against a list of
+well-known managed-email providers — Google Workspace, Microsoft 365,
+Proofpoint, Mimecast, Barracuda, Cisco Secure Email, Zoho, Amazon SES/WorkMail,
+Yandex — so the **Mail infrastructure** section reads "Google Workspace"
+rather than an opaque MX hostname. A domain whose MX doesn't match any known
+provider is flagged in the run log as possibly self-hosted — worth a closer
+look (SMTP banner grab, open relay, vulnerable MTA version) if in scope.
 
 ---
 
