@@ -529,6 +529,74 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_asn():
 
 
 # --------------------------------------------------------------------------- #
+# Reporting: HTML report — collapsible sections + escaping
+# --------------------------------------------------------------------------- #
+def test_write_html_minimal_data_does_not_crash_and_has_attack_surface():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"], http_status=200, scheme="https")]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert content.startswith("<!doctype html>")
+    assert 'id="attacksurface"' in content
+    assert "a.x.com" in content
+    # sections with no data must not render at all
+    for absent in ("id=\"sources\"", "id=\"takeover\"", "id=\"cforigin\"", "id=\"people\""):
+        assert absent not in content
+
+
+def test_write_html_escapes_attacker_controlled_strings():
+    hosts = [Host("<script>alert(1)</script>.x.com", ips=["1.2.3.4"],
+                  server="<img src=x onerror=alert(2)>",
+                  takeover='XSS" onmouseover="alert(3)')]
+    res = {"entry_points": [{"severity": "critical", "target": hosts[0].subdomain,
+                            "summary": "<script>evil()</script>", "attck": "T1"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert "<script>alert(1)</script>" not in content
+    assert "<img src=x onerror=alert(2)>" not in content
+    assert 'onmouseover="alert(3)' not in content
+    assert "<script>evil()</script>" not in content
+    assert "&lt;script&gt;" in content
+
+
+def test_write_html_renders_sections_only_when_data_present():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {
+        "per_source": {"crtsh": 5},
+        "breach": {"x.com": [{"name": "BigBreach", "date": "2022-01-01", "pwned": 100, "data": ["Emails"]}]},
+        "buckets": [{"name": "x-backup", "provider": "s3", "url": "https://x", "status": 200, "public": True}],
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert 'id="sources"' in content
+    assert 'id="breach"' in content
+    assert 'id="buckets"' in content
+    assert "BigBreach" in content
+    assert "x-backup" in content
+    # sections with no data still absent
+    assert 'id="nuclei"' not in content
+    assert 'id="people"' not in content
+
+
+def test_write_html_export_buttons_reference_a_table_id_that_exists():
+    import re
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {"entry_points": [{"severity": "high", "target": "a.x.com", "summary": "x", "attck": "T1"}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    referenced_ids = set(re.findall(r"exportTableToCSV\('([^']+)'", content))
+    table_ids = set(re.findall(r'<table id="([^"]+)"', content))
+    assert referenced_ids and referenced_ids <= table_ids
+
+
+# --------------------------------------------------------------------------- #
 # OSINT user enumeration (people.py) — pure-logic parsers + pattern generation
 # --------------------------------------------------------------------------- #
 def test_parse_hunter_response_extracts_pattern_and_people():

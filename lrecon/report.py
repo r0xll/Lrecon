@@ -252,57 +252,334 @@ def write_markdown(hosts, domains, res, path) -> None:
 # --------------------------------------------------------------------------- #
 # HTML report + optional screenshots
 # --------------------------------------------------------------------------- #
+def _html_section(section_id: str, title: str, count, body_html: str, open_default: bool = False) -> str:
+    """One collapsible <details> section with an item-count badge in the summary."""
+    badge = f' <span class="count">{count}</span>' if count is not None else ""
+    open_attr = " open" if open_default else ""
+    return (f'<details class="section" id="{section_id}"{open_attr}>'
+            f'<summary>{title}{badge}</summary>'
+            f'<div class="section-body">{body_html}</div></details>')
+
+
+def _html_export_button(table_id: str, filename: str) -> str:
+    return (f'<button class="export-btn" type="button" '
+            f'onclick="exportTableToCSV(\'{table_id}\',\'{filename}\')">Export CSV</button>')
+
+
 def write_html(hosts, domains, res, path) -> None:
     import html as _h
-    cf = res.get("cf", {})
+
+    def esc(x) -> str:
+        return _h.escape(str(x)) if x not in (None, "") else "—"
+
+    cf = res.get("cf") or {}
     entry_points = res.get("entry_points") or []
+    per_source = res.get("per_source") or {}
+    diff = res.get("diff") or {}
+    breach = res.get("breach") or {}
+    gh = res.get("github") or []
+    buckets = res.get("buckets") or []
+    email = res.get("email") or {}
+    fp = res.get("favicon_pivots") or {}
+    nuclei = res.get("nuclei") or []
+    people = res.get("people") or []
+
+    takeovers = [h for h in hosts if h.takeover]
+    vulns = [h for h in hosts if h.vulns]
+    n_live = sum(1 for h in hosts if h.http_status)
+    sev_class = {"critical": "sev-critical", "high": "sev-high", "medium": "sev-medium",
+                "low": "sev-low", "info": "sev-info"}
+
+    def sev_badge(sev: str) -> str:
+        sev = (sev or "info").lower()
+        return f'<span class="sev {sev_class.get(sev, "sev-info")}">{esc(sev.upper())}</span>'
+
+    sections = []
+
+    # ---- Potential entry points ----
+    if entry_points:
+        rows = "".join(
+            f"<tr><td>{sev_badge(e['severity'])}</td><td>{esc(e['target'])}</td>"
+            f"<td>{esc(e['summary'])}</td><td>{esc(e.get('attck'))}</td></tr>"
+            for e in entry_points)
+        body = (f'{_html_export_button("t-entrypoints", "entry_points.csv")}'
+                f'<table id="t-entrypoints"><tr><th>Severity</th><th>Target</th><th>Finding</th>'
+                f'<th>ATT&amp;CK</th></tr>{rows}</table>'
+                f'<p class="note">Leads, not confirmed compromises — validate per ROE '
+                f'before treating as exploitable.</p>')
+    else:
+        body = '<p class="note">No high-confidence entry points identified from this pass.</p>'
+    sections.append(_html_section("entrypoints", "⚠ Potential entry points", len(entry_points),
+                                  body, open_default=True))
+
+    # ---- Passive source contribution ----
+    if per_source:
+        rows = "".join(f"<tr><td>{esc(s)}</td><td>{per_source[s]}</td></tr>"
+                       for s in sorted(per_source, key=lambda k: -per_source[k]))
+        body = (f'<table id="t-sources"><tr><th>Source</th><th>In-scope hosts found</th></tr>{rows}</table>')
+        sections.append(_html_section("sources", "Passive source contribution", len(per_source), body))
+
+    # ---- Subdomain takeover leads ----
+    if takeovers:
+        rows = "".join(f"<tr><td>{esc(h.subdomain)}</td><td>{esc(h.takeover)}</td></tr>"
+                       for h in takeovers)
+        body = (f'{_html_export_button("t-takeover", "takeover_leads.csv")}'
+                f'<table id="t-takeover"><tr><th>Subdomain</th><th>Detail</th></tr>{rows}</table>'
+                f'<p class="note">Validate by attempting to claim the dangling resource in a '
+                f'controlled manner per ROE before reporting as confirmed.</p>')
+        sections.append(_html_section("takeover", "Subdomain takeover leads (T1584.001)",
+                                      len(takeovers), body))
+
+    # ---- Cloudflare origin exposure ----
+    if cf.get("detected"):
+        conf = {ip: v for ip, v in cf["candidates"].items() if v["confirmed"]}
+        unconf = {ip: v for ip, v in cf["candidates"].items() if not v["confirmed"]}
+        body = (f'<p>Cloudflare fronts {len(cf["fronted"])} in-scope host(s). Origin IPs reachable '
+                f'outside Cloudflare let an attacker bypass the WAF/DDoS layer entirely.</p>')
+        if conf:
+            rows = "".join(f'<tr><td><code>{esc(ip)}</code></td><td>{esc(v["evidence"])}</td>'
+                          f'<td>{esc(", ".join(v["sources"]))}</td></tr>' for ip, v in conf.items())
+            body += (f'<p><b>Confirmed origin candidates</b> (responded to spoofed Host header):</p>'
+                     f'<table id="t-cforigin"><tr><th>IP</th><th>Evidence</th><th>Sources</th></tr>{rows}</table>')
+        if unconf:
+            rows = "".join(f'<tr><td><code>{esc(ip)}</code></td><td>{esc(", ".join(v["sources"]))}</td></tr>'
+                          for ip, v in unconf.items())
+            body += (f'<p><b>Unconfirmed candidate IPs</b> (found passively, not verified):</p>'
+                     f'<table><tr><th>IP</th><th>Sources</th></tr>{rows}</table>')
+        sections.append(_html_section("cforigin", "Cloudflare origin exposure",
+                                      len(cf["candidates"]), body))
+
+    # ---- Change since last run ----
+    if diff and (diff.get("new_hosts") or diff.get("gone_hosts") or diff.get("new_ports")):
+        n_changed = (len(diff.get("new_hosts") or []) + len(diff.get("gone_hosts") or [])
+                    + len(diff.get("new_ports") or {}))
+        body = f'<p class="note">Baseline: {esc(diff.get("prev_ts"))}</p><ul>'
+        if diff.get("new_hosts"):
+            body += f'<li><b>New hosts ({len(diff["new_hosts"])}):</b> {esc(", ".join(diff["new_hosts"][:40]))}</li>'
+        if diff.get("gone_hosts"):
+            body += f'<li><b>Removed hosts ({len(diff["gone_hosts"])}):</b> {esc(", ".join(diff["gone_hosts"][:40]))}</li>'
+        for sub, ps in list((diff.get("new_ports") or {}).items())[:20]:
+            body += f'<li><b>{esc(sub)}</b> newly-open ports: {esc(", ".join(map(str, ps)))}</li>'
+        body += "</ul>"
+        sections.append(_html_section("diff", "Change since last run", n_changed, body))
+
+    # ---- People OSINT / enumerated users ----
+    if people:
+        rows = "".join(
+            f"<tr><td>{esc(p.email)}</td><td>{esc(p.name)}</td><td>{esc(p.position)}</td>"
+            f"<td>{esc(p.confidence)}</td><td>{'yes' if p.generated else ''}</td>"
+            f"<td>{esc(p.smtp_status)}</td><td>{esc(', '.join(sorted(p.source)))}</td></tr>"
+            for p in people)
+        body = (f'{_html_export_button("t-people", "users.csv")}'
+                f'<table id="t-people"><tr><th>Email</th><th>Name</th><th>Position</th>'
+                f'<th>Confidence</th><th>Generated</th><th>SMTP status</th><th>Source</th></tr>'
+                f'{rows}</table>'
+                f'<p class="note">Company-affiliated OSINT, not personal accounts. '
+                f'"Generated" = pattern-applied guess, not directly observed.</p>')
+        sections.append(_html_section("people", "People OSINT (user enumeration)", len(people), body))
+
+    # ---- Credential / breach exposure ----
+    if breach:
+        rows = "".join(
+            f"<tr><td>{esc(d)}</td><td>{esc(b['name'])}</td><td>{esc(b.get('date'))}</td>"
+            f"<td>{esc(b.get('pwned'))}</td><td>{esc(', '.join(b.get('data', [])[:6]))}</td></tr>"
+            for d, bs in breach.items() for b in bs)
+        n_breach = sum(len(v) for v in breach.values())
+        body = (f'{_html_export_button("t-breach", "breach.csv")}'
+                f'<table id="t-breach"><tr><th>Domain</th><th>Breach</th><th>Date</th>'
+                f'<th>Accounts</th><th>Data classes</th></tr>{rows}</table>'
+                f'<p class="note">Feeds password-spray candidate lists (T1110.003).</p>')
+        sections.append(_html_section("breach", "Credential / breach exposure", n_breach, body))
+
+    # ---- GitHub code exposure ----
+    if gh:
+        rows = "".join(
+            f'<tr><td>{esc(it.get("repo"))}</td><td>{esc(it.get("path"))}</td>'
+            f'<td><a href="{_h.escape(it.get("url") or "#")}">{esc(it.get("url"))}</a></td></tr>'
+            for it in gh[:100])
+        body = (f'{_html_export_button("t-github", "github_hits.csv")}'
+                f'<table id="t-github"><tr><th>Repo</th><th>Path</th><th>URL</th></tr>{rows}</table>'
+                f'<p class="note">Review each hit for leaked credentials, internal hostnames, or keys.</p>')
+        sections.append(_html_section("github", "GitHub code exposure (T1593.003)", len(gh), body))
+
+    # ---- Cloud storage exposure ----
+    if buckets:
+        rows = "".join(
+            f'<tr><td>{esc(b["name"])}</td><td>{esc(b["provider"])}</td><td>{esc(b["status"])}</td>'
+            f'<td>{"YES" if b["public"] else "no"}</td></tr>'
+            for b in sorted(buckets, key=lambda x: not x["public"]))
+        body = (f'{_html_export_button("t-buckets", "buckets.csv")}'
+                f'<table id="t-buckets"><tr><th>Bucket</th><th>Provider</th><th>Status</th>'
+                f'<th>Public listing</th></tr>{rows}</table>')
+        sections.append(_html_section("buckets", "Cloud storage exposure", len(buckets), body))
+
+    # ---- Email security posture ----
+    if email:
+        rows = "".join(
+            f'<tr><td>{esc(d)}</td><td>{esc(e.get("grade"))}</td>'
+            f'<td>{esc("; ".join(e.get("issues", [])) or "none")}</td></tr>'
+            for d, e in email.items())
+        body = (f'<table id="t-email"><tr><th>Domain</th><th>Grade</th><th>Issues</th></tr>{rows}</table>'
+                f'<p class="note">SPF/DKIM/DMARC gaps enable email spoofing.</p>')
+        sections.append(_html_section("email", "Email security posture", len(email), body))
+
+    # ---- Favicon pivots ----
+    if fp:
+        rows = "".join(f'<li>hash <code>{esc(fh)}</code> -&gt; {esc(", ".join(ips[:20]))}</li>'
+                       for fh, ips in fp.items())
+        body = f'<ul>{rows}</ul><p class="note">Validate ownership before reporting as shadow assets.</p>'
+        sections.append(_html_section("favicon", "Favicon pivots", len(fp), body))
+
+    # ---- nuclei findings ----
+    if nuclei:
+        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        nuclei_sorted = sorted(nuclei, key=lambda n: sev_order.get((n.get("severity") or "info"), 5))
+        rows = "".join(
+            f'<tr><td>{sev_badge(n.get("severity"))}</td><td>{esc(n.get("host"))}</td>'
+            f'<td>{esc(n.get("name") or n.get("template"))}</td>'
+            f'<td>{esc(", ".join(n["cve"]) if isinstance(n.get("cve"), list) else n.get("cve"))}</td></tr>'
+            for n in nuclei_sorted)
+        body = (f'{_html_export_button("t-nuclei", "nuclei_findings.csv")}'
+                f'<table id="t-nuclei"><tr><th>Severity</th><th>Host</th><th>Template</th>'
+                f'<th>CVE</th></tr>{rows}</table>')
+        sections.append(_html_section("nuclei", "nuclei findings (templated vuln scan)", len(nuclei), body))
+
+    # ---- Attack surface (primary table, always open) ----
     rows = []
     for h in hosts:
         if h.wildcard:
             continue
         cves = ", ".join(h.vulns[:5]) or "—"
         rows.append(
-            f"<tr><td>{_h.escape(h.subdomain)}</td><td>{', '.join(h.ips) or '—'}</td>"
-            f"<td>{_h.escape((h.asn or '') + ' ' + (h.org or ''))[:40] or '—'}</td>"
+            f"<tr><td>{esc(h.subdomain)}</td><td>{', '.join(h.ips) or '—'}</td>"
+            f"<td>{esc(((h.asn or '') + ' ' + (h.org or '')).strip())[:40] or '—'}</td>"
             f"<td>{', '.join(map(str, h.ports)) or '—'}</td>"
-            f"<td>{_h.escape(h.server or h.powered_by or '—')}</td>"
+            f"<td>{esc(h.server or h.powered_by or None)}</td>"
             f"<td>{(str(h.http_status) if h.http_status else '—')}</td>"
-            f"<td>{_h.escape(cves)}</td></tr>")
-    takeovers = [h for h in hosts if h.takeover]
-    to_html = "".join(f"<li><b>{_h.escape(h.subdomain)}</b> — {_h.escape(h.takeover)}</li>"
-                      for h in takeovers)
-    cf_html = ""
-    if cf.get("detected"):
-        conf = [f"<li><code>{ip}</code> — {_h.escape(v['evidence'] or '')}</li>"
-                for ip, v in cf["candidates"].items() if v["confirmed"]]
-        cf_html = (f"<h2>Cloudflare origin exposure</h2><p>Fronts {len(cf['fronted'])} host(s). "
-                   f"Confirmed origin candidates:</p><ul>{''.join(conf) or '<li>none confirmed</li>'}</ul>")
-    ep_html = "<p>No high-confidence entry points identified from this pass.</p>"
-    if entry_points:
-        ep_rows = "".join(
-            f"<tr><td>{_h.escape(e['severity'].upper())}</td><td>{_h.escape(str(e['target']))}</td>"
-            f"<td>{_h.escape(e['summary'])}</td><td>{_h.escape(e.get('attck') or '—')}</td></tr>"
-            for e in entry_points)
-        ep_html = (f"<table><tr><th>Severity</th><th>Target</th><th>Finding</th>"
-                   f"<th>ATT&amp;CK</th></tr>{ep_rows}</table>"
-                   f"<p><i>Leads, not confirmed compromises — validate per ROE.</i></p>")
+            f"<td>{esc(cves)}</td></tr>")
+    body = (f'{_html_export_button("t-attacksurface", "attack_surface.csv")}'
+            f'<table id="t-attacksurface"><tr><th>Subdomain</th><th>IP(s)</th><th>ASN/Org</th>'
+            f'<th>Open Ports</th><th>Tech</th><th>HTTP</th><th>CVEs</th></tr>{"".join(rows)}</table>')
+    sections.append(_html_section("attacksurface", "Attack surface", len(rows), body, open_default=True))
+
+    # ---- CVE hits ----
+    if vulns:
+        rows = "".join(
+            f'<tr><td>{esc(h.subdomain)}</td><td>{esc(", ".join(h.ips))}</td>'
+            f'<td>{esc(", ".join(h.vulns))}</td></tr>' for h in vulns)
+        engine = "Shodan" if any("shodan" in h.enrich_src for h in hosts) else "InternetDB"
+        body = (f'{_html_export_button("t-cve", "cve_hits.csv")}'
+                f'<table id="t-cve"><tr><th>Subdomain</th><th>IP(s)</th><th>CVEs</th></tr>{rows}</table>'
+                f'<p class="note">CVEs inferred from {esc(engine)} banner/version data. '
+                f'Treat as leads, confirm with targeted validation.</p>')
+        sections.append(_html_section("cve", "CVE hits (validate before reporting)", len(vulns), body))
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>lrecon — {_h.escape(', '.join(domains))}</title><style>
-body{{font:14px/1.5 system-ui,sans-serif;margin:2rem;color:#1a1a1a;max-width:1100px}}
-h1{{border-bottom:2px solid #333}} h2{{margin-top:2rem;color:#b31b1b}}
-table{{border-collapse:collapse;width:100%;font-size:13px}}
-th,td{{border:1px solid #ddd;padding:4px 8px;text-align:left}}
-th{{background:#f4f4f4}} code{{background:#f0f0f0;padding:1px 4px}}
-tr:nth-child(even){{background:#fafafa}}</style></head><body>
-<h1>External Recon — {_h.escape(', '.join(domains))}</h1>
-<p>Authorized engagement. Hosts: {len(hosts)} · Live: {sum(1 for h in hosts if h.http_status)} ·
-Takeover leads: {len(takeovers)} · Potential entry points: {len(entry_points)}</p>
-<h2>⚠ Potential entry points</h2>
-{ep_html}
-{('<h2>Subdomain takeover leads</h2><ul>'+to_html+'</ul>') if takeovers else ''}
-{cf_html}
-<h2>Attack surface</h2><table><tr><th>Subdomain</th><th>IP(s)</th><th>ASN/Org</th>
-<th>Ports</th><th>Tech</th><th>HTTP</th><th>CVEs</th></tr>{''.join(rows)}</table>
+<title>lrecon — {esc(', '.join(domains))}</title>
+<style>
+:root {{ color-scheme: light; }}
+body {{ font: 14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; margin: 0;
+       color: #1a1a1a; background: #fff; }}
+.wrap {{ max-width: 1100px; margin: 0 auto; padding: 2rem; }}
+h1 {{ border-bottom: 2px solid #333; padding-bottom: .5rem; }}
+.meta {{ color: #555; margin-top: -.5rem; }}
+.toolbar {{ margin: 1rem 0; display: flex; gap: .5rem; flex-wrap: wrap; }}
+.toolbar button {{ font: inherit; padding: .35rem .8rem; border: 1px solid #999; border-radius: 4px;
+                   background: #f4f4f4; cursor: pointer; }}
+.toolbar button:hover {{ background: #e8e8e8; }}
+.stats {{ display: flex; gap: .75rem; flex-wrap: wrap; margin: 1rem 0 1.5rem; }}
+.stat {{ border: 1px solid #ddd; border-radius: 6px; padding: .6rem 1rem; min-width: 8rem; }}
+.stat .n {{ font-size: 1.4rem; font-weight: 700; display: block; }}
+.stat .l {{ font-size: .78rem; color: #666; text-transform: uppercase; letter-spacing: .03em; }}
+details.section {{ border: 1px solid #ddd; border-radius: 6px; margin-bottom: .6rem; overflow: hidden; }}
+details.section summary {{ cursor: pointer; padding: .6rem .9rem; font-weight: 600; font-size: 15px;
+                           color: #b31b1b; background: #faf5f5; list-style: revert; }}
+details.section summary:hover {{ background: #f5eaea; }}
+details.section .count {{ color: #666; font-weight: 400; font-size: .85em; }}
+.section-body {{ padding: .8rem 1rem 1rem; }}
+.export-btn {{ font: inherit; font-size: .8rem; padding: .3rem .7rem; margin-bottom: .5rem;
+              border: 1px solid #999; border-radius: 4px; background: #fff; cursor: pointer; }}
+.export-btn:hover {{ background: #f0f0f0; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+th, td {{ border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-align: top; }}
+th {{ background: #f4f4f4; position: sticky; top: 0; }}
+code {{ background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }}
+tr:nth-child(even) {{ background: #fafafa; }}
+.note {{ color: #555; font-style: italic; }}
+.sev {{ display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
+       font-weight: 700; letter-spacing: .02em; }}
+.sev-critical {{ background: #7a0d0d; color: #fff; }}
+.sev-high {{ background: #c0392b; color: #fff; }}
+.sev-medium {{ background: #e67e22; color: #fff; }}
+.sev-low {{ background: #95a5a6; color: #fff; }}
+.sev-info {{ background: #bdc3c7; color: #333; }}
+@media (prefers-color-scheme: dark) {{
+  :root {{ color-scheme: dark; }}
+  body {{ background: #16181c; color: #e6e6e6; }}
+  h1 {{ border-color: #444; }}
+  .meta {{ color: #aaa; }}
+  .toolbar button {{ background: #24272d; border-color: #555; color: #e6e6e6; }}
+  .toolbar button:hover {{ background: #2c2f36; }}
+  .stat {{ border-color: #3a3d44; }}
+  .stat .l {{ color: #999; }}
+  details.section {{ border-color: #3a3d44; }}
+  details.section summary {{ background: #241a1a; color: #ff8a80; }}
+  details.section summary:hover {{ background: #2b1f1f; }}
+  .export-btn {{ background: #24272d; border-color: #555; color: #e6e6e6; }}
+  .export-btn:hover {{ background: #2c2f36; }}
+  th {{ background: #23262c; }}
+  th, td {{ border-color: #3a3d44; }}
+  code {{ background: #2a2d33; }}
+  tr:nth-child(even) {{ background: #1c1f24; }}
+  .note {{ color: #aaa; }}
+}}
+@media print {{
+  .toolbar {{ display: none; }}
+  details.section {{ break-inside: avoid; }}
+}}
+</style></head><body><div class="wrap">
+<h1>External Recon — {esc(', '.join(domains))}</h1>
+<p class="meta">Authorized engagement · Generated {ts} · ATT&amp;CK TA0043 Reconnaissance</p>
+<div class="stats">
+<div class="stat"><span class="n">{len(hosts)}</span><span class="l">Subdomains</span></div>
+<div class="stat"><span class="n">{n_live}</span><span class="l">Live</span></div>
+<div class="stat"><span class="n">{len(entry_points)}</span><span class="l">Entry points</span></div>
+<div class="stat"><span class="n">{len(takeovers)}</span><span class="l">Takeover leads</span></div>
+<div class="stat"><span class="n">{len(vulns)}</span><span class="l">Hosts w/ CVEs</span></div>
+<div class="stat"><span class="n">{len(people)}</span><span class="l">People (OSINT)</span></div>
+</div>
+<div class="toolbar">
+<button type="button" onclick="toggleAllSections(true)">Expand all</button>
+<button type="button" onclick="toggleAllSections(false)">Collapse all</button>
+</div>
+{"".join(sections)}
+<p class="note">Full per-target CSV/JSON exports also written alongside this report
+(<code>.targets.csv</code>, <code>.users.csv</code>, <code>.json</code>) — the buttons above export
+exactly what's rendered on this page, which may be truncated for display.</p>
+</div>
+<script>
+function exportTableToCSV(tableId, filename) {{
+  var table = document.getElementById(tableId);
+  if (!table) return;
+  var rows = Array.prototype.slice.call(table.querySelectorAll('tr'));
+  var csv = rows.map(function(row) {{
+    var cells = Array.prototype.slice.call(row.querySelectorAll('th,td'));
+    return cells.map(function(cell) {{
+      return '"' + cell.textContent.trim().replace(/"/g, '""') + '"';
+    }}).join(',');
+  }}).join('\\r\\n');
+  var blob = new Blob([csv], {{type: 'text/csv;charset=utf-8;'}});
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}}
+function toggleAllSections(open) {{
+  document.querySelectorAll('details.section').forEach(function(d) {{ d.open = open; }});
+}}
+</script>
 </body></html>"""
     Path(path).write_text(doc)
 

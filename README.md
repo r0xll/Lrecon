@@ -230,7 +230,10 @@ Per run, `<out>.*`:
 - **`<out>.md`** — the deliverable: summary, source-contribution table, change-since-last-run,
   breach/GitHub/bucket exposure, nuclei findings, email posture, Cloudflare origin exposure, subdomain-takeover
   leads, favicon pivots, full attack-surface table, CVE hits.
-- **`<out>.html`** — self-contained styled HTML report for client sharing.
+- **`<out>.html`** — self-contained styled HTML report for client sharing. Same section
+  coverage as the Markdown report, each in a collapsible panel (expand/collapse-all
+  toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
+  no server, no external JS/CSS, works fully offline from the file.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
   favicon_pivots, diff, per_source, entry_points, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
