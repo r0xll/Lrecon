@@ -39,14 +39,34 @@ def _parse_cse_response(data: dict) -> list:
     return out
 
 
-async def google_dork(client, domain: str, api_key: str, cx: str, limiter) -> list:
+async def google_dork(client, domain: str, api_key: str, cx: str, limiter) -> tuple:
+    """
+    Returns (hits, terminal). terminal=True means the response indicated a
+    condition that will recur identically for every remaining domain (quota
+    exhausted, invalid key, invalid cx) — the caller should stop querying
+    entirely rather than burning the shared rate limiter on doomed requests
+    for the rest of the domain list. A transient per-request exception is
+    NOT treated as terminal (it only aborts this domain's remaining
+    categories) since it doesn't necessarily indicate the same failure would
+    repeat for other domains.
+
+    Uses the API's siteSearch/siteSearchFilter params, not a `site:{domain}`
+    prefix folded into the free-text query — several DORK_TEMPLATES entries
+    contain top-level `OR`, and Google's query-syntax precedence only binds
+    a leading `site:` to the first OR branch, letting later branches (e.g.
+    `inurl:login` on its own) match pages on any indexed site, not just the
+    scoped domain. siteSearch/siteSearchFilter constrain the whole query
+    regardless of its internal OR/AND structure.
+    """
     seen_links = set()
     out = []
+    terminal = False
     for category, query, severity in DORK_TEMPLATES:
         await limiter.wait()
         try:
             r = await client.get("https://www.googleapis.com/customsearch/v1",
-                                params={"key": api_key, "cx": cx, "q": f"site:{domain} {query}"},
+                                params={"key": api_key, "cx": cx, "q": query,
+                                        "siteSearch": domain, "siteSearchFilter": "i"},
                                 timeout=25)
             if r.status_code == 200:
                 for hit in _parse_cse_response(r.json()):
@@ -56,11 +76,13 @@ async def google_dork(client, domain: str, api_key: str, cx: str, limiter) -> li
                     out.append({**hit, "category": category, "severity": severity})
             elif r.status_code == 403:
                 log("[!] google dork: quota exhausted or key/cx invalid — stopping")
+                terminal = True
                 break
             elif r.status_code == 400:
                 log("[!] google dork: bad request (check --google-cse-key/--google-cse-cx)")
+                terminal = True
                 break
         except Exception as e:
             log(f"[!] google dork {domain}: {e}")
             break
-    return out
+    return out, terminal

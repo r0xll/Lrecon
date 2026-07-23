@@ -379,8 +379,13 @@ async def run(domains, args, keys) -> list:
             if keys.get("google_cse") and keys.get("google_cse_cx"):
                 dork_limiter = RateLimiter(per_second=1.0)
                 for d in domains:
-                    dorks += await google_dork(client, d, keys["google_cse"],
-                                               keys["google_cse_cx"], dork_limiter)
+                    hits, terminal = await google_dork(client, d, keys["google_cse"],
+                                                        keys["google_cse_cx"], dork_limiter)
+                    dorks += hits
+                    if terminal:
+                        log(f"[!] google dork: stopping after {d} — the error would repeat "
+                            f"identically for every remaining domain")
+                        break
                 if dorks:
                     n_cat = len({d["category"] for d in dorks})
                     log(f"[+] google dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
