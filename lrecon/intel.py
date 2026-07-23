@@ -183,6 +183,74 @@ async def email_security(domain: str, resolver_ns) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Domain registration data (WHOIS via RDAP) — keyless, third-party registry
+# only, never touches the target's own infrastructure. RDAP is the
+# structured, JSON-based successor to WHOIS; rdap.org is a public bootstrap
+# redirector to the authoritative RDAP server for whatever TLD the domain is
+# under, so one endpoint covers the large majority of TLDs without needing to
+# chase IANA referrals ourselves.
+# --------------------------------------------------------------------------- #
+def _rdap_entity_name(entity: dict) -> str | None:
+    """Registrar/registrant name is buried in jCard format: vcardArray[1] is
+    a list of [field, params, type, value, ...] entries; find the "fn" one."""
+    for item in (entity.get("vcardArray") or [None, []])[1]:
+        if len(item) >= 4 and item[0] == "fn" and item[3]:
+            return item[3]
+    return None
+
+
+def _parse_rdap(data: dict) -> dict:
+    out = {"registrar": None, "created": None, "expires": None,
+          "last_changed": None, "nameservers": [], "status": []}
+    for ev in data.get("events", []) or []:
+        action = ev.get("eventAction")
+        if action == "registration":
+            out["created"] = ev.get("eventDate")
+        elif action == "expiration":
+            out["expires"] = ev.get("eventDate")
+        elif action == "last changed":
+            out["last_changed"] = ev.get("eventDate")
+    out["nameservers"] = sorted({ns["ldhName"].lower() for ns in data.get("nameservers", []) or []
+                                 if ns.get("ldhName")})
+    out["status"] = data.get("status") or []
+    registrar = next((e for e in data.get("entities", []) or [] if "registrar" in (e.get("roles") or [])),
+                     None)
+    if registrar:
+        out["registrar"] = _rdap_entity_name(registrar)
+    return out
+
+
+async def rdap_lookup(client, domain: str) -> dict:
+    """
+    Overrides the shared client's default follow_redirects=False for this one
+    call — rdap.org responds with a redirect to the authoritative registry
+    (e.g. rdap.verisign.com for .com), confirmed live against example.com.
+    Returns {} on any failure — many domains (privacy-protected registrants,
+    some ccTLDs without RDAP support yet) simply won't resolve; that's
+    expected, not an error worth logging loudly.
+    """
+    try:
+        r = await client.get(f"https://rdap.org/domain/{domain}", timeout=20, follow_redirects=True)
+        if r.status_code == 200:
+            return _parse_rdap(r.json())
+    except Exception as e:
+        log(f"[!] whois/rdap {domain}: {e}")
+    return {}
+
+
+def domain_expiring_soon(expires: str | None, within_days: int = 30) -> bool:
+    if not expires:
+        return False
+    try:
+        from datetime import datetime, timezone
+        exp = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        return (exp - datetime.now(timezone.utc)).days <= within_days
+    except Exception:
+        return False
+
+
+
+# --------------------------------------------------------------------------- #
 # GitHub code dorking (needs token) — T1593.003
 # --------------------------------------------------------------------------- #
 async def github_dork(client, domain: str, token: str, limiter) -> list:
@@ -305,7 +373,7 @@ def _cve_severity(cvss, has_poc: bool = False) -> str:
     return sev
 
 
-def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) -> list:
+def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei, dorks=None) -> list:
     """
     Pull the findings that represent a likely initial-access vector out of the
     full result set into one ranked list, so they're stated explicitly instead
@@ -341,6 +409,11 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei) 
                        "summary": f"{n.get('name') or n.get('template')} "
                                   f"({n.get('cve') or 'no CVE'}) at {n.get('matched')}",
                        "attck": "T1190"})
+
+    for d in (dorks or []):
+        out.append({"type": "dork-hit", "target": d["link"], "severity": d["severity"],
+                   "summary": f"{d['category']}: {d['title']} — {d['snippet']}",
+                   "attck": "T1593.002"})
 
     known_cve_cap = 5
     for h in hosts:

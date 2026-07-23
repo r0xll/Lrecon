@@ -12,9 +12,24 @@ from .report import write_markdown, write_html, write_live_hosts, write_csv, wri
 from .backends import available_backends
 from . import backends
 
+
+def read_domains_file(path: str) -> list:
+    """One domain per line; blank lines and #-comments skipped."""
+    return [ln.strip() for ln in Path(path).read_text().splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def merge_domains(positional: list, file_domains: list) -> list:
+    """Union of positional args + file domains, deduped, order preserved."""
+    return list(dict.fromkeys(list(positional) + list(file_domains)))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="LRecon (Let's Recon) v3.2 — external recon (authorized use only)")
     ap.add_argument("domains", nargs="*", help="root domain(s) in scope")
+    ap.add_argument("-iL", "--domains-file",
+                    help="read domains from a file, one per line (# comments and blank "
+                         "lines skipped) — merged with any positional domains, deduped")
     ap.add_argument("--check-backends", action="store_true",
                     help="validate optional backends (ProjectDiscovery tools + psql) + "
                          "parser mapping, then exit")
@@ -32,6 +47,13 @@ def main() -> None:
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
     ap.add_argument("--buckets", action="store_true", help="cloud bucket permutation enum")
     ap.add_argument("--bucket-keywords", help="extra comma-separated bucket keywords")
+    ap.add_argument("--dork", action="store_true",
+                    help="search-engine dork for exposed admin/login panels, config/env files, "
+                         "directory listings, .git/backup leaks, etc. via Google Custom Search "
+                         "(needs --google-cse-key + --google-cse-cx; free tier is 100 queries/day "
+                         "total, ~7 queries per domain — explicit flag even with a key configured)")
+    ap.add_argument("--google-cse-key", help="Google Custom Search API key (else env/config)")
+    ap.add_argument("--google-cse-cx", help="Google Custom Search Engine ID (else env/config)")
     ap.add_argument("--nvd", action="store_true", help="resolve CPEs to CVEs via NVD (slow)")
     ap.add_argument("--nvd-max-cves", type=int, default=25,
                     help="per-host cap on bare Shodan/InternetDB CVE IDs resolved via NVD "
@@ -83,6 +105,13 @@ def main() -> None:
                 "check binary version vs parser in backends.py")
         return
 
+    if args.domains_file:
+        try:
+            file_domains = read_domains_file(args.domains_file)
+        except OSError as e:
+            ap.error(f"--domains-file: {e}")
+        args.domains = merge_domains(args.domains, file_domains)
+
     if not args.domains:
         ap.error("provide at least one domain (or use --check-backends)")
 
@@ -105,6 +134,9 @@ def main() -> None:
                                      ("github", keys["github"])) if k]
     log(f"[i] people-enum: {', '.join(people_sources) if people_sources else 'off (no hunter/rocketreach/github key)'}"
         f" | email verify: {'on (active)' if args.verify_emails else 'off'}")
+    if args.dork:
+        dork_ready = bool(keys["google_cse"] and keys["google_cse_cx"])
+        log(f"[i] google dork: {'on' if dork_ready else 'requested but not configured — will skip'}")
     if args.no_pd:
         log("[i] backends: forced pure-Python (--no-pd)")
     else:
@@ -126,7 +158,7 @@ def main() -> None:
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
-                                "entry_points")}
+                                "entry_points", "whois", "dorks")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
@@ -149,8 +181,9 @@ def main() -> None:
             log(f"[+] {n} screenshot(s) -> {shot_dir}/")
 
     n_entry = len(res.get("entry_points") or [])
+    n_dorks = len(res.get("dorks") or [])
     log(f"[+] done in {time.time()-t0:.1f}s — {len(hosts)} hosts, {n_live} live URLs, "
-        f"{n_entry} potential entry point(s), {len(people)} enumerated user(s)")
+        f"{n_entry} potential entry point(s), {len(people)} enumerated user(s), {n_dorks} dork hit(s)")
     log(f"[+] {'  '.join(outputs)}")
 
 

@@ -83,7 +83,9 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | CF origin | Cloudflare detection + origin-IP candidates (+ optional confirm) | confirm step only |
 | Expansion | ASN->netblock (RIPEstat) + reverse-DNS sweep, rDNS wire-back | DNS only |
 | Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
+| WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status (always on) | none (third-party registry) |
 | People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
+| Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
 | Email verify | SMTP RCPT-TO probe of discovered emails (opt-in, `--verify-emails`) | yes, mail infra |
 | CVE | NVD CPE->CVE resolution (opt-in, cached) | none (API) |
 | Diff | change vs previous run snapshot | none |
@@ -136,6 +138,7 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 | HIBP | breach-by-domain (keyless list endpoint) | — | `HIBP_API_KEY` | keyless list |
 | Hunter.io | company email enumeration + naming-pattern detection | `--hunter-key` | `HUNTER_API_KEY` | limited |
 | RocketReach | company people search (name/title only — see below) | `--rocketreach-key` | `ROCKETREACH_API_KEY` | limited |
+| Google Custom Search | `--dork` entry-point search (admin/login/config/backup exposure) | `--google-cse-key` / `--google-cse-cx` | `GOOGLE_CSE_KEY` / `GOOGLE_CSE_CX` | 100 queries/day |
 
 ```fish
 # persistent (fish universal vars — visible inside the venv)
@@ -144,7 +147,7 @@ set -Ux IPINFO_TOKEN   "..."
 
 # or config file
 mkdir -p ~/.config/lrecon
-echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"..."}' > ~/.config/lrecon/config.json
+echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"...","google_cse_key":"...","google_cse_cx":"..."}' > ~/.config/lrecon/config.json
 
 # or interactive (stays out of shell history)
 lrecon example.com --ask-keys
@@ -186,6 +189,11 @@ lrecon client.com --active-ports --ports 80,443,8080,8443 -o client_web
 
 # multiple roots + custom resolvers
 lrecon client.com client.net --resolvers 1.1.1.1,9.9.9.9 -o client
+
+# large client domain lists from a file instead of the command line
+# (one domain per line; blank lines and #-comments skipped; merged with
+# any positional domains, deduped)
+lrecon -iL client_domains.txt -o client
 ```
 
 ### Handoff to nuclei / httpx
@@ -200,6 +208,7 @@ httpx -l client.live.txt -tech-detect -title
 
 | Flag | Effect |
 |---|---|
+| `-iL, --domains-file` | read domains from a file, one per line, merged with positional domains |
 | `--passive-only` | OSINT sources + host lookup only; no resolution/HTTP/portscan |
 | `--active-ports` | async TCP connect scan of common ports (aggressive; ROE-gated) |
 | `--ports a,b,c` | custom port set for `--active-ports` |
@@ -211,6 +220,9 @@ httpx -l client.live.txt -tech-detect -title
 | `--nvd` | resolve CPEs to CVEs via NVD (slow, rate-limited, cached) |
 | `--company-name` | company name override for name-based people-enum sources (default: domain label) |
 | `--verify-emails` | SMTP RCPT-TO probe of discovered company emails (active, ROE-gated) |
+| `--dork` | search-engine dork for exposed admin/login/config/backup/`.git` paths (needs `--google-cse-key` + `--google-cse-cx`) |
+| `--google-cse-key` | Google Custom Search API key for `--dork` (else env/config) |
+| `--google-cse-cx` | Google Custom Search Engine ID for `--dork` (else env/config) |
 | `--diff` | diff against previous run snapshot |
 | `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei) |
 | `--nuclei-severity` | min nuclei severity, e.g. `medium,high,critical` |
@@ -228,14 +240,15 @@ httpx -l client.live.txt -tech-detect -title
 Per run, `<out>.*`:
 
 - **`<out>.md`** — the deliverable: summary, source-contribution table, change-since-last-run,
-  breach/GitHub/bucket exposure, nuclei findings, email posture, Cloudflare origin exposure, subdomain-takeover
+  breach/GitHub/bucket exposure, nuclei findings, email posture, domain registration (WHOIS/RDAP),
+  search-engine dork hits, Cloudflare origin exposure, subdomain-takeover
   leads, favicon pivots, full attack-surface table, CVE hits.
 - **`<out>.html`** — self-contained styled HTML report for client sharing. Same section
   coverage as the Markdown report, each in a collapsible panel (expand/collapse-all
   toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
   no server, no external JS/CSS, works fully offline from the file.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
-  favicon_pivots, diff, per_source, entry_points, people).
+  favicon_pivots, diff, per_source, entry_points, whois, dorks, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
 - **`<out>.targets.csv`** — flat subdomain/IP/ASN list for client scope confirmation.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
@@ -310,6 +323,49 @@ address accepted too) and marks every result `catch-all` rather than reporting
 false `valid` positives. Many providers (Microsoft 365, Google Workspace, or
 anything blocking port 25 from cloud/datacenter source IPs) will make this come
 back `unknown` for the whole domain — expected, not a bug.
+
+---
+
+## Search-engine dorking
+
+Finds exposed admin/login panels, config/env files, directory listings, and
+`.git`/backup leaks indexed by Google against each in-scope domain — the
+`site:` dork techniques security testers run by hand, automated across
+seven curated categories per domain (admin/login panels, config/env
+exposure, directory listing, backup/database files, exposed `.git`,
+API/swagger docs, debug/error pages). Findings feed the entry-points
+summary tagged **T1593.002** (Search Open Websites/Domains: Search Engines).
+
+Opt-in via **`--dork`**, and requires a **Google Custom Search JSON API**
+key + Custom Search Engine ID (`--google-cse-key`/`--google-cse-cx`, or
+`GOOGLE_CSE_KEY`/`GOOGLE_CSE_CX`, or config file). It's an explicit flag
+even when a key is configured — unlike the "presence of a key = opt-in"
+convention used for the People OSINT sources — because the free tier is
+only **100 queries/day total** and each domain burns ~7 of them; auto-running
+it could silently exhaust the day's quota on a run where you didn't need it.
+
+**No raw search-engine scraping.** Like the [People OSINT](#people-osint-user-enumeration)
+LinkedIn decision above, lrecon does not scrape Google or DuckDuckGo HTML
+result pages directly — that means defeating anti-automation measures and
+violating those platforms' terms of service. Dorking uses Google's official,
+keyed, documented Custom Search API only. There is no DuckDuckGo fallback.
+
+A hit is a search-engine-indexed page matching a dork pattern, not a
+confirmed live exposure — verify each is actually reachable before
+reporting it, since a Google result can be stale.
+
+## Domain registration (WHOIS/RDAP)
+
+Every run looks up each domain's registration data — registrar, creation/
+expiration dates, nameservers, and status codes — via **RDAP** (the
+structured-JSON successor to WHOIS), queried keylessly over HTTPS through
+`rdap.org`'s public bootstrap redirector to the authoritative registry. No
+system `whois` binary is used or required. This always runs, including
+under `--passive-only`, since it only touches a third-party registry, never
+the target's own infrastructure. A domain expiring within 30 days is flagged
+in the run log as worth raising with the client. Some domains — privacy-
+protected registrants, a few ccTLDs without RDAP support yet — simply won't
+resolve; that's expected, not an error.
 
 ---
 
