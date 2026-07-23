@@ -483,18 +483,24 @@ async def test_google_dork_tags_category_severity_and_dedupes_by_link(monkeypatc
     calls = []
 
     async def fake_get(url, params=None, timeout=None):
-        calls.append(params["q"])
+        calls.append(params)
         # every category "finds" the same URL -> should collapse to one hit
         return _FakeResp(200, {"items": [{"title": "Admin", "link": "https://x.com/admin",
                                           "snippet": "s"}]})
     client = type("C", (), {"get": staticmethod(fake_get)})()
     limiter = enrich.RateLimiter(per_second=1000)
-    out = await dorking.google_dork(client, "x.com", "key", "cx", limiter)
+    out, terminal = await dorking.google_dork(client, "x.com", "key", "cx", limiter)
     assert len(calls) == len(dorking.DORK_TEMPLATES)          # one query per template
     assert len(out) == 1                                       # deduped by link
     assert out[0]["category"] == dorking.DORK_TEMPLATES[0][0]  # first template wins
     assert out[0]["severity"] == dorking.DORK_TEMPLATES[0][2]
-    assert all(q.startswith("site:x.com ") for q in calls)     # scoped to the domain
+    assert terminal is False
+    # scoped via siteSearch/siteSearchFilter (API-level), not a `site:` prefix folded
+    # into the free-text query — several templates contain top-level OR, and a
+    # `site:x.com` prefix only binds to the first OR branch, leaking later branches
+    # to results outside the domain.
+    assert all(c["siteSearch"] == "x.com" and c["siteSearchFilter"] == "i" for c in calls)
+    assert all("site:" not in c["q"] for c in calls)
 
 
 async def test_google_dork_stops_on_403_quota_or_bad_key(monkeypatch):
@@ -502,8 +508,51 @@ async def test_google_dork_stops_on_403_quota_or_bad_key(monkeypatch):
         return _FakeResp(403)
     client = type("C", (), {"get": staticmethod(fake_get)})()
     limiter = enrich.RateLimiter(per_second=1000)
-    out = await dorking.google_dork(client, "x.com", "bad-key", "cx", limiter)
+    out, terminal = await dorking.google_dork(client, "x.com", "bad-key", "cx", limiter)
     assert out == []
+    assert terminal is True
+
+
+async def test_google_dork_stops_on_400_bad_request():
+    async def fake_get(url, params=None, timeout=None):
+        return _FakeResp(400)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out, terminal = await dorking.google_dork(client, "x.com", "key", "bad-cx", limiter)
+    assert out == []
+    assert terminal is True
+
+
+async def test_google_dork_network_exception_not_terminal():
+    async def fake_get(url, params=None, timeout=None):
+        raise Exception("boom")
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out, terminal = await dorking.google_dork(client, "x.com", "key", "cx", limiter)
+    assert out == []
+    assert terminal is False
+
+
+async def test_google_dork_terminal_status_stops_remaining_domains_in_core_loop():
+    """
+    Mirrors core.py's `for d in domains: ... if terminal: break` wiring —
+    the second domain must never be queried once the first returns terminal.
+    """
+    queried_domains = []
+
+    async def fake_dork(client, domain, key, cx, limiter):
+        queried_domains.append(domain)
+        return [], True   # simulate a terminal 403 on the very first domain
+
+    domains = ["a.com", "b.com", "c.com"]
+    dorks = []
+    for d in domains:
+        hits, terminal = await fake_dork(None, d, "key", "cx", None)
+        dorks += hits
+        if terminal:
+            break
+    assert queried_domains == ["a.com"]
+    assert dorks == []
 
 
 def test_summarize_entry_points_includes_dork_hits():
