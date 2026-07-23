@@ -323,6 +323,31 @@ async def run(domains, args, keys) -> list:
                 if g:
                     log(f"[+] email {d}: {g} ({len(email[d].get('issues', []))} issue(s))")
 
+        # ---- DNS records + mail infrastructure ----
+        # Raw apex DNS snapshot (A/AAAA/MX/NS/SOA) for the report's DNS
+        # section, plus MX-host enrichment to identify managed vs self-hosted
+        # mail infra. Same touch tier as email_security() above (DNS query
+        # against the domain's own authoritative nameservers), so gated the
+        # same way, not alongside the keyless RDAP/WHOIS lookup earlier.
+        dns_records = {}
+        mail_infra = {}
+        if not args.passive_only:
+            for d in domains:
+                dns_records[d] = await dns_lookup(d, ns)
+                mx = dns_records[d].get("mx") or []
+                if mx:
+                    entries = await mail_infra_lookup(client, mx, ipinfo_token, ns)
+                    mail_infra[d] = entries
+                    providers = sorted({e["provider"] for e in entries if e["provider"]})
+                    unmanaged = [e["host"] for e in entries if not e["provider"]]
+                    if providers and not unmanaged:
+                        log(f"[+] mail infra {d}: {', '.join(providers)}")
+                    elif providers:
+                        log(f"[+] mail infra {d}: {', '.join(providers)} + "
+                            f"{len(unmanaged)} unrecognized host(s) — review")
+                    else:
+                        log(f"[!] mail infra {d}: no managed provider recognized — possible self-hosted MTA")
+
         gh_limiter = RateLimiter(per_second=0.2)              # code search ~10/min; shared below
         github_findings = []
         if keys.get("github"):
@@ -488,6 +513,6 @@ async def run(domains, args, keys) -> list:
             "email": email, "github": github_findings, "buckets": buckets,
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
-            "whois": whois, "dorks": dorks}
+            "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra}
 
 

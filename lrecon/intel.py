@@ -3,6 +3,7 @@ import asyncio, ipaddress, json
 import httpx
 from .common import *
 from .sources import get_resolver, resolve_full
+from .enrich import enrich_ipinfo
 
 # --------------------------------------------------------------------------- #
 # Cloudflare origin discovery (origin IP disclosure -> WAF bypass)
@@ -178,6 +179,108 @@ async def email_security(domain: str, resolver_ns) -> dict:
 
     sev = len([i for i in out["issues"] if "risk" in i or "critical" in i])
     out["grade"] = "FAIL" if sev else ("WARN" if out["issues"] else "PASS")
+    return out
+
+
+
+# --------------------------------------------------------------------------- #
+# DNS records (A/AAAA/MX/NS/SOA) — apex-level snapshot for the report's own
+# "DNS records" section. Distinct from resolve_full() (per-subdomain A/AAAA/
+# CNAME used in Phase 2) and from email_security() above (which only surfaces
+# the SPF/DMARC/DKIM TXT records, not the rest of the zone). A DNS query
+# against the domain's own authoritative nameservers is the same "DNS only"
+# touch tier as Phase 2 resolution, so this is gated the same way (not
+# --passive-only), not run alongside the keyless RDAP/WHOIS lookup above.
+# --------------------------------------------------------------------------- #
+async def dns_lookup(domain: str, resolver_ns) -> dict:
+    out = {"a": [], "aaaa": [], "mx": [], "ns": [], "txt": [], "soa": None}
+    if not _HAVE_DNS:
+        return out
+    res = get_resolver(resolver_ns)
+
+    async def q(rtype):
+        try:
+            return await res.resolve(domain, rtype)
+        except Exception:
+            return None
+
+    a, aaaa, mx, nsrr, txt, soa = await asyncio.gather(
+        q("A"), q("AAAA"), q("MX"), q("NS"), q("TXT"), q("SOA"))
+    if a:
+        out["a"] = sorted(str(r) for r in a)
+    if aaaa:
+        out["aaaa"] = sorted(str(r) for r in aaaa)
+    if mx:
+        out["mx"] = sorted(({"priority": r.preference, "host": str(r.exchange).rstrip(".").lower()}
+                            for r in mx), key=lambda m: m["priority"])
+    if nsrr:
+        out["ns"] = sorted(str(r).rstrip(".").lower() for r in nsrr)
+    if txt:
+        out["txt"] = ["".join(s.decode(errors="ignore") for s in r.strings) for r in txt]
+    if soa:
+        out["soa"] = str(soa[0].mname).rstrip(".").lower()
+    return out
+
+
+
+# --------------------------------------------------------------------------- #
+# Mail infrastructure identification — resolves each MX host's IP and
+# enriches it via IPinfo (ASN/org/country, reusing the same enrichment used
+# for in-scope hosts), then labels well-known managed-email providers by
+# hostname so the report reads "Google Workspace" / "Microsoft 365" rather
+# than an opaque MX hostname. One entry per unique MX host — several
+# priority tiers commonly share a provider's pool (e.g. multiple
+# *.protection.outlook.com records).
+# --------------------------------------------------------------------------- #
+MAIL_PROVIDER_PATTERNS = [
+    ("Google Workspace",               ["google.com", "googlemail.com"]),
+    ("Microsoft 365",                  ["outlook.com", "protection.outlook.com"]),
+    ("Proofpoint",                     ["pphosted.com", "proofpoint.com"]),
+    ("Mimecast",                       ["mimecast.com"]),
+    ("Barracuda",                      ["barracudanetworks.com"]),
+    ("Cisco Secure Email (IronPort)",  ["iphmx.com", "ppe-hosted.com"]),
+    ("Zoho Mail",                      ["zoho.com", "zohomail.com"]),
+    ("Amazon SES / WorkMail",          ["amazonaws.com", "awsapps.com"]),
+    ("Yandex Mail",                    ["yandex.net", "yandex.ru"]),
+]
+
+
+def _classify_mail_provider(mx_host: str) -> str | None:
+    h = mx_host.lower()
+    for name, patterns in MAIL_PROVIDER_PATTERNS:
+        if any(p in h for p in patterns):
+            return name
+    return None
+
+
+async def mail_infra_lookup(client, mx_records: list, ipinfo_token: str | None, resolver_ns) -> list:
+    out = []
+    seen = set()
+    for mx in mx_records:
+        host = mx["host"]
+        if host in seen:
+            continue
+        seen.add(host)
+        entry = {"host": host, "priority": mx["priority"], "ips": [],
+                 "provider": _classify_mail_provider(host), "asn": None, "org": None, "country": None}
+        if _HAVE_DNS:
+            try:
+                res = get_resolver(resolver_ns)
+                entry["ips"] = sorted(str(r) for r in await res.resolve(host, "A"))
+            except Exception:
+                pass
+        if entry["ips"] and ipinfo_token:
+            info = await enrich_ipinfo(client, entry["ips"][0], ipinfo_token)
+            org = info.get("org")           # e.g. "AS15169 Google LLC"
+            if org:
+                parts = org.split(" ", 1)
+                if parts[0].startswith("AS"):
+                    entry["asn"] = parts[0]
+                    entry["org"] = parts[1] if len(parts) > 1 else org
+                else:
+                    entry["org"] = org
+            entry["country"] = info.get("country")
+        out.append(entry)
     return out
 
 

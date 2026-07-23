@@ -367,6 +367,104 @@ async def test_rdap_lookup_parses_200_response():
 
 
 # --------------------------------------------------------------------------- #
+# DNS records + mail infrastructure identification
+# --------------------------------------------------------------------------- #
+class _FakeMXRecord:
+    def __init__(self, host, preference=10):
+        self.exchange = host + "."
+        self.preference = preference
+
+
+class _FakeTXTRecord:
+    def __init__(self, text):
+        self.strings = [text.encode()]
+
+
+class _FakeSOARecord:
+    def __init__(self, mname):
+        self.mname = mname + "."
+
+
+class _FakeDNSResolver:
+    """Generic fake resolver keyed by (name, rtype); raises (like a real
+    NXDOMAIN/timeout) for anything not explicitly configured, so callers
+    exercise the same try/except-per-record-type path as production."""
+    def __init__(self, answers):
+        self._answers = answers
+
+    async def resolve(self, name, rtype):
+        key = (name, rtype)
+        if key not in self._answers:
+            raise Exception(f"no answer for {name} {rtype}")
+        return self._answers[key]
+
+
+async def test_dns_lookup_parses_all_record_types(monkeypatch):
+    answers = {
+        ("example.com", "A"): ["93.184.216.34"],
+        ("example.com", "AAAA"): ["2606:2800:220:1:248:1893:25c8:1946"],
+        ("example.com", "MX"): [_FakeMXRecord("mail.example.com", 10)],
+        ("example.com", "NS"): ["a.iana-servers.net.", "b.iana-servers.net."],
+        ("example.com", "TXT"): [_FakeTXTRecord("v=spf1 -all")],
+        ("example.com", "SOA"): [_FakeSOARecord("a.iana-servers.net")],
+    }
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.dns_lookup("example.com", None)
+    assert out["a"] == ["93.184.216.34"]
+    assert out["aaaa"] == ["2606:2800:220:1:248:1893:25c8:1946"]
+    assert out["mx"] == [{"priority": 10, "host": "mail.example.com"}]
+    assert out["ns"] == ["a.iana-servers.net", "b.iana-servers.net"]
+    assert out["txt"] == ["v=spf1 -all"]
+    assert out["soa"] == "a.iana-servers.net"
+
+
+async def test_dns_lookup_missing_records_default_empty(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver({}))
+    out = await intel.dns_lookup("nx.test", None)
+    assert out == {"a": [], "aaaa": [], "mx": [], "ns": [], "txt": [], "soa": None}
+
+
+def test_classify_mail_provider_matches_known_hosts():
+    assert intel._classify_mail_provider("ASPMX.L.GOOGLE.COM") == "Google Workspace"
+    assert intel._classify_mail_provider("domain-com.mail.protection.outlook.com") == "Microsoft 365"
+    assert intel._classify_mail_provider("mx1.example-corp.internal") is None
+
+
+async def test_mail_infra_lookup_resolves_ip_and_classifies_provider(monkeypatch):
+    answers = {("aspmx.l.google.com", "A"): ["142.250.152.26"]}
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+
+    async def fake_get(url, timeout=None):
+        assert "142.250.152.26" in url
+        return _FakeResp(200, {"org": "AS15169 Google LLC", "country": "US"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+
+    out = await intel.mail_infra_lookup(client, [{"host": "aspmx.l.google.com", "priority": 1}],
+                                        "fake-token", None)
+    assert out == [{"host": "aspmx.l.google.com", "priority": 1, "ips": ["142.250.152.26"],
+                    "provider": "Google Workspace", "asn": "AS15169", "org": "Google LLC",
+                    "country": "US"}]
+
+
+async def test_mail_infra_lookup_dedupes_shared_mx_host(monkeypatch):
+    answers = {("mx.example.com", "A"): ["1.2.3.4"]}
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    mx_records = [{"host": "mx.example.com", "priority": 10}, {"host": "mx.example.com", "priority": 20}]
+    out = await intel.mail_infra_lookup(None, mx_records, None, None)
+    assert len(out) == 1
+    assert out[0]["priority"] == 10                  # first occurrence kept
+
+
+async def test_mail_infra_lookup_no_ipinfo_token_skips_enrichment(monkeypatch):
+    answers = {("mx.unrecognized.test", "A"): ["9.9.9.9"]}
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.mail_infra_lookup(None, [{"host": "mx.unrecognized.test", "priority": 5}],
+                                        None, None)
+    assert out == [{"host": "mx.unrecognized.test", "priority": 5, "ips": ["9.9.9.9"],
+                    "provider": None, "asn": None, "org": None, "country": None}]
+
+
+# --------------------------------------------------------------------------- #
 # Search-engine dorking (Google Custom Search API)
 # --------------------------------------------------------------------------- #
 def test_parse_cse_response_extracts_hits():

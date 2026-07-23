@@ -119,6 +119,34 @@ def write_markdown(hosts, domains, res, path) -> None:
                          f"| {w.get('expires') or '—'} | {status} | {ns} |")
         lines.append("")
 
+    dns_records = res.get("dns") or {}
+    if dns_records:
+        lines += ["## DNS records", "",
+                  "| Domain | A | AAAA | MX | NS | SOA |", "|---|---|---|---|---|---|"]
+        for d, r in dns_records.items():
+            a = ", ".join(r.get("a", [])) or "—"
+            aaaa = ", ".join(r.get("aaaa", [])) or "—"
+            mx = ", ".join(f"{m['priority']} {m['host']}" for m in r.get("mx", [])) or "—"
+            nsl = ", ".join(r.get("ns", [])) or "—"
+            soa = r.get("soa") or "—"
+            lines.append(f"| {d} | {a} | {aaaa} | {mx} | {nsl} | {soa} |")
+        lines.append("")
+
+    mail_infra = res.get("mail_infra") or {}
+    if mail_infra:
+        lines += ["## Mail infrastructure", "",
+                  "| Domain | MX Host | Priority | IP(s) | Provider | ASN | Org | Country |",
+                  "|---|---|---|---|---|---|---|---|"]
+        for d, entries in mail_infra.items():
+            for e in entries:
+                ips = ", ".join(e.get("ips", [])) or "—"
+                lines.append(f"| {d} | {e['host']} | {e['priority']} | {ips} | "
+                             f"{e.get('provider') or 'self-hosted / unrecognized'} | "
+                             f"{e.get('asn') or '—'} | {e.get('org') or '—'} | {e.get('country') or '—'} |")
+        lines += ["", "> Managed email providers (Google Workspace, Microsoft 365, Proofpoint, etc.) "
+                  "front spam/malware/phishing filtering; a self-hosted or unrecognized MX is worth "
+                  "a closer look (SMTP banner grab, open relay, vulnerable MTA version) if in scope.", ""]
+
     if takeovers:
         lines += ["## Subdomain takeover leads (T1584.001) — priority", ""]
         for h in takeovers:
@@ -307,6 +335,8 @@ def write_html(hosts, domains, res, path) -> None:
     people = res.get("people") or []
     whois = res.get("whois") or {}
     dorks = res.get("dorks") or []
+    dns_records = res.get("dns") or {}
+    mail_infra = res.get("mail_infra") or {}
 
     takeovers = [h for h in hosts if h.takeover]
     vulns = [h for h in hosts if h.vulns]
@@ -354,6 +384,37 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<table id="t-whois"><tr><th>Domain</th><th>Registrar</th><th>Created</th>'
                 f'<th>Expires</th><th>Status</th><th>Nameservers</th></tr>{rows}</table>')
         sections.append(_html_section("whois", "Domain registration (WHOIS/RDAP)", len(whois), body))
+
+    # ---- DNS records ----
+    if dns_records:
+        def _mx_str(r):
+            return ", ".join(f"{m['priority']} {m['host']}" for m in r.get("mx", []))
+        rows = "".join(
+            f"<tr><td>{esc(d)}</td><td>{esc(', '.join(r.get('a', [])))}</td>"
+            f"<td>{esc(', '.join(r.get('aaaa', [])))}</td>"
+            f"<td>{esc(_mx_str(r))}</td>"
+            f"<td>{esc(', '.join(r.get('ns', [])))}</td><td>{esc(r.get('soa'))}</td></tr>"
+            for d, r in dns_records.items())
+        body = (f'{_html_export_button("t-dns", "dns_records.csv")}'
+                f'<table id="t-dns"><tr><th>Domain</th><th>A</th><th>AAAA</th><th>MX</th>'
+                f'<th>NS</th><th>SOA</th></tr>{rows}</table>')
+        sections.append(_html_section("dns", "DNS records", len(dns_records), body))
+
+    # ---- Mail infrastructure ----
+    if mail_infra:
+        rows = "".join(
+            f"<tr><td>{esc(d)}</td><td>{esc(e['host'])}</td><td>{esc(e['priority'])}</td>"
+            f"<td>{esc(', '.join(e.get('ips', [])))}</td>"
+            f"<td>{esc(e.get('provider') or 'self-hosted / unrecognized')}</td>"
+            f"<td>{esc(e.get('asn'))}</td><td>{esc(e.get('org'))}</td><td>{esc(e.get('country'))}</td></tr>"
+            for d, entries in mail_infra.items() for e in entries)
+        n_infra = sum(len(v) for v in mail_infra.values())
+        body = (f'{_html_export_button("t-mailinfra", "mail_infrastructure.csv")}'
+                f'<table id="t-mailinfra"><tr><th>Domain</th><th>MX Host</th><th>Priority</th>'
+                f'<th>IP(s)</th><th>Provider</th><th>ASN</th><th>Org</th><th>Country</th></tr>{rows}</table>'
+                f'<p class="note">Self-hosted or unrecognized MX hosts are worth a closer look '
+                f'(SMTP banner grab, open relay, vulnerable MTA version) if in scope.</p>')
+        sections.append(_html_section("mailinfra", "Mail infrastructure", n_infra, body))
 
     # ---- Subdomain takeover leads ----
     if takeovers:
