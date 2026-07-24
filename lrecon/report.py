@@ -11,24 +11,27 @@ def write_csv(hosts, path) -> int:
     """
     Flat target list for client scope confirmation — one row per discovered
     host (including wildcard-suspect ones, so the client can weigh in on
-    those too). Deliberately just subdomain + IPs (+ per-IP ASN): this is
+    those too). Deliberately just subdomain + IPs (+ per-IP ASN/org): this is
     "here's what we found in your scope, please confirm ownership," not a
-    vuln report. The asn column is positionally parallel to ips — the ASN
-    at index i belongs to the IP at index i, blank where unresolved (e.g.
-    no IPinfo token configured for that run). For single-IP hosts, falls
-    back to the scalar h.asn if ip_asn wasn't populated for that IP —
-    unambiguous with only one IP, and guards against any future caller of
-    apply_ipinfo() that omits the optional ip argument.
+    vuln report. The asn and org columns are positionally parallel to ips —
+    the ASN/org at index i belong to the IP at index i, blank where
+    unresolved (e.g. no IPinfo token configured for that run — though IPinfo
+    enrichment runs keylessly too, so this is now rare). For single-IP
+    hosts, falls back to the scalar h.asn/h.org if ip_asn/ip_org weren't
+    populated for that IP — unambiguous with only one IP, and guards against
+    any future caller of apply_ipinfo() that omits the optional ip argument.
     """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["subdomain", "ips", "asn"])
+        w.writerow(["subdomain", "ips", "asn", "org"])
         for h in hosts:
             if len(h.ips) == 1:
                 asn_col = h.ip_asn.get(h.ips[0]) or h.asn or ""
+                org_col = h.ip_org.get(h.ips[0]) or h.org or ""
             else:
                 asn_col = ", ".join(h.ip_asn.get(ip, "") for ip in h.ips)
-            w.writerow([h.subdomain, ", ".join(h.ips), asn_col])
+                org_col = ", ".join(h.ip_org.get(ip, "") for ip in h.ips)
+            w.writerow([h.subdomain, ", ".join(h.ips), asn_col, org_col])
     return len(hosts)
 
 
