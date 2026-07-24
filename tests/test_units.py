@@ -1,4 +1,5 @@
 """Unit tests for LRecon pure-logic and backend parsers (no network required)."""
+import argparse
 import csv
 import ipaddress
 import sys
@@ -38,6 +39,7 @@ def test_apply_ipinfo_parses_asn_and_org():
     assert h.rdns == "a.x.com"
     assert h.country == "US"
     assert h.ip_asn == {}                        # no ip passed -> per-IP map untouched
+    assert h.ip_org == {}
 
 
 def test_apply_ipinfo_records_per_ip_asn_for_multi_ip_hosts():
@@ -45,7 +47,18 @@ def test_apply_ipinfo_records_per_ip_asn_for_multi_ip_hosts():
     enrich.apply_ipinfo(h, {"org": "AS15169 Google LLC"}, "1.2.3.4")
     enrich.apply_ipinfo(h, {"org": "AS13335 Cloudflare"}, "5.6.7.8")
     assert h.ip_asn == {"1.2.3.4": "AS15169", "5.6.7.8": "AS13335"}
+    assert h.ip_org == {"1.2.3.4": "Google LLC", "5.6.7.8": "Cloudflare"}
     assert h.asn == "AS13335"                    # scalar field: still last-IP-wins
+
+
+def test_apply_ipinfo_records_per_ip_org_without_asn_prefix():
+    # org string without a leading "ASxxxxx" token — still worth recording
+    # per-IP, just with no ASN to go with it.
+    h = Host("a.x.com", ips=["1.2.3.4"])
+    enrich.apply_ipinfo(h, {"org": "Some Hosting Co"}, "1.2.3.4")
+    assert h.ip_org == {"1.2.3.4": "Some Hosting Co"}
+    assert h.ip_asn == {}
+    assert h.org == "Some Hosting Co"
 
 
 def test_non_web_ports_filters_out_web_ports():
@@ -1145,39 +1158,43 @@ def test_available_backends_shape():
 # --------------------------------------------------------------------------- #
 # Reporting: CSV target list
 # --------------------------------------------------------------------------- #
-def test_write_csv_has_subdomain_ips_and_per_ip_asn():
+def test_write_csv_has_subdomain_ips_and_per_ip_asn_org():
     hosts = [
         Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC",
              country="US", scheme="https", http_status=200, source={"crtsh"},
-             ip_asn={"1.2.3.4": "AS15169"}),
-        # multi-IP host, only one IP resolved to an ASN — asn column stays
-        # positionally parallel to ips, blank where unresolved.
+             ip_asn={"1.2.3.4": "AS15169"}, ip_org={"1.2.3.4": "Google LLC"}),
+        # multi-IP host, only one IP resolved to an ASN/org — both columns
+        # stay positionally parallel to ips, blank where unresolved.
         Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"},
-             ip_asn={"8.8.8.8": "AS15169"}),
+             ip_asn={"8.8.8.8": "AS15169"}, ip_org={"8.8.8.8": "Google LLC"}),
     ]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
         n = report.write_csv(hosts, str(path))
         assert n == 2
         rows = list(csv.DictReader(path.open()))
-    assert list(rows[0].keys()) == ["subdomain", "ips", "asn"]
+    assert list(rows[0].keys()) == ["subdomain", "ips", "asn", "org"]
     assert rows[0]["subdomain"] == "a.x.com"
     assert rows[0]["ips"] == "1.2.3.4"
     assert rows[0]["asn"] == "AS15169"
+    assert rows[0]["org"] == "Google LLC"
     assert rows[1]["subdomain"] == "multi.x.com"
     assert rows[1]["ips"] == "9.9.9.9, 8.8.8.8"
     assert rows[1]["asn"] == ", AS15169"          # blank for 9.9.9.9, resolved for 8.8.8.8
+    assert rows[1]["org"] == ", Google LLC"
 
 
-def test_write_csv_single_ip_host_falls_back_to_scalar_asn():
-    # ip_asn wasn't populated (e.g. a caller of apply_ipinfo() that omitted
-    # the optional ip arg), but h.asn is known and unambiguous for one IP.
-    h = Host("a.x.com", ips=["1.2.3.4"], asn="AS15169")
+def test_write_csv_single_ip_host_falls_back_to_scalar_asn_org():
+    # ip_asn/ip_org weren't populated (e.g. a caller of apply_ipinfo() that
+    # omitted the optional ip arg), but h.asn/h.org are known and
+    # unambiguous for one IP.
+    h = Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC")
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
         report.write_csv([h], str(path))
         rows = list(csv.DictReader(path.open()))
     assert rows[0]["asn"] == "AS15169"
+    assert rows[0]["org"] == "Google LLC"
 
 
 # --------------------------------------------------------------------------- #
@@ -1401,6 +1418,45 @@ def test_merge_domains_dedupes_and_preserves_order():
     assert cli.merge_domains(["c.com"], ["a.com", "b.com", "a.com"]) == ["c.com", "a.com", "b.com"]
     assert cli.merge_domains([], ["a.com"]) == ["a.com"]
     assert cli.merge_domains(["a.com"], []) == ["a.com"]
+
+
+def test_apply_all_flag_enables_osint_checks_not_active_ones():
+    args = argparse.Namespace(all=True, buckets=False, dork=False, vt=False, nvd=False,
+                              nuclei=False, asn_expand=False, active_ports=False,
+                              verify_emails=False, passive_only=False)
+    cli.apply_all_flag(args)
+    assert args.buckets is True
+    assert args.dork is True
+    assert args.vt is True
+    assert args.nvd is True
+    assert args.nuclei is True
+    assert args.asn_expand is True
+    # active/target-touching checks must never be flipped on by --all
+    assert args.active_ports is False
+    assert args.verify_emails is False
+
+
+def test_apply_all_flag_is_noop_when_not_set():
+    args = argparse.Namespace(all=False, buckets=False, dork=False, vt=False, nvd=False,
+                              nuclei=False, asn_expand=False)
+    cli.apply_all_flag(args)
+    assert args.buckets is False
+    assert args.dork is False
+    assert args.vt is False
+    assert args.nvd is False
+    assert args.nuclei is False
+    assert args.asn_expand is False
+
+
+def test_all_flag_parses_via_real_argparse_and_expands_correctly(monkeypatch):
+    # exercises the real ap.parse_args() -> apply_all_flag() path, not just
+    # the pure function in isolation.
+    monkeypatch.setattr(sys, "argv", ["lrecon", "--all", "--check-backends"])
+
+    async def fake_selfcheck(active=False):
+        return [{"tool": "subfinder", "path": True, "ran": True, "parsed": 1, "note": "ok"}]
+    monkeypatch.setattr(cli.backends, "selfcheck", fake_selfcheck)
+    cli.main()   # --check-backends returns early, but args are parsed+expanded first
 
 
 def test_domains_file_missing_raises_cli_error(monkeypatch, capsys):

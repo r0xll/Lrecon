@@ -24,6 +24,30 @@ def merge_domains(positional: list, file_domains: list) -> list:
     return list(dict.fromkeys(list(positional) + list(file_domains)))
 
 
+def apply_all_flag(args) -> None:
+    """
+    --all turns on every OSINT/informational check that's otherwise opt-in
+    only due to quota/speed/binary availability, not ROE: --buckets, --dork,
+    --vt, --nvd, --nuclei, --asn-expand. Each still auto-skips on its own
+    with a log line if its key/binary isn't configured — this just flips
+    the flag, same as passing it by hand.
+
+    Deliberately does NOT touch --active-ports or --verify-emails — those
+    touch target infrastructure directly (a TCP port scan, an SMTP RCPT-TO
+    probe of the target's own mail servers) and the README's ROE/Legal
+    section calls them out as needing conscious authorization, so --all
+    must never silently enable them.
+    """
+    if not args.all:
+        return
+    args.buckets = True
+    args.dork = True
+    args.vt = True
+    args.nvd = True
+    args.nuclei = True
+    args.asn_expand = True
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="LRecon (Let's Recon) v3.2 — external recon (authorized use only)")
     ap.add_argument("domains", nargs="*", help="root domain(s) in scope")
@@ -37,6 +61,13 @@ def main() -> None:
                     help="with --check-backends: let naabu/nuclei test-scan scanme.nmap.org")
     ap.add_argument("--passive-only", action="store_true",
                     help="OSINT sources + host lookup only; no resolution/HTTP/portscan")
+    ap.add_argument("--all", action="store_true",
+                    help="turn on every OSINT/informational check that's otherwise opt-in due "
+                         "to quota/speed/binary availability, not ROE: --buckets, --dork, --vt, "
+                         "--nvd, --nuclei, --asn-expand (each still auto-skips with a log line "
+                         "if its key/binary isn't configured). Does NOT enable --active-ports or "
+                         "--verify-emails — those touch target infrastructure directly and stay "
+                         "explicit opt-in regardless of --all")
     ap.add_argument("--no-cf-origin", action="store_true",
                     help="disable Cloudflare origin-IP discovery")
     ap.add_argument("--active-ports", action="store_true",
@@ -94,6 +125,7 @@ def main() -> None:
                     help="output basename — a UTC timestamp is appended so "
                          "reruns don't overwrite prior output (<basename>_YYYYMMDD_HHMMSS.*)")
     args = ap.parse_args()
+    apply_all_flag(args)
 
     if args.check_backends:
         rows = asyncio.run(backends.selfcheck(active=args.check_active))
@@ -132,6 +164,10 @@ def main() -> None:
         log("[!] dnspython missing — install it or use --passive-only")
 
     keys = load_keys(args)
+    if args.all:
+        log("[i] --all: enabling --buckets --dork --vt --nvd --nuclei --asn-expand "
+            "(each still skips on its own if a needed key/binary isn't configured; "
+            "--active-ports/--verify-emails stay opt-in)")
     log(f"[i] enrichment: ports/CVE via {'Shodan' if keys['shodan'] else 'InternetDB (keyless)'}"
         f" | ASN/org/rDNS via IPinfo ({'key' if keys['ipinfo'] else 'keyless, lower rate limit'})"
         f" | github {'on' if keys['github'] else 'off'}"

@@ -53,12 +53,16 @@ def apply_ipinfo(h: Host, data: dict, ip: str | None = None) -> None:
     if org:
         parts = org.split(" ", 1)
         if parts[0].startswith("AS"):
+            org_name = parts[1] if len(parts) > 1 else org
             h.asn = parts[0]
-            h.org = h.org or (parts[1] if len(parts) > 1 else org)
+            h.org = h.org or org_name
             if ip:
                 h.ip_asn[ip] = parts[0]
+                h.ip_org[ip] = org_name
         else:
             h.org = h.org or org
+            if ip:
+                h.ip_org[ip] = org
     h.rdns = h.rdns or data.get("hostname")
     h.country = h.country or data.get("country")
 

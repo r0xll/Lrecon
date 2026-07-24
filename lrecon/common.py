@@ -220,6 +220,7 @@ class Host:
     isp: str | None = None
     asn: str | None = None
     ip_asn: dict = field(default_factory=dict)   # {ip: "ASxxxxx"} — asn above is last-IP-wins
+    ip_org: dict = field(default_factory=dict)   # {ip: "Org Name"} — parallel to ip_asn
     rdns: str | None = None
     country: str | None = None
     http_status: int | None = None

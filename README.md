@@ -198,6 +198,11 @@ lrecon client.com client.net --resolvers 1.1.1.1,9.9.9.9 -o client
 # (one domain per line; blank lines and #-comments skipped; merged with
 # any positional domains, deduped)
 lrecon -iL client_domains.txt -o client
+
+# everything OSINT/informational — buckets, dorking, VirusTotal, NVD CVEs,
+# nuclei, ASN expansion — each still skips on its own if its key/binary
+# isn't configured. --active-ports/--verify-emails stay opt-in even here.
+lrecon client.com --all -o client_full_osint
 ```
 
 ### Handoff to nuclei / httpx
@@ -214,6 +219,7 @@ httpx -l client.live.txt -tech-detect -title
 |---|---|
 | `-iL, --domains-file` | read domains from a file, one per line, merged with positional domains |
 | `--passive-only` | OSINT sources + host lookup only; no resolution/HTTP/portscan |
+| `--all` | turn on every OSINT/informational check that's otherwise opt-in only due to quota/speed/binary availability — `--buckets --dork --vt --nvd --nuclei --asn-expand`. Does **not** enable `--active-ports`/`--verify-emails` (those stay explicit — see below) |
 | `--active-ports` | async TCP connect scan of common ports (aggressive; ROE-gated) |
 | `--ports a,b,c` | custom port set for `--active-ports` |
 | `--no-cf-origin` | disable Cloudflare origin-IP discovery |
@@ -257,7 +263,7 @@ Per run, `<out>.*`:
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
   favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
-- **`<out>.targets.csv`** — flat subdomain/IP/ASN list for client scope confirmation.
+- **`<out>.targets.csv`** — flat subdomain/IP/ASN/org list for client scope confirmation.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
   key is configured (see [People OSINT](#people-osint-user-enumeration)).
 - **`<out>_shots/`** — live-host screenshots (with `--screenshots`).
