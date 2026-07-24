@@ -305,6 +305,19 @@ just the `Server`/`X-Powered-By` headers — no Wappalyzer fingerprinting — so
 confirmation stays unavailable (`None`, shown as `—`) until it's installed;
 run `lrecon --check-backends` to confirm it's on PATH.
 
+**Non-web port highlighting.** The HTTP probe/tech-detect pipeline only ever
+touches general-purpose web/app-proxy ports (80, 443, 8080, 8443, etc.).
+Anything else open — SSH, RDP, SMB, VNC, WinRM, databases (MySQL, Postgres,
+Redis, MongoDB, MSSQL), Elasticsearch, and so on — never gets probed, so it's
+highlighted in the Attack Surface table (bold in Markdown, an amber badge in
+HTML) and surfaced as its own **entry-points** finding (`T1046`, Network
+Service Discovery) naming the service where recognized. Direct RCE/lateral-
+movement-prone services (RDP, SMB, VNC, WinRM, Telnet) rank **high**;
+databases and auth-adjacent services (FTP, LDAP, MSSQL/MySQL/Postgres,
+RPC/NetBIOS) rank **medium**; commonly-intentional exposures (SSH, mail,
+DNS) rank **low**. An unrecognized open port still gets flagged, at a
+conservative medium, even without a friendly name.
+
 ---
 
 ## People OSINT (user enumeration)
