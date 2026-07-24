@@ -87,6 +87,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status (always on) | none (third-party registry) |
 | People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
+| VirusTotal domain intel | historical IP/hosting resolutions, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
 | Email verify | SMTP RCPT-TO probe of discovered emails (opt-in, `--verify-emails`) | yes, mail infra |
 | CVE | NVD CPE->CVE resolution (opt-in, cached) | none (API) |
 | Diff | change vs previous run snapshot | none |
@@ -141,6 +142,7 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 | Hunter.io | company email enumeration + naming-pattern detection | `--hunter-key` | `HUNTER_API_KEY` | limited |
 | RocketReach | company people search (name/title only — see below) | `--rocketreach-key` | `ROCKETREACH_API_KEY` | limited |
 | Google Custom Search | `--dork` entry-point search (admin/login/config/backup exposure) | `--google-cse-key` / `--google-cse-cx` | `GOOGLE_CSE_KEY` / `GOOGLE_CSE_CX` | 100 queries/day |
+| VirusTotal | `--vt` domain intelligence — historical IP/hosting resolutions, WHOIS mirror, reputation | `--vt-key` | `VT_API_KEY` | 500/day, 4 req/min |
 
 ```fish
 # persistent (fish universal vars — visible inside the venv)
@@ -149,7 +151,7 @@ set -Ux IPINFO_TOKEN   "..."
 
 # or config file
 mkdir -p ~/.config/lrecon
-echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"...","google_cse_key":"...","google_cse_cx":"..."}' > ~/.config/lrecon/config.json
+echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"...","google_cse_key":"...","google_cse_cx":"...","vt_api_key":"..."}' > ~/.config/lrecon/config.json
 
 # or interactive (stays out of shell history)
 lrecon example.com --ask-keys
@@ -225,6 +227,8 @@ httpx -l client.live.txt -tech-detect -title
 | `--dork` | search-engine dork for exposed admin/login/config/backup/`.git` paths (needs `--google-cse-key` + `--google-cse-cx`) |
 | `--google-cse-key` | Google Custom Search API key for `--dork` (else env/config) |
 | `--google-cse-cx` | Google Custom Search Engine ID for `--dork` (else env/config) |
+| `--vt` | VirusTotal domain intelligence: IP/hosting history, WHOIS mirror, reputation (needs `--vt-key`) |
+| `--vt-key` | VirusTotal API key for `--vt` (else env/config) |
 | `--diff` | diff against previous run snapshot |
 | `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei) |
 | `--nuclei-severity` | min nuclei severity, e.g. `medium,high,critical` |
@@ -243,14 +247,15 @@ Per run, `<out>.*`:
 
 - **`<out>.md`** — the deliverable: summary, source-contribution table, change-since-last-run,
   breach/GitHub/bucket exposure, nuclei findings, email posture, domain registration (WHOIS/RDAP),
-  DNS records, mail infrastructure, search-engine dork hits, Cloudflare origin exposure,
-  subdomain-takeover leads, favicon pivots, full attack-surface table, CVE hits.
+  VirusTotal domain intelligence & IP/hosting history, DNS records, mail infrastructure,
+  search-engine dork hits, Cloudflare origin exposure, subdomain-takeover leads, favicon pivots,
+  full attack-surface table, CVE hits.
 - **`<out>.html`** — self-contained styled HTML report for client sharing. Same section
   coverage as the Markdown report, each in a collapsible panel (expand/collapse-all
   toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
   no server, no external JS/CSS, works fully offline from the file.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
-  favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, people).
+  favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
 - **`<out>.targets.csv`** — flat subdomain/IP/ASN list for client scope confirmation.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
@@ -417,6 +422,31 @@ domain:
 - **Unknown** — no registrant entity was returned by either the registry or
   the registrar referral (common for some ccTLDs); this is *not* the same
   as "confirmed not privacy-protected," and the report says so explicitly.
+
+## Domain intelligence & IP/hosting history (VirusTotal)
+
+RDAP/WHOIS covers registration data, but not *hosting* history — which IPs
+a domain has actually pointed to over time, and when. That's the piece a
+paid tool like DomainTools normally provides; **`--vt`** gets you the
+closest free equivalent via VirusTotal's official public API v3:
+
+- **Historical IP resolutions** (hosting history) — every domain→IP passive-DNS
+  resolution VT has observed, newest first, each with a first-seen date.
+- **WHOIS mirror, cached DNS records, reputation/detection stats** — VT's own
+  domain snapshot, useful as a cross-check against the RDAP data above.
+
+Requires **`--vt-key`** (or `VT_API_KEY`/config). It's an explicit flag even
+with a key configured — unlike the "presence of a key = auto-run" convention
+used for the People OSINT sources — because the free tier is rate-limited to
+**4 requests/minute** (500/day) and each domain costs two calls, so
+auto-running it would add real wall-clock time (up to ~30s/domain) to a run
+where you didn't ask for it. It's passive (only queries VT's own API, never
+the target directly), so it still runs under `--passive-only`.
+
+A high malicious/suspicious vote count on a client-owned domain in the report
+is usually a false positive from a prior compromise or shared/CDN
+infrastructure another tenant polluted — verify before reporting it as a
+finding.
 
 ## DNS records & mail infrastructure
 
