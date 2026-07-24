@@ -110,6 +110,11 @@ def _whois_registrant_cell(w: dict) -> str:
     return "—"
 
 
+def _whois_source_label(source: str | None) -> str:
+    return {"rdap": "RDAP", "whois43": "WHOIS (port 43)",
+           "rdap+whois43": "RDAP + WHOIS (port 43)"}.get(source, "—")
+
+
 def _tech_confirmed_label(h) -> str:
     if h.tech_confirmed is True:
         return "[tech-confirmed]"
@@ -179,19 +184,35 @@ def write_markdown(hosts, domains, res, path) -> None:
     whois = res.get("whois") or {}
     if whois:
         lines += ["## Domain registration (WHOIS/RDAP)", "",
-                  "| Domain | Registrar | Registrant | Privacy protected | Created | Expires | Status | Nameservers |",
-                  "|---|---|---|---|---|---|---|---|"]
+                  "| Domain | Registrar | Registrant | Privacy protected | Created | Expires | "
+                  "Status | Nameservers | Source |",
+                  "|---|---|---|---|---|---|---|---|---|"]
         for d, w in whois.items():
             status = ", ".join(w.get("status", [])[:3]) or "—"
             ns = ", ".join(w.get("nameservers", [])[:4]) or "—"
             lines.append(f"| {d} | {w.get('registrar') or '—'} | {_whois_registrant_cell(w)} "
                          f"| {_whois_privacy_cell(w)} | {w.get('created') or '—'} "
-                         f"| {w.get('expires') or '—'} | {status} | {ns} |")
+                         f"| {w.get('expires') or '—'} | {status} | {ns} "
+                         f"| {_whois_source_label(w.get('source'))} |")
         lines += ["", "> \"Unknown\" means either the registry-level RDAP response (and its "
                   "registrar referral, if any) didn't include a registrant entity at all — "
-                  "common for some ccTLDs — or the RDAP lookup itself returned nothing for "
-                  "that domain (unsupported TLD, typo, or a transient failure; see the run "
-                  "log). Neither is a confirmed absence of privacy protection.", ""]
+                  "common for some ccTLDs — or the lookup itself returned nothing for that "
+                  "domain (unsupported TLD, typo, or a transient failure; see the run log). "
+                  "Neither is a confirmed absence of privacy protection.",
+                  "> RDAP has no service at all for some common TLDs (.io, .co, .me, and "
+                  "others — confirmed against IANA's own bootstrap registry); those fall back "
+                  "to classic WHOIS (port 43), whose free-text parsing is best-effort and "
+                  "varies by registry.", ""]
+
+        vt_all = res.get("vt") or {}
+        vt_mirrors = {d: vt_all[d]["whois"] for d, w in whois.items()
+                     if not w.get("registrar") and vt_all.get(d, {}).get("whois")}
+        if vt_mirrors:
+            lines += ["**VirusTotal WHOIS mirror** (unparsed, for manual cross-reference — "
+                      "shown because no registrar was found above):", ""]
+            for d, text in vt_mirrors.items():
+                snippet = text[:2000] + ("…" if len(text) > 2000 else "")
+                lines += [f"**{d}:**", "```", snippet, "```", ""]
 
     vt = res.get("vt") or {}
     if vt:
@@ -493,17 +514,31 @@ def write_html(hosts, domains, res, path) -> None:
             f"<td>{esc(_whois_registrant_cell(w))}</td><td>{esc(_whois_privacy_cell(w))}</td>"
             f"<td>{esc(w.get('created'))}</td>"
             f"<td>{esc(w.get('expires'))}</td><td>{esc(', '.join(w.get('status', [])[:3]))}</td>"
-            f"<td>{esc(', '.join(w.get('nameservers', [])[:4]))}</td></tr>"
+            f"<td>{esc(', '.join(w.get('nameservers', [])[:4]))}</td>"
+            f"<td>{esc(_whois_source_label(w.get('source')))}</td></tr>"
             for d, w in whois.items())
         body = (f'{_html_export_button("t-whois", "whois.csv")}'
                 f'<table id="t-whois"><tr><th>Domain</th><th>Registrar</th><th>Registrant</th>'
                 f'<th>Privacy protected</th><th>Created</th>'
-                f'<th>Expires</th><th>Status</th><th>Nameservers</th></tr>{rows}</table>'
+                f'<th>Expires</th><th>Status</th><th>Nameservers</th><th>Source</th></tr>{rows}</table>'
                 f'<p class="note">"Unknown" means either the registry-level RDAP response (and '
                 f'its registrar referral, if any) didn\'t include a registrant entity at all — '
-                f'common for some ccTLDs — or the RDAP lookup itself returned nothing for that '
+                f'common for some ccTLDs — or the lookup itself returned nothing for that '
                 f'domain (unsupported TLD, typo, or a transient failure; see the run log). '
-                f'Neither is a confirmed absence of privacy protection.</p>')
+                f'Neither is a confirmed absence of privacy protection.</p>'
+                f'<p class="note">RDAP has no service at all for some common TLDs (.io, .co, '
+                f'.me, and others — confirmed against IANA\'s own bootstrap registry); those '
+                f'fall back to classic WHOIS (port 43), whose free-text parsing is best-effort '
+                f'and varies by registry.</p>')
+        vt_mirrors = {d: vt[d]["whois"] for d, w in whois.items()
+                     if not w.get("registrar") and vt.get(d, {}).get("whois")}
+        if vt_mirrors:
+            mirror_html = "".join(
+                f'<details><summary>{esc(d)}</summary><pre>{esc(text[:2000])}'
+                f'{"…" if len(text) > 2000 else ""}</pre></details>'
+                for d, text in vt_mirrors.items())
+            body += (f'<p><b>VirusTotal WHOIS mirror</b> (unparsed, for manual cross-reference — '
+                     f'shown because no registrar was found above):</p>{mirror_html}')
         sections.append(_html_section("whois", "Domain registration (WHOIS/RDAP)", len(whois), body))
 
     # ---- VirusTotal domain intelligence + IP/hosting history ----

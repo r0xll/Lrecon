@@ -154,22 +154,22 @@ async def run(domains, args, keys) -> list:
         if per_source.get("crtsh", 0) == 0:
             log("[!] crt.sh returned 0 (down/rate-limited?) — other CT sources covering")
 
-        # ---- Domain registration data (WHOIS via RDAP) ----
+        # ---- Domain registration data (WHOIS via RDAP, falling back to
+        # classic WHOIS/port 43 for TLDs with no RDAP service at all —
+        # .io/.co/.me and others, confirmed against IANA's own bootstrap
+        # registry) ----
         # Keyless, third-party-registry-only — runs even in --passive-only,
         # same tier as the passive-enum sources above. Always records one
         # entry per domain, even on a total lookup failure (unsupported
         # TLD, network issue, domain not found) — a client running an
         # engagement against N domains should see all N in the WHOIS
         # section, not have the whole section vanish because one domain's
-        # RDAP lookup came back empty.
+        # lookup came back empty.
         whois = {}
         for d in domains:
-            w = await rdap_lookup(client, d)
-            whois[d] = w or {"registrar": None, "created": None, "expires": None,
-                             "last_changed": None, "nameservers": [], "status": [],
-                             "registrant_name": None, "registrant_org": None,
-                             "privacy_protected": None, "privacy_provider": None}
-            if w and domain_expiring_soon(w.get("expires")):
+            w = await whois_lookup(client, d)
+            whois[d] = w
+            if w.get("expires") and domain_expiring_soon(w["expires"]):
                 log(f"[!] {d}: domain registration expires {w['expires']} — flag to client")
 
         # ---- Phase 2: resolution + wildcard filter ----

@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, ipaddress, json
+import asyncio, ipaddress, json, re
 import httpx
 from .common import *
 from .sources import get_resolver, resolve_full
@@ -447,6 +447,164 @@ def domain_expiring_soon(expires: str | None, within_days: int = 30) -> bool:
         return (exp - datetime.now(timezone.utc)).days <= within_days
     except Exception:
         return False
+
+
+def empty_whois_entry() -> dict:
+    return {"registrar": None, "created": None, "expires": None, "last_changed": None,
+           "nameservers": [], "status": [], "registrant_name": None, "registrant_org": None,
+           "privacy_protected": None, "privacy_provider": None}
+
+
+# --------------------------------------------------------------------------- #
+# Classic WHOIS (port 43) — fallback for TLDs with no RDAP service at all.
+# Confirmed against IANA's own canonical RDAP bootstrap registry
+# (https://data.iana.org/rdap/dns.json): .io, .co, .me, and others simply
+# have no RDAP entry — not a bug in rdap.org's redirector, there is no
+# RDAP server to redirect to. Pure-Python sockets, RFC 3912 — no external
+# `whois` binary, keeping the earlier "no system whois binary" design
+# intact while still covering these TLDs. Two round trips: ask
+# whois.iana.org which registry WHOIS server is authoritative for the
+# TLD (the same referral every classic WHOIS client does), then query
+# that server directly. Free-text parsing is necessarily best-effort —
+# format varies by registry, unlike RDAP's structured JSON.
+# --------------------------------------------------------------------------- #
+_WHOIS_FIELD_PATTERNS = {
+    "registrar": (r"registrar:\s*(.+)", r"sponsoring registrar:\s*(.+)", r"registrar name:\s*(.+)"),
+    "created": (r"creation date:\s*(.+)", r"created on:\s*(.+)", r"registered on:\s*(.+)",
+               r"domain registration date:\s*(.+)", r"created:\s*(.+)", r"registered:\s*(.+)"),
+    "expires": (r"registry expiry date:\s*(.+)", r"expiration date:\s*(.+)",
+               r"expiry date:\s*(.+)", r"registrar registration expiration date:\s*(.+)",
+               r"expires:\s*(.+)", r"expires on:\s*(.+)", r"paid-till:\s*(.+)"),
+    "last_changed": (r"updated date:\s*(.+)", r"last updated on:\s*(.+)", r"last modified:\s*(.+)",
+                     r"changed:\s*(.+)", r"modified:\s*(.+)", r"last-update:\s*(.+)"),
+}
+
+
+async def _iana_whois_referral(tld: str) -> str | None:
+    """The registry WHOIS server authoritative for a TLD, per IANA's own
+    WHOIS server — there's no single global endpoint the way RDAP has one
+    bootstrap redirector, so this referral hop is required."""
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("whois.iana.org", 43), timeout=10)
+        try:
+            writer.write(f"{tld}\r\n".encode())
+            await writer.drain()
+            data = await asyncio.wait_for(reader.read(-1), timeout=10)
+        finally:
+            writer.close()
+        for line in data.decode(errors="ignore").splitlines():
+            if line.lower().startswith("whois:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+async def _whois43_query(server: str, domain: str) -> str | None:
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(server, 43), timeout=15)
+        try:
+            writer.write(f"{domain}\r\n".encode())
+            await writer.drain()
+            chunks = []
+            while True:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=15)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            writer.close()
+        return b"".join(chunks).decode(errors="ignore")
+    except Exception:
+        return None
+
+
+def _parse_whois43(text: str) -> dict:
+    out = empty_whois_entry()
+    if not text:
+        return out
+    nameservers = set()
+    statuses = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        low = stripped.lower()
+        if not low or low.startswith(("%", "#", ">>>")):
+            continue
+        for field, patterns in _WHOIS_FIELD_PATTERNS.items():
+            if out[field]:
+                continue
+            for pat in patterns:
+                if re.match(pat, low) and ":" in stripped:
+                    val = stripped.split(":", 1)[1].strip()
+                    if val:
+                        out[field] = val
+                    break
+        if low.startswith(("name server:", "nserver:")) and ":" in stripped:
+            ns = stripped.split(":", 1)[1].strip().split()[0].rstrip(".").lower() \
+                if stripped.split(":", 1)[1].strip() else ""
+            if ns:
+                nameservers.add(ns)
+        elif low.startswith(("domain status:", "status:")) and ":" in stripped:
+            val = stripped.split(":", 1)[1].strip()
+            if val:
+                statuses.append(val)
+        elif low.startswith("registrant organization:") and ":" in stripped:
+            out["registrant_org"] = stripped.split(":", 1)[1].strip() or None
+        elif low.startswith("registrant name:") and ":" in stripped:
+            out["registrant_name"] = stripped.split(":", 1)[1].strip() or None
+
+    out["nameservers"] = sorted(nameservers)
+    out["status"] = statuses
+    if out["registrant_name"] or out["registrant_org"]:
+        looks_private = any(k in (out["registrant_org"] or "").lower() for k in _PRIVACY_KEYWORDS) or \
+                        any(k in (out["registrant_name"] or "").lower() for k in _PRIVACY_KEYWORDS)
+        out["privacy_protected"] = looks_private
+        if looks_private:
+            out["privacy_provider"] = out["registrant_org"]
+    return out
+
+
+async def whois43_lookup(domain: str) -> dict:
+    """Returns {} if the TLD has no discoverable WHOIS server, the query
+    fails, or nothing useful was parsed out of the response."""
+    tld = domain.rsplit(".", 1)[-1].lower()
+    server = await _iana_whois_referral(tld)
+    if not server:
+        return {}
+    text = await _whois43_query(server, domain)
+    if not text:
+        return {}
+    out = _parse_whois43(text)
+    return out if any(out.get(k) for k in ("registrar", "created", "expires", "nameservers")) else {}
+
+
+async def whois_lookup(client, domain: str) -> dict:
+    """
+    RDAP first (structured, fast); if RDAP has no registrar at all —
+    either the domain's TLD has no RDAP service (.io/.co/.me and others,
+    per IANA's own bootstrap registry) or the lookup failed outright —
+    falls back to classic WHOIS (port 43) and merges in whatever fields
+    RDAP was missing, preferring RDAP's values wherever both have one.
+    Result always carries a "source" field ("rdap", "whois43",
+    "rdap+whois43", or None if both came back with nothing) so it's clear
+    which method actually supplied the data.
+    """
+    w = await rdap_lookup(client, domain)
+    source = "rdap" if w else None
+    if not w or not w.get("registrar"):
+        w43 = await whois43_lookup(domain)
+        if w43:
+            merged = dict(w) if w else empty_whois_entry()
+            for k, v in w43.items():
+                if not merged.get(k):
+                    merged[k] = v
+            w = merged
+            source = "rdap+whois43" if source else "whois43"
+    if not w:
+        w = empty_whois_entry()
+    w["source"] = source
+    return w
 
 
 
