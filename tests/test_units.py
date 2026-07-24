@@ -1464,9 +1464,13 @@ def test_apply_all_flag_enables_osint_checks_not_active_ones():
     assert args.dork is True
     assert args.vt is True
     assert args.nvd is True
-    assert args.nuclei is True
     assert args.asn_expand is True
-    # active/target-touching checks must never be flipped on by --all
+    # active/target-touching checks must never be flipped on by --all —
+    # nuclei sends live HTTP requests (including exploit/auth-bypass
+    # probes) straight at the target's hosts, same tier as active_ports
+    # and verify_emails, and is gated behind `not passive_only` in core.py
+    # for exactly that reason.
+    assert args.nuclei is False
     assert args.active_ports is False
     assert args.verify_emails is False
 

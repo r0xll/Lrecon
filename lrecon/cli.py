@@ -29,15 +29,19 @@ def apply_all_flag(args) -> None:
     """
     --all turns on every OSINT/informational check that's otherwise opt-in
     only due to quota/speed/binary availability, not ROE: --buckets, --dork,
-    --vt, --nvd, --nuclei, --asn-expand. Each still auto-skips on its own
-    with a log line if its key/binary isn't configured — this just flips
-    the flag, same as passing it by hand.
+    --vt, --nvd, --asn-expand. Each still auto-skips on its own with a log
+    line if its key/binary isn't configured — this just flips the flag,
+    same as passing it by hand.
 
-    Deliberately does NOT touch --active-ports or --verify-emails — those
-    touch target infrastructure directly (a TCP port scan, an SMTP RCPT-TO
-    probe of the target's own mail servers) and the README's ROE/Legal
-    section calls them out as needing conscious authorization, so --all
-    must never silently enable them.
+    Deliberately does NOT touch --active-ports, --verify-emails, or
+    --nuclei — all three send live traffic straight at target-owned
+    infrastructure (a TCP port scan, an SMTP RCPT-TO probe of the target's
+    own mail servers, and nuclei's templated HTTP requests — including
+    exploit/auth-bypass probes — against the target's live hosts,
+    core.py gates it behind `not args.passive_only` for exactly that
+    reason, the same gate --active-ports uses). The README's ROE/Legal
+    section calls this class of check out as needing conscious
+    authorization, so --all must never silently enable any of them.
     """
     if not args.all:
         return
@@ -45,7 +49,6 @@ def apply_all_flag(args) -> None:
     args.dork = True
     args.vt = True
     args.nvd = True
-    args.nuclei = True
     args.asn_expand = True
 
 
@@ -65,10 +68,10 @@ def main() -> None:
     ap.add_argument("--all", action="store_true",
                     help="turn on every OSINT/informational check that's otherwise opt-in due "
                          "to quota/speed/binary availability, not ROE: --buckets, --dork, --vt, "
-                         "--nvd, --nuclei, --asn-expand (each still auto-skips with a log line "
-                         "if its key/binary isn't configured). Does NOT enable --active-ports or "
-                         "--verify-emails — those touch target infrastructure directly and stay "
-                         "explicit opt-in regardless of --all")
+                         "--nvd, --asn-expand (each still auto-skips with a log line if its "
+                         "key/binary isn't configured). Does NOT enable --active-ports, "
+                         "--verify-emails, or --nuclei — those send live traffic straight at "
+                         "target-owned infrastructure and stay explicit opt-in regardless of --all")
     ap.add_argument("--no-cf-origin", action="store_true",
                     help="disable Cloudflare origin-IP discovery")
     ap.add_argument("--active-ports", action="store_true",
@@ -166,9 +169,9 @@ def main() -> None:
 
     keys = load_keys(args)
     if args.all:
-        log("[i] --all: enabling --buckets --dork --vt --nvd --nuclei --asn-expand "
+        log("[i] --all: enabling --buckets --dork --vt --nvd --asn-expand "
             "(each still skips on its own if a needed key/binary isn't configured; "
-            "--active-ports/--verify-emails stay opt-in)")
+            "--active-ports/--verify-emails/--nuclei stay opt-in — they touch target infra)")
     log(f"[i] enrichment: ports/CVE via {'Shodan' if keys['shodan'] else 'InternetDB (keyless)'}"
         f" | ASN/org/rDNS via IPinfo ({'key' if keys['ipinfo'] else 'keyless, lower rate limit'})"
         f" | github {'on' if keys['github'] else 'off'}"
