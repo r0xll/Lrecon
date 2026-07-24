@@ -154,14 +154,21 @@ async def run(domains, args, keys) -> list:
 
         # ---- Domain registration data (WHOIS via RDAP) ----
         # Keyless, third-party-registry-only — runs even in --passive-only,
-        # same tier as the passive-enum sources above.
+        # same tier as the passive-enum sources above. Always records one
+        # entry per domain, even on a total lookup failure (unsupported
+        # TLD, network issue, domain not found) — a client running an
+        # engagement against N domains should see all N in the WHOIS
+        # section, not have the whole section vanish because one domain's
+        # RDAP lookup came back empty.
         whois = {}
         for d in domains:
             w = await rdap_lookup(client, d)
-            if w:
-                whois[d] = w
-                if domain_expiring_soon(w.get("expires")):
-                    log(f"[!] {d}: domain registration expires {w['expires']} — flag to client")
+            whois[d] = w or {"registrar": None, "created": None, "expires": None,
+                             "last_changed": None, "nameservers": [], "status": [],
+                             "registrant_name": None, "registrant_org": None,
+                             "privacy_protected": None, "privacy_provider": None}
+            if w and domain_expiring_soon(w.get("expires")):
+                log(f"[!] {d}: domain registration expires {w['expires']} — flag to client")
 
         # ---- Phase 2: resolution + wildcard filter ----
         if not args.passive_only:
@@ -265,6 +272,16 @@ async def run(domains, args, keys) -> list:
                 return h
             await _gather_with_progress((do_active(h) for h in active_hosts),
                                         "probing", use_prog)
+
+            # ---- Tech-stack confirmation: does the live probe corroborate
+            # Shodan/InternetDB's (possibly stale) reported software? ----
+            for h in active_hosts:
+                h.tech_confirmed = confirm_tech_stack(h)
+            n_confirmed = sum(1 for h in active_hosts if h.tech_confirmed is True)
+            n_unconfirmed = sum(1 for h in active_hosts if h.tech_confirmed is False)
+            if n_confirmed or n_unconfirmed:
+                log(f"[+] tech-stack confirmation: {n_confirmed} host(s) corroborated live, "
+                    f"{n_unconfirmed} unconfirmed (Shodan/InternetDB banner only — verify before triaging)")
 
         # ---- Cloudflare origin discovery ----
         cf = {"detected": False, "fronted": [], "candidates": {}}

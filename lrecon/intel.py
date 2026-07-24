@@ -395,9 +395,11 @@ async def rdap_lookup(client, domain: str) -> dict:
     Overrides the shared client's default follow_redirects=False for this one
     call — rdap.org responds with a redirect to the authoritative registry
     (e.g. rdap.verisign.com for .com), confirmed live against example.com.
-    Returns {} on any failure — many domains (privacy-protected registrants,
-    some ccTLDs without RDAP support yet) simply won't resolve; that's
-    expected, not an error worth logging loudly.
+    Returns {} on any failure — many domains (some ccTLDs without RDAP
+    support yet, typos, internal-only names) simply won't resolve. Still
+    logged (once, at "no data" level) rather than silently vanishing, since
+    a fully-empty WHOIS section with no explanation is confusing — the
+    caller shows a placeholder row for the domain either way.
 
     If the registry response has no registrant entity (the common case for
     thin gTLD registries), follows the registrar's own RDAP referral link
@@ -408,6 +410,7 @@ async def rdap_lookup(client, domain: str) -> dict:
     try:
         r = await client.get(f"https://rdap.org/domain/{domain}", timeout=20, follow_redirects=True)
         if r.status_code != 200:
+            log(f"[!] whois/rdap {domain}: no data (HTTP {r.status_code} from rdap.org)")
             return {}
         data = r.json()
         out = _parse_rdap(data)
@@ -646,6 +649,13 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei, 
         dos_note = f" [{len(dos_ids)} DoS-only CVE(s) excluded]" if dos_ids else ""
         unscored_note = f" [{unscored} unscored — run --nvd for full data]" if unscored and not cvss_values else \
                          (f" [{unscored} unscored]" if unscored else "")
+        # Cross-references the reported CPEs against the live tech-detect
+        # probe (enrich.confirm_tech_stack) — Shodan/InternetDB data can be
+        # weeks stale, so this flags whether the vulnerable software still
+        # looks live, to cut down manual triage.
+        tech_note = " [tech-stack confirmed live]" if h.tech_confirmed is True else \
+                    (" [unconfirmed — live probe found no matching software, may be stale]"
+                     if h.tech_confirmed is False else "")
         detail = "; ".join(
             cid + (f" (CVSS {nvd_by_id[cid]['cvss']})" if nvd_by_id.get(cid, {}).get("cvss") is not None else "")
             + (" [PoC]" if nvd_by_id.get(cid, {}).get("poc") else "")
@@ -655,7 +665,8 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei, 
             detail += f"; +{len(ranked) - known_cve_cap} more"
         out.append({"type": "known-cve", "target": h.subdomain,
                    "severity": severity,
-                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{poc_note}{dos_note}{unscored_note}: {detail}",
+                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{poc_note}{dos_note}"
+                              f"{unscored_note}{tech_note}: {detail}",
                    "attck": "T1190"})
 
     for d, bs in (breach or {}).items():

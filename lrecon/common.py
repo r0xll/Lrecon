@@ -212,6 +212,7 @@ class Host:
     final_url: str | None = None
     favicon_hash: int | None = None
     nvd_cves: list = field(default_factory=list)
+    tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None
     wildcard: bool = False
     enrich_src: set = field(default_factory=set)

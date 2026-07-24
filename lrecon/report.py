@@ -88,6 +88,14 @@ def _whois_registrant_cell(w: dict) -> str:
     return "—"
 
 
+def _tech_confirmed_label(h) -> str:
+    if h.tech_confirmed is True:
+        return "[tech-confirmed]"
+    if h.tech_confirmed is False:
+        return "[unconfirmed — verify]"
+    return ""
+
+
 def write_markdown(hosts, domains, res, path) -> None:
     per_source = res.get("per_source", {})
     cf = res.get("cf", {})
@@ -140,9 +148,11 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"| {d} | {w.get('registrar') or '—'} | {_whois_registrant_cell(w)} "
                          f"| {_whois_privacy_cell(w)} | {w.get('created') or '—'} "
                          f"| {w.get('expires') or '—'} | {status} | {ns} |")
-        lines += ["", "> \"Unknown\" means the registry-level RDAP response (and its registrar "
-                  "referral, if any) didn't include a registrant entity at all — common for some "
-                  "ccTLDs — not a confirmed absence of privacy protection.", ""]
+        lines += ["", "> \"Unknown\" means either the registry-level RDAP response (and its "
+                  "registrar referral, if any) didn't include a registrant entity at all — "
+                  "common for some ccTLDs — or the RDAP lookup itself returned nothing for "
+                  "that domain (unsupported TLD, typo, or a transient failure; see the run "
+                  "log). Neither is a confirmed absence of privacy protection.", ""]
 
     dns_records = res.get("dns") or {}
     if dns_records:
@@ -319,10 +329,16 @@ def write_markdown(hosts, domains, res, path) -> None:
     if vulns:
         lines += ["", "## CVE hits (validate before reporting)", ""]
         for h in vulns:
-            lines.append(f"- **{h.subdomain}** ({', '.join(h.ips)}): {', '.join(h.vulns)}")
+            lines.append(f"- **{h.subdomain}** ({', '.join(h.ips)}) {_tech_confirmed_label(h)}: "
+                         f"{', '.join(h.vulns)}")
         engine = "Shodan" if any("shodan" in h.enrich_src for h in hosts) else "InternetDB"
+        n_unconfirmed = sum(1 for h in vulns if h.tech_confirmed is False)
         lines += ["", f"> CVEs inferred from {engine} banner/version data. "
                   "Treat as leads, confirm with targeted validation."]
+        if n_unconfirmed:
+            lines.append(f"> {n_unconfirmed} host(s) marked \"unconfirmed\" — the live tech-detect "
+                         "probe found no matching software for the reported CPE(s); the banner may "
+                         "be stale or the service since patched/replaced. Triage confirmed hosts first.")
 
     Path(path).write_text("\n".join(lines) + "\n")
 
@@ -415,9 +431,11 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<table id="t-whois"><tr><th>Domain</th><th>Registrar</th><th>Registrant</th>'
                 f'<th>Privacy protected</th><th>Created</th>'
                 f'<th>Expires</th><th>Status</th><th>Nameservers</th></tr>{rows}</table>'
-                f'<p class="note">"Unknown" means the registry-level RDAP response (and its '
-                f'registrar referral, if any) didn\'t include a registrant entity at all — '
-                f'common for some ccTLDs — not a confirmed absence of privacy protection.</p>')
+                f'<p class="note">"Unknown" means either the registry-level RDAP response (and '
+                f'its registrar referral, if any) didn\'t include a registrant entity at all — '
+                f'common for some ccTLDs — or the RDAP lookup itself returned nothing for that '
+                f'domain (unsupported TLD, typo, or a transient failure; see the run log). '
+                f'Neither is a confirmed absence of privacy protection.</p>')
         sections.append(_html_section("whois", "Domain registration (WHOIS/RDAP)", len(whois), body))
 
     # ---- DNS records ----
@@ -619,14 +637,29 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- CVE hits ----
     if vulns:
+        def _tech_confirmed_badge(h) -> str:
+            if h.tech_confirmed is True:
+                return '<span class="sev sev-low">TECH-CONFIRMED</span>'
+            if h.tech_confirmed is False:
+                return '<span class="sev sev-medium">UNCONFIRMED</span>'
+            return "—"
+
         rows = "".join(
             f'<tr><td>{esc(h.subdomain)}</td><td>{esc(", ".join(h.ips))}</td>'
+            f'<td>{_tech_confirmed_badge(h)}</td>'
             f'<td>{esc(", ".join(h.vulns))}</td></tr>' for h in vulns)
         engine = "Shodan" if any("shodan" in h.enrich_src for h in hosts) else "InternetDB"
-        body = (f'{_html_export_button("t-cve", "cve_hits.csv")}'
-                f'<table id="t-cve"><tr><th>Subdomain</th><th>IP(s)</th><th>CVEs</th></tr>{rows}</table>'
-                f'<p class="note">CVEs inferred from {esc(engine)} banner/version data. '
+        n_unconfirmed = sum(1 for h in vulns if h.tech_confirmed is False)
+        note = (f'<p class="note">CVEs inferred from {esc(engine)} banner/version data. '
                 f'Treat as leads, confirm with targeted validation.</p>')
+        if n_unconfirmed:
+            note += (f'<p class="note">{n_unconfirmed} host(s) marked UNCONFIRMED — the live '
+                     f'tech-detect probe found no matching software for the reported CPE(s); '
+                     f'the banner may be stale or the service since patched/replaced. Triage '
+                     f'TECH-CONFIRMED hosts first.</p>')
+        body = (f'{_html_export_button("t-cve", "cve_hits.csv")}'
+                f'<table id="t-cve"><tr><th>Subdomain</th><th>IP(s)</th><th>Tech-stack</th>'
+                f'<th>CVEs</th></tr>{rows}</table>{note}')
         sections.append(_html_section("cve", "CVE hits (validate before reporting)", len(vulns), body))
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
