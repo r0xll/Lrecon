@@ -12,6 +12,7 @@ from .active import *
 from .state import *
 from .people import *
 from .dorking import *
+from .vt import *
 from . import backends
 
 # --------------------------------------------------------------------------- #
@@ -413,6 +414,27 @@ async def run(domains, args, keys) -> list:
             else:
                 log("[!] --dork set but --google-cse-key/--google-cse-cx not configured — skipping")
 
+        # ---- VirusTotal domain intelligence (opt-in --vt; needs VT key) ----
+        # Explicit flag even with a key configured — VT's free tier is
+        # rate-limited to 4 req/min and each domain costs two calls, so
+        # auto-running it would add real wall-clock time to every run.
+        # Passive: only queries VT's own API, never the target directly —
+        # same tier as --dork/--buckets, not gated behind --passive-only.
+        vt_intel = {}
+        if args.vt:
+            if keys.get("vt"):
+                vt_limiter = RateLimiter(per_second=4 / 60)
+                for d in domains:
+                    info = await vt_domain_intel(client, d, keys["vt"], vt_limiter)
+                    if info:
+                        vt_intel[d] = info
+                if vt_intel:
+                    n_hist = sum(len(v.get("ip_history") or []) for v in vt_intel.values())
+                    log(f"[+] VirusTotal: {len(vt_intel)} domain(s) enriched, "
+                        f"{n_hist} historical IP resolution(s)")
+            else:
+                log("[!] --vt set but --vt-key/VT_API_KEY not configured — skipping")
+
         breach = {}
         for d in domains:
             b = await hibp_breaches(client, d)
@@ -539,6 +561,7 @@ async def run(domains, args, keys) -> list:
             "email": email, "github": github_findings, "buckets": buckets,
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
-            "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra}
+            "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
+            "vt": vt_intel}
 
 

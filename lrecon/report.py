@@ -171,6 +171,30 @@ def write_markdown(hosts, domains, res, path) -> None:
                   "that domain (unsupported TLD, typo, or a transient failure; see the run "
                   "log). Neither is a confirmed absence of privacy protection.", ""]
 
+    vt = res.get("vt") or {}
+    if vt:
+        lines += ["## Domain intelligence & IP/hosting history (VirusTotal)", "",
+                  "| Domain | Reputation | VT malicious/suspicious votes | Creation date | "
+                  "Last modified |", "|---|---|---|---|---|"]
+        for d, v in vt.items():
+            votes = f"{v.get('malicious_votes', 0)}/{v.get('suspicious_votes', 0)}"
+            lines.append(f"| {d} | {v.get('reputation') if v.get('reputation') is not None else '—'} "
+                         f"| {votes} | {v.get('creation_date') or '—'} "
+                         f"| {v.get('last_modification_date') or '—'} |")
+        lines.append("")
+        any_history = any(v.get("ip_history") for v in vt.values())
+        if any_history:
+            lines += ["**Historical IP resolutions (hosting history)** — newest first:", "",
+                      "| Domain | IP | First seen |", "|---|---|---|"]
+            for d, v in vt.items():
+                for r in (v.get("ip_history") or [])[:20]:
+                    lines.append(f"| {d} | {r['ip']} | {r.get('first_seen') or '—'} |")
+            lines.append("")
+        lines += ["> Free-tier VirusTotal domain intelligence — passive DNS history VT has "
+                  "observed, not a live scan. A high malicious/suspicious vote count on a "
+                  "client-owned domain is usually a false positive from prior compromise or "
+                  "shared/CDN infrastructure; verify before reporting.", ""]
+
     dns_records = res.get("dns") or {}
     if dns_records:
         lines += ["## DNS records", "",
@@ -403,6 +427,7 @@ def write_html(hosts, domains, res, path) -> None:
     dorks = res.get("dorks") or []
     dns_records = res.get("dns") or {}
     mail_infra = res.get("mail_infra") or {}
+    vt = res.get("vt") or {}
 
     takeovers = [h for h in hosts if h.takeover]
     vulns = [h for h in hosts if h.vulns]
@@ -458,6 +483,33 @@ def write_html(hosts, domains, res, path) -> None:
                 f'domain (unsupported TLD, typo, or a transient failure; see the run log). '
                 f'Neither is a confirmed absence of privacy protection.</p>')
         sections.append(_html_section("whois", "Domain registration (WHOIS/RDAP)", len(whois), body))
+
+    # ---- VirusTotal domain intelligence + IP/hosting history ----
+    if vt:
+        rows = "".join(
+            f"<tr><td>{esc(d)}</td><td>{esc(v.get('reputation'))}</td>"
+            f"<td>{esc(v.get('malicious_votes', 0))}/{esc(v.get('suspicious_votes', 0))}</td>"
+            f"<td>{esc(v.get('creation_date'))}</td><td>{esc(v.get('last_modification_date'))}</td></tr>"
+            for d, v in vt.items())
+        body = (f'{_html_export_button("t-vt", "vt_domain_intel.csv")}'
+                f'<table id="t-vt"><tr><th>Domain</th><th>Reputation</th>'
+                f'<th>VT malicious/suspicious votes</th><th>Creation date</th>'
+                f'<th>Last modified</th></tr>{rows}</table>')
+        history_rows = "".join(
+            f"<tr><td>{esc(d)}</td><td>{esc(r['ip'])}</td><td>{esc(r.get('first_seen'))}</td></tr>"
+            for d, v in vt.items() for r in (v.get("ip_history") or [])[:20])
+        if history_rows:
+            body += (f'<p><b>Historical IP resolutions (hosting history)</b> — newest first:</p>'
+                     f'{_html_export_button("t-vt-history", "vt_ip_history.csv")}'
+                     f'<table id="t-vt-history"><tr><th>Domain</th><th>IP</th>'
+                     f'<th>First seen</th></tr>{history_rows}</table>')
+        body += ('<p class="note">Free-tier VirusTotal domain intelligence — passive DNS '
+                 'history VT has observed, not a live scan. A high malicious/suspicious vote '
+                 'count on a client-owned domain is usually a false positive from prior '
+                 'compromise or shared/CDN infrastructure; verify before reporting.</p>')
+        n_history = sum(len(v.get("ip_history") or []) for v in vt.values())
+        sections.append(_html_section("vt", "Domain intelligence & IP/hosting history (VirusTotal)",
+                                      len(vt) + n_history, body))
 
     # ---- DNS records ----
     if dns_records:

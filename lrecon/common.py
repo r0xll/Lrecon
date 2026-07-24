@@ -17,7 +17,8 @@ they're often empty — that's expected. IPinfo fills ASN/org/rDNS regardless.
 Key precedence (each): --<svc>-key  >  $<SVC>_API_KEY / $IPINFO_TOKEN  >  config
 Config: ~/.config/lrecon/config.json  {"shodan_api_key":"...","ipinfo_token":"...",
   "github_token":"...", "hibp_api_key":"...", "hunter_api_key":"...",
-  "rocketreach_api_key":"...", "google_cse_key":"...", "google_cse_cx":"..."}
+  "rocketreach_api_key":"...", "google_cse_key":"...", "google_cse_cx":"...",
+  "vt_api_key":"..."}
 
 ROE tiers: --passive-only | (default active) | --active-ports
 ATT&CK: TA0043. Passive ~T1596/T1593. Active ~T1595/T1590. Takeover ~T1584.001.
@@ -135,7 +136,8 @@ CF_FALLBACK = [
 # --------------------------------------------------------------------------- #
 def load_keys(args) -> dict:
     keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None,
-            "hunter": None, "rocketreach": None, "google_cse": None, "google_cse_cx": None}
+            "hunter": None, "rocketreach": None, "google_cse": None, "google_cse_cx": None,
+            "vt": None}
     cfg = Path(args.config) if args.config else CONFIG_PATH
     if cfg.exists():
         try:
@@ -148,6 +150,7 @@ def load_keys(args) -> dict:
             keys["rocketreach"] = data.get("rocketreach_api_key")
             keys["google_cse"] = data.get("google_cse_key")
             keys["google_cse_cx"] = data.get("google_cse_cx")
+            keys["vt"] = data.get("vt_api_key")
         except Exception as e:
             log(f"[!] config read failed: {e}")
     keys["shodan"] = os.environ.get("SHODAN_API_KEY") or keys["shodan"]
@@ -158,6 +161,7 @@ def load_keys(args) -> dict:
     keys["rocketreach"] = os.environ.get("ROCKETREACH_API_KEY") or keys["rocketreach"]
     keys["google_cse"] = os.environ.get("GOOGLE_CSE_KEY") or keys["google_cse"]
     keys["google_cse_cx"] = os.environ.get("GOOGLE_CSE_CX") or keys["google_cse_cx"]
+    keys["vt"] = os.environ.get("VT_API_KEY") or keys["vt"]
     if args.shodan_key:
         keys["shodan"] = args.shodan_key
     if args.ipinfo_key:
@@ -170,6 +174,8 @@ def load_keys(args) -> dict:
         keys["google_cse"] = args.google_cse_key
     if args.google_cse_cx:
         keys["google_cse_cx"] = args.google_cse_cx
+    if args.vt_key:
+        keys["vt"] = args.vt_key
     if args.ask_keys:
         import getpass
         if not keys["shodan"]:

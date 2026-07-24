@@ -54,6 +54,12 @@ def main() -> None:
                          "total, ~7 queries per domain — explicit flag even with a key configured)")
     ap.add_argument("--google-cse-key", help="Google Custom Search API key (else env/config)")
     ap.add_argument("--google-cse-cx", help="Google Custom Search Engine ID (else env/config)")
+    ap.add_argument("--vt", action="store_true",
+                    help="VirusTotal domain intelligence: historical IP resolutions "
+                         "(hosting history), WHOIS mirror, DNS-record snapshot, reputation "
+                         "(needs --vt-key; free tier is 4 req/min, 2 calls/domain — explicit "
+                         "flag even with a key configured, since it adds real wall-clock time)")
+    ap.add_argument("--vt-key", help="VirusTotal API key (else env/config)")
     ap.add_argument("--nvd", action="store_true", help="resolve CPEs to CVEs via NVD (slow)")
     ap.add_argument("--nvd-max-cves", type=int, default=25,
                     help="per-host cap on bare Shodan/InternetDB CVE IDs resolved via NVD "
@@ -137,6 +143,8 @@ def main() -> None:
     if args.dork:
         dork_ready = bool(keys["google_cse"] and keys["google_cse_cx"])
         log(f"[i] google dork: {'on' if dork_ready else 'requested but not configured — will skip'}")
+    if args.vt:
+        log(f"[i] VirusTotal domain intel: {'on' if keys['vt'] else 'requested but not configured — will skip'}")
     if args.no_pd:
         log("[i] backends: forced pure-Python (--no-pd)")
     else:
@@ -158,7 +166,7 @@ def main() -> None:
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
-                                "entry_points", "whois", "dorks", "dns", "mail_infra")}
+                                "entry_points", "whois", "dorks", "dns", "mail_infra", "vt")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))

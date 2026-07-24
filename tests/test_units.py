@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import enrich, intel, state, backends, sources, report, people, cli, core, dorking
+from lrecon import enrich, intel, state, backends, sources, report, people, cli, core, dorking, vt
 from lrecon.common import Host, Person, CF_FALLBACK, WEB_PORTS, non_web_ports
 
 
@@ -736,6 +736,122 @@ async def test_google_dork_terminal_status_stops_remaining_domains_in_core_loop(
     assert dorks == []
 
 
+# --------------------------------------------------------------------------- #
+# VirusTotal domain intelligence (historical IP resolutions, WHOIS mirror)
+# --------------------------------------------------------------------------- #
+_VT_DOMAIN_RESPONSE = {
+    "data": {
+        "attributes": {
+            "reputation": -5,
+            "creation_date": 1000000000,             # 2001-09-09T01:46:40+00:00
+            "last_modification_date": 1700000000,
+            "whois": "Domain Name: X.COM\nRegistrar: Example Registrar",
+            "whois_date": 1699000000,
+            "categories": {"vendor1": "search engines"},
+            "last_dns_records": [{"type": "A", "value": "1.2.3.4", "ttl": 300}],
+            "last_analysis_stats": {"malicious": 2, "suspicious": 1, "harmless": 70},
+        }
+    }
+}
+
+_VT_RESOLUTIONS_RESPONSE = {
+    "data": [
+        {"attributes": {"ip_address": "1.2.3.4", "date": 1700000000}},
+        {"attributes": {"ip_address": "5.6.7.8", "date": 1600000000}},
+        {"attributes": {}},   # malformed entry, no ip_address -> skipped
+    ]
+}
+
+
+def test_unix_to_iso_converts_and_handles_none():
+    assert vt._unix_to_iso(1000000000) == "2001-09-09T01:46:40+00:00"
+    assert vt._unix_to_iso(None) is None
+    assert vt._unix_to_iso("not-a-number") is None
+
+
+def test_parse_vt_domain_extracts_all_fields():
+    out = vt._parse_vt_domain(_VT_DOMAIN_RESPONSE)
+    assert out["reputation"] == -5
+    assert out["creation_date"] == "2001-09-09T01:46:40+00:00"
+    assert out["whois"].startswith("Domain Name: X.COM")
+    assert out["malicious_votes"] == 2
+    assert out["suspicious_votes"] == 1
+    assert out["last_dns_records"] == [{"type": "A", "value": "1.2.3.4"}]
+
+
+def test_parse_vt_domain_handles_missing_data_gracefully():
+    out = vt._parse_vt_domain({})
+    assert out["reputation"] is None
+    assert out["malicious_votes"] == 0
+    assert out["last_dns_records"] == []
+
+
+def test_parse_vt_resolutions_sorted_newest_first_and_skips_malformed():
+    out = vt._parse_vt_resolutions(_VT_RESOLUTIONS_RESPONSE)
+    assert len(out) == 2                              # malformed entry dropped
+    assert out[0]["ip"] == "1.2.3.4"                  # 2023-11-... newest
+    assert out[1]["ip"] == "5.6.7.8"                  # 2020-09-... older
+
+
+async def test_vt_domain_lookup_parses_200_response():
+    async def fake_get(url, headers=None, timeout=None):
+        assert headers["x-apikey"] == "vtkey"
+        return _FakeResp(200, _VT_DOMAIN_RESPONSE)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await vt.vt_domain_lookup(client, "x.com", "vtkey")
+    assert out["reputation"] == -5
+
+
+async def test_vt_domain_lookup_returns_empty_on_401():
+    async def fake_get(url, headers=None, timeout=None):
+        return _FakeResp(401)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await vt.vt_domain_lookup(client, "x.com", "bad-key")
+    assert out == {}
+
+
+async def test_vt_ip_history_parses_resolutions():
+    async def fake_get(url, headers=None, params=None, timeout=None):
+        assert params["limit"] == 20
+        return _FakeResp(200, _VT_RESOLUTIONS_RESPONSE)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await vt.vt_ip_history(client, "x.com", "vtkey")
+    assert len(out) == 2
+    assert out[0]["ip"] == "1.2.3.4"
+
+
+async def test_vt_domain_intel_combines_both_calls_and_waits_on_shared_limiter():
+    wait_count = 0
+
+    class _FakeLimiter:
+        async def wait(self):
+            nonlocal wait_count
+            wait_count += 1
+
+    call_urls = []
+
+    async def fake_get(url, headers=None, params=None, timeout=None):
+        call_urls.append(url)
+        if url.endswith("/resolutions"):
+            return _FakeResp(200, _VT_RESOLUTIONS_RESPONSE)
+        return _FakeResp(200, _VT_DOMAIN_RESPONSE)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+
+    out = await vt.vt_domain_intel(client, "x.com", "vtkey", _FakeLimiter())
+    assert wait_count == 2                            # one wait per call
+    assert out["reputation"] == -5
+    assert len(out["ip_history"]) == 2
+
+
+async def test_vt_domain_intel_returns_empty_when_vt_has_nothing():
+    async def fake_get(url, headers=None, params=None, timeout=None):
+        return _FakeResp(404)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out = await vt.vt_domain_intel(client, "unseen-domain.test", "vtkey", limiter)
+    assert out == {}
+
+
 def test_summarize_entry_points_includes_dork_hits():
     dorks = [{"category": "git-exposure", "severity": "high", "title": "Index of /.git",
              "link": "https://x.com/.git/", "snippet": "Index of /.git"}]
@@ -1159,6 +1275,37 @@ def test_write_html_cve_section_shows_tech_confirmed_badge():
     assert "TECH-CONFIRMED" in content
     assert "UNCONFIRMED" in content
     assert "CVE-2026-1" in content and "CVE-2026-2" in content
+
+
+def test_write_html_vt_section_shows_intel_and_ip_history():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {"vt": {"x.com": {"reputation": -5, "malicious_votes": 2, "suspicious_votes": 1,
+                            "creation_date": "2001-09-09T01:46:40+00:00",
+                            "last_modification_date": "2023-11-14T22:13:20+00:00",
+                            "ip_history": [{"ip": "1.2.3.4", "first_seen": "2023-11-14T22:13:20+00:00"},
+                                          {"ip": "5.6.7.8", "first_seen": "2020-09-13T12:26:40+00:00"}]}}}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert 'id="vt"' in content
+    assert "-5" in content
+    assert "5.6.7.8" in content
+    assert "hosting history" in content.lower()
+
+
+def test_write_markdown_vt_section_renders_history_table():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {"vt": {"x.com": {"reputation": 0, "malicious_votes": 0, "suspicious_votes": 0,
+                            "creation_date": None, "last_modification_date": None,
+                            "ip_history": [{"ip": "9.9.9.9", "first_seen": "2024-01-01T00:00:00+00:00"}]}}}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert "VirusTotal" in content
+    assert "9.9.9.9" in content
+    assert "2024-01-01T00:00:00+00:00" in content
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():
