@@ -205,12 +205,16 @@ lrecon -iL client_domains.txt -o client
 lrecon client.com --all -o client_full_osint
 ```
 
-### Handoff to nuclei / httpx
+### Handoff to nuclei / httpx / nmap
 
 ```fish
 lrecon client.com -o client
 nuclei -l client.live.txt -o client_nuclei.txt
 httpx -l client.live.txt -tech-detect -title
+
+# if a Cloudflare origin candidate was found, scan what CF was masking
+nmap -iL client.origin_ips.txt -p- -oA client_origin_scan
+nuclei -l client.origin_ips.txt -o client_origin_nuclei.txt
 ```
 
 ### Key flags
@@ -263,6 +267,9 @@ Per run, `<out>.*`:
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
   favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
+- **`<out>.origin_ips.txt`** — Cloudflare-origin-candidate IPs (confirmed + unconfirmed),
+  one per line, if any were found — direct handoff to `nmap -iL` / `nuclei -l` to scan what
+  Cloudflare was masking. Not written if no candidates were found.
 - **`<out>.targets.csv`** — flat subdomain/IP/ASN/org list for client scope confirmation.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
   key is configured (see [People OSINT](#people-osint-user-enumeration)).
