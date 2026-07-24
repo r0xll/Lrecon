@@ -48,6 +48,28 @@ def test_apply_ipinfo_records_per_ip_asn_for_multi_ip_hosts():
     assert h.asn == "AS13335"                    # scalar field: still last-IP-wins
 
 
+async def test_enrich_ipinfo_omits_token_param_when_keyless():
+    # IPinfo's /json endpoint works without a token (lower, unauthenticated
+    # rate limit) — this is the capability the whole "ASN/org shouldn't be
+    # gated behind a configured key" fix relies on.
+    async def fake_get(url, timeout=None):
+        assert url == "https://ipinfo.io/8.8.8.8/json"
+        assert "token" not in url
+        return _FakeResp(200, {"org": "AS15169 Google LLC"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await enrich.enrich_ipinfo(client, "8.8.8.8", None)
+    assert out["org"] == "AS15169 Google LLC"
+
+
+async def test_enrich_ipinfo_includes_token_param_when_configured():
+    async def fake_get(url, timeout=None):
+        assert url == "https://ipinfo.io/8.8.8.8/json?token=abc123"
+        return _FakeResp(200, {"org": "AS15169 Google LLC"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await enrich.enrich_ipinfo(client, "8.8.8.8", "abc123")
+    assert out["org"] == "AS15169 Google LLC"
+
+
 def test_apply_ports_merges_and_tags_source():
     h = Host("a.x.com", ports=[80])
     enrich.apply_ports(h, {"ports": [443, 80], "vulns": ["CVE-2026-1"]}, "internetdb")
@@ -583,19 +605,31 @@ async def test_mail_infra_lookup_resolves_ip_and_classifies_provider(monkeypatch
 async def test_mail_infra_lookup_dedupes_shared_mx_host(monkeypatch):
     answers = {("mx.example.com", "A"): ["1.2.3.4"]}
     monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+
+    async def fake_get(url, timeout=None):
+        return _FakeResp(200, {})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
     mx_records = [{"host": "mx.example.com", "priority": 10}, {"host": "mx.example.com", "priority": 20}]
-    out = await intel.mail_infra_lookup(None, mx_records, None, None)
+    out = await intel.mail_infra_lookup(client, mx_records, None, None)
     assert len(out) == 1
     assert out[0]["priority"] == 10                  # first occurrence kept
 
 
-async def test_mail_infra_lookup_no_ipinfo_token_skips_enrichment(monkeypatch):
+async def test_mail_infra_lookup_keyless_still_enriches_asn_org(monkeypatch):
+    # IPinfo's /json endpoint works without a token — ASN/org enrichment
+    # must not be skipped outright just because no key is configured.
     answers = {("mx.unrecognized.test", "A"): ["9.9.9.9"]}
     monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
-    out = await intel.mail_infra_lookup(None, [{"host": "mx.unrecognized.test", "priority": 5}],
+
+    async def fake_get(url, timeout=None):
+        assert "token=" not in url
+        return _FakeResp(200, {"org": "AS64512 Example Net", "country": "US"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+
+    out = await intel.mail_infra_lookup(client, [{"host": "mx.unrecognized.test", "priority": 5}],
                                         None, None)
     assert out == [{"host": "mx.unrecognized.test", "priority": 5, "ips": ["9.9.9.9"],
-                    "provider": None, "asn": None, "org": None, "country": None}]
+                    "provider": None, "asn": "AS64512", "org": "Example Net", "country": "US"}]
 
 
 # --------------------------------------------------------------------------- #
@@ -831,13 +865,35 @@ async def test_cloudflare_origin_detects_unproxied_leak():
         "x.com":     Host("x.com", ips=["104.16.5.5"]),        # CF edge
         "dev.x.com": Host("dev.x.com", ips=["45.79.10.20"]),   # leaked origin
     }
+
+    async def fake_get(url, timeout=None):
+        return _FakeResp(200, {})   # no org data in the response
+    client = type("C", (), {"get": staticmethod(fake_get)})()
     res = await intel.cloudflare_origin_analysis(
-        None, None, ["x.com"], hosts, {}, nets, active=False, resolver_ns=None)
+        client, None, ["x.com"], hosts, {}, nets, active=False, resolver_ns=None)
     assert res["detected"] is True
     assert "x.com" in res["fronted"]
     assert "45.79.10.20" in res["candidates"]
-    # no ipinfo token configured -> asn/org present but unresolved
     assert res["candidates"]["45.79.10.20"]["asn"] is None
+
+
+async def test_cloudflare_origin_enriches_keylessly_without_ipinfo_token():
+    # IPinfo's /json endpoint works without a token (lower, unauthenticated
+    # rate limit) — ASN/org enrichment for CF-origin candidates must not be
+    # skipped outright just because no --ipinfo-key/IPINFO_TOKEN is set.
+    nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
+    hosts = {
+        "x.com":     Host("x.com", ips=["104.16.5.5"]),
+        "dev.x.com": Host("dev.x.com", ips=["45.79.10.20"]),
+    }
+
+    async def fake_get(url, timeout=None):
+        assert "token=" not in url
+        return _FakeResp(200, {"org": "AS63949 Linode, LLC"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    res = await intel.cloudflare_origin_analysis(
+        client, None, ["x.com"], hosts, {}, nets, active=False, resolver_ns=None)
+    assert res["candidates"]["45.79.10.20"]["asn"] == "AS63949"
 
 
 async def test_cloudflare_origin_enriches_candidates_with_asn_org(monkeypatch):

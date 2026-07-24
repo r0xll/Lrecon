@@ -127,7 +127,7 @@ def main() -> None:
 
     keys = load_keys(args)
     log(f"[i] enrichment: ports/CVE via {'Shodan' if keys['shodan'] else 'InternetDB (keyless)'}"
-        f" | ASN/org/rDNS via {'IPinfo' if keys['ipinfo'] else 'disabled'}"
+        f" | ASN/org/rDNS via IPinfo ({'key' if keys['ipinfo'] else 'keyless, lower rate limit'})"
         f" | github {'on' if keys['github'] else 'off'}"
         f" | hibp {'key' if keys['hibp'] else 'keyless'}")
     people_sources = [n for n, k in (("hunter", keys["hunter"]), ("rocketreach", keys["rocketreach"]),
