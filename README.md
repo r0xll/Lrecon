@@ -200,8 +200,9 @@ lrecon client.com client.net --resolvers 1.1.1.1,9.9.9.9 -o client
 lrecon -iL client_domains.txt -o client
 
 # everything OSINT/informational — buckets, dorking, VirusTotal, NVD CVEs,
-# nuclei, ASN expansion — each still skips on its own if its key/binary
-# isn't configured. --active-ports/--verify-emails stay opt-in even here.
+# ASN expansion — each still skips on its own if its key/binary isn't
+# configured. --active-ports/--verify-emails/--nuclei stay opt-in even
+# here — all three send live traffic straight at the target's hosts.
 lrecon client.com --all -o client_full_osint
 ```
 
@@ -223,7 +224,7 @@ nuclei -l client.origin_ips.txt -o client_origin_nuclei.txt
 |---|---|
 | `-iL, --domains-file` | read domains from a file, one per line, merged with positional domains |
 | `--passive-only` | OSINT sources + host lookup only; no resolution/HTTP/portscan |
-| `--all` | turn on every OSINT/informational check that's otherwise opt-in only due to quota/speed/binary availability — `--buckets --dork --vt --nvd --nuclei --asn-expand`. Does **not** enable `--active-ports`/`--verify-emails` (those stay explicit — see below) |
+| `--all` | turn on every OSINT/informational check that's otherwise opt-in only due to quota/speed/binary availability — `--buckets --dork --vt --nvd --asn-expand`. Does **not** enable `--active-ports`/`--verify-emails`/`--nuclei` (those send live traffic at the target and stay explicit — see below) |
 | `--active-ports` | async TCP connect scan of common ports (aggressive; ROE-gated) |
 | `--ports a,b,c` | custom port set for `--active-ports` |
 | `--no-cf-origin` | disable Cloudflare origin-IP discovery |
@@ -240,7 +241,7 @@ nuclei -l client.origin_ips.txt -o client_origin_nuclei.txt
 | `--vt` | VirusTotal domain intelligence: IP/hosting history, WHOIS mirror, reputation (needs `--vt-key`) |
 | `--vt-key` | VirusTotal API key for `--vt` (else env/config) |
 | `--diff` | diff against previous run snapshot |
-| `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei) |
+| `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei; active, ROE-gated — not enabled by `--all`) |
 | `--nuclei-severity` | min nuclei severity, e.g. `medium,high,critical` |
 | `--no-pd` | force pure-Python/HTTP; ignore ProjectDiscovery binaries and the psql-based crt.sh accelerator |
 | `--screenshots` | capture live-host screenshots (needs playwright) |
@@ -491,10 +492,12 @@ look (SMTP banner grab, open relay, vulnerable MTA version) if in scope.
 | `--active-ports` | yes | yes | yes | yes |
 
 The steps that touch target-owned infrastructure directly are the HTTP probe,
-the optional TCP scan, the Cloudflare origin **confirmation** request, and (if
-`--verify-emails` is set) the SMTP `RCPT TO` probe of the target's mail servers.
-All subdomain/enrichment/candidate collection — including all people-OSINT
-discovery, before `--verify-emails` — is passive.
+the optional TCP scan, the Cloudflare origin **confirmation** request, the
+optional nuclei templated scan (`--nuclei` — sends live requests, including
+exploit/auth-bypass probes, to live hosts), and (if `--verify-emails` is set)
+the SMTP `RCPT TO` probe of the target's mail servers. All subdomain/
+enrichment/candidate collection — including all people-OSINT discovery,
+before `--verify-emails` — is passive.
 
 ---
 
