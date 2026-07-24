@@ -94,6 +94,79 @@ async def _run(cmd: list, stdin: bytes | None = None, timeout: int = 900) -> str
         return ""
 
 
+def _looks_like_nuclei_finding(line: str) -> bool:
+    """A nuclei -jsonl result line, not a -stats status line or banner
+    text — findings always carry both of these fields."""
+    try:
+        obj = json.loads(line)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and "template-id" in obj and "matched-at" in obj
+
+
+async def _run_nuclei(cmd: list, stdin: bytes, timeout: int = 1800) -> str:
+    """
+    Like _run(), but streams progress live via log() instead of silently
+    discarding it for the whole (possibly many-minutes-long) scan —
+    nuclei's own periodic -stats status lines (duration/hosts/requests/rps)
+    otherwise vanish into stderr, making a long scan look hung. Reads
+    stdout line-by-line as results arrive: JSONL finding lines are
+    collected and returned (same shape _run() would have returned, so
+    nuclei_scan()'s existing _jsonl() parsing is unchanged); any other
+    non-empty line, on stdout or stderr, is logged live instead — this
+    covers -stats output landing on either stream without needing to
+    assume which one nuclei uses.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+    except Exception as e:
+        log(f"[!] backend {cmd[0]}: {e}")
+        return ""
+
+    finding_lines = []
+
+    async def feed_stdin():
+        try:
+            proc.stdin.write(stdin)
+            await proc.stdin.drain()
+        finally:
+            proc.stdin.close()
+
+    async def pump_stdout():
+        async for raw in proc.stdout:
+            line = raw.decode(errors="ignore").strip()
+            if not line:
+                continue
+            if _looks_like_nuclei_finding(line):
+                finding_lines.append(line)
+            else:
+                log(f"    [nuclei] {line}")
+
+    async def pump_stderr():
+        async for raw in proc.stderr:
+            line = raw.decode(errors="ignore").strip()
+            if line:
+                log(f"    [nuclei] {line}")
+
+    try:
+        await asyncio.wait_for(asyncio.gather(feed_stdin(), pump_stdout(), pump_stderr()),
+                               timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        log(f"[!] backend {cmd[0]}: timed out after {timeout}s")
+    except Exception as e:
+        log(f"[!] backend {cmd[0]}: {e}")
+    finally:
+        if proc.returncode is None:
+            await proc.wait()
+
+    return "\n".join(finding_lines)
+
+
 def _jsonl(text: str):
     for line in text.splitlines():
         line = line.strip()
@@ -166,10 +239,15 @@ async def nuclei_scan(urls, severity=None, rate=150) -> list | None:
     if not have("nuclei") or not urls:
         return None
     inp = "\n".join(urls).encode()
-    cmd = ["nuclei", "-silent", "-jsonl", "-rate-limit", str(rate), "-no-color"]
+    # -stats -stats-interval periodically emits scan-status lines (duration/
+    # hosts/requests/rps) alongside -silent's normal findings-only output —
+    # _run_nuclei() streams those live via log() so a long scan (up to the
+    # 1800s timeout below) isn't a silent wait.
+    cmd = ["nuclei", "-silent", "-jsonl", "-rate-limit", str(rate), "-no-color",
+          "-stats", "-stats-interval", "5"]
     if severity:
         cmd += ["-severity", severity]
-    out = await _run(cmd, stdin=inp, timeout=1800)
+    out = await _run_nuclei(cmd, stdin=inp, timeout=1800)
     findings = []
     for j in _jsonl(out):
         info = j.get("info", {})

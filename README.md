@@ -241,7 +241,7 @@ nuclei -l client.origin_ips.txt -o client_origin_nuclei.txt
 | `--vt` | VirusTotal domain intelligence: IP/hosting history, WHOIS mirror, reputation (needs `--vt-key`) |
 | `--vt-key` | VirusTotal API key for `--vt` (else env/config) |
 | `--diff` | diff against previous run snapshot |
-| `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei; active, ROE-gated — not enabled by `--all`) |
+| `--nuclei` | run nuclei templated vuln scan on live hosts (needs nuclei; active, ROE-gated — not enabled by `--all`). Streams nuclei's own periodic scan-status lines live so a long scan isn't a silent wait |
 | `--nuclei-severity` | min nuclei severity, e.g. `medium,high,critical` |
 | `--no-pd` | force pure-Python/HTTP; ignore ProjectDiscovery binaries and the psql-based crt.sh accelerator |
 | `--screenshots` | capture live-host screenshots (needs playwright) |
@@ -336,6 +336,13 @@ databases and auth-adjacent services (FTP, LDAP, MSSQL/MySQL/Postgres,
 RPC/NetBIOS) rank **medium**; commonly-intentional exposures (SSH, mail,
 DNS) rank **low**. An unrecognized open port still gets flagged, at a
 conservative medium, even without a friendly name.
+
+**Live nuclei progress.** A `--nuclei` scan against many live hosts can run
+for minutes with the stock backend giving zero feedback until it finishes.
+lrecon runs nuclei with `-stats` and streams its periodic scan-status lines
+(duration, hosts, requests, rps) straight to the console as they arrive,
+instead of buffering all output until the process exits — a long scan no
+longer looks hung.
 
 ---
 
