@@ -9,7 +9,7 @@ import pytest
 
 import lrecon
 from lrecon import enrich, intel, state, backends, sources, report, people, cli, core, dorking
-from lrecon.common import Host, Person, CF_FALLBACK
+from lrecon.common import Host, Person, CF_FALLBACK, WEB_PORTS, non_web_ports
 
 
 # --------------------------------------------------------------------------- #
@@ -46,6 +46,19 @@ def test_apply_ipinfo_records_per_ip_asn_for_multi_ip_hosts():
     enrich.apply_ipinfo(h, {"org": "AS13335 Cloudflare"}, "5.6.7.8")
     assert h.ip_asn == {"1.2.3.4": "AS15169", "5.6.7.8": "AS13335"}
     assert h.asn == "AS13335"                    # scalar field: still last-IP-wins
+
+
+def test_non_web_ports_filters_out_web_ports():
+    assert non_web_ports([80, 443, 8080]) == []
+    assert non_web_ports([80, 22, 3389, 443]) == [22, 3389]
+    assert non_web_ports([]) == []
+
+
+def test_non_web_ports_keeps_elasticsearch_flagged():
+    # 9200 speaks HTTP but is a database service worth flagging, not a
+    # general-purpose web/app-proxy port.
+    assert 9200 not in WEB_PORTS
+    assert non_web_ports([9200]) == [9200]
 
 
 async def test_enrich_ipinfo_omits_token_param_when_keyless():
@@ -762,6 +775,36 @@ def test_summarize_entry_points_empty_when_nothing_found():
     assert intel.summarize_entry_points(hosts, cf, [], {}, [], []) == []
 
 
+def test_summarize_entry_points_flags_non_web_ports():
+    h = Host("db.x.com", ports=[80, 443, 3389, 6379])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    nwp = [e for e in eps if e["type"] == "non-web-port"]
+    assert len(nwp) == 1
+    assert nwp[0]["target"] == "db.x.com"
+    assert "3389 (RDP)" in nwp[0]["summary"]
+    assert "6379 (Redis)" in nwp[0]["summary"]
+    assert nwp[0]["summary"].endswith("3389 (RDP), 6379 (Redis)")  # only non-web ports listed
+    assert nwp[0]["severity"] == "high"                        # worst of RDP/Redis (both high)
+    assert nwp[0]["attck"] == "T1046"
+
+
+def test_summarize_entry_points_no_non_web_port_finding_when_only_web_ports_open():
+    h = Host("web.x.com", ports=[80, 443, 8443])
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert not [e for e in eps if e["type"] == "non-web-port"]
+
+
+def test_summarize_entry_points_unlisted_non_web_port_gets_generic_medium():
+    h = Host("odd.x.com", ports=[80, 12345])   # not in NON_WEB_PORT_INFO
+    cf = {"detected": False, "candidates": {}}
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    nwp = [e for e in eps if e["type"] == "non-web-port"][0]
+    assert "12345" in nwp["summary"]
+    assert nwp["severity"] == "medium"
+
+
 def test_summarize_entry_points_includes_nvd_only_cves():
     # InternetDB gave CPEs but no vulns entries; --nvd found a critical CVE via CPE lookup.
     h = Host("legacy.x.com", nvd_cves=[{"id": "CVE-2026-9999", "cvss": 9.8}])
@@ -1074,6 +1117,36 @@ def test_write_html_renders_sections_only_when_data_present():
     # sections with no data still absent
     assert 'id="nuclei"' not in content
     assert 'id="people"' not in content
+
+
+def test_write_html_highlights_non_web_ports_in_attack_surface():
+    hosts = [Host("db.x.com", ips=["1.2.3.4"], ports=[80, 443, 3389])]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert '<span class="portflag"' in content
+    assert ">3389</span>" in content
+    assert "needs manual review" in content
+
+
+def test_write_html_no_portflag_note_when_only_web_ports_open():
+    hosts = [Host("web.x.com", ips=["1.2.3.4"], ports=[80, 443])]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert '<span class="portflag"' not in content
+
+
+def test_write_markdown_bolds_non_web_ports():
+    hosts = [Host("db.x.com", ips=["1.2.3.4"], ports=[80, 443, 3389])]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown(hosts, ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "80, 443, **3389**" in content
+    assert "need a manual look" in content
 
 
 def test_write_html_cve_section_shows_tech_confirmed_badge():

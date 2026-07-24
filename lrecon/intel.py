@@ -556,6 +556,23 @@ async def hibp_breaches(client, domain: str) -> list:
 ENTRY_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 _CVSS_SEVERITY = ((9.0, "critical"), (7.0, "high"), (4.0, "medium"))
 
+# Label + a rough severity for non-web ports worth flagging by name — direct
+# RCE/lateral-movement-prone services (RDP, SMB, VNC, WinRM, Telnet) rank
+# higher than ones that are commonly intentionally exposed (SSH, mail, DNS).
+# Anything open but not in this table (e.g. a naabu hit on an odd port) still
+# gets flagged, just without a friendly name, at a conservative "medium".
+NON_WEB_PORT_INFO = {
+    21: ("FTP", "medium"), 22: ("SSH", "low"), 23: ("Telnet", "high"),
+    25: ("SMTP", "low"), 53: ("DNS", "low"), 110: ("POP3", "low"),
+    111: ("RPCbind", "medium"), 135: ("MS-RPC", "medium"), 139: ("NetBIOS", "medium"),
+    143: ("IMAP", "low"), 389: ("LDAP", "medium"), 445: ("SMB", "high"),
+    465: ("SMTPS", "low"), 587: ("SMTP submission", "low"), 993: ("IMAPS", "low"),
+    995: ("POP3S", "low"), 1433: ("MSSQL", "medium"), 1723: ("PPTP", "medium"),
+    3306: ("MySQL", "medium"), 3389: ("RDP", "high"), 5432: ("PostgreSQL", "medium"),
+    5900: ("VNC", "high"), 5985: ("WinRM", "high"), 6379: ("Redis", "high"),
+    9200: ("Elasticsearch", "high"), 27017: ("MongoDB", "high"),
+}
+
 
 def _cve_severity(cvss, has_poc: bool = False) -> str:
     if cvss is None:
@@ -669,6 +686,20 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei, 
                    "summary": f"{len(ranked)} known CVE(s){cvss_note}{poc_note}{dos_note}"
                               f"{unscored_note}{tech_note}: {detail}",
                    "attck": "T1190"})
+
+    # Non-web open ports — services lrecon's HTTP probe never touches, so
+    # they need a manual look (RDP/SMB/VNC/WinRM/Telnet especially).
+    for h in hosts:
+        nwp = non_web_ports(h.ports)
+        if not nwp:
+            continue
+        labeled = [f"{p} ({NON_WEB_PORT_INFO[p][0]})" if p in NON_WEB_PORT_INFO else str(p)
+                  for p in nwp]
+        sev = min((NON_WEB_PORT_INFO.get(p, (None, "medium"))[1] for p in nwp),
+                 key=lambda s: ENTRY_SEVERITY_ORDER.get(s, 9))
+        out.append({"type": "non-web-port", "target": h.subdomain, "severity": sev,
+                   "summary": f"Non-web port(s) open, needs manual review: {', '.join(labeled)}",
+                   "attck": "T1046"})
 
     for d, bs in (breach or {}).items():
         if bs:

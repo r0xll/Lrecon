@@ -96,6 +96,23 @@ def _tech_confirmed_label(h) -> str:
     return ""
 
 
+def _format_ports_md(ports: list) -> str:
+    """Bold any port outside WEB_PORTS — a non-HTTP service the probe
+    pipeline never looks at, so it needs a manual look."""
+    if not ports:
+        return "—"
+    nwp = set(non_web_ports(ports))
+    return ", ".join(f"**{p}**" if p in nwp else str(p) for p in ports)
+
+
+def _format_ports_html(ports: list) -> str:
+    if not ports:
+        return "—"
+    nwp = set(non_web_ports(ports))
+    return ", ".join(f'<span class="portflag" title="non-web service — needs manual review">{p}</span>'
+                     if p in nwp else str(p) for p in ports)
+
+
 def write_markdown(hosts, domains, res, path) -> None:
     per_source = res.get("per_source", {})
     cf = res.get("cf", {})
@@ -320,11 +337,15 @@ def write_markdown(hosts, domains, res, path) -> None:
             continue
         ips = ", ".join(h.ips) or "—"
         asn_org = " ".join(x for x in (h.asn, (h.org or "")[:20]) if x) or "—"
-        ports = ", ".join(map(str, h.ports)) or "—"
+        ports = _format_ports_md(h.ports)
         tech = h.server or h.powered_by or (h.cpes[0] if h.cpes else "—")
         http = f"{h.scheme} {h.http_status}" if h.http_status else "—"
         v = ", ".join(h.vulns[:5]) + ("…" if len(h.vulns) > 5 else "") if h.vulns else "—"
         lines.append(f"| {h.subdomain} | {ips} | {asn_org} | {ports} | {tech} | {http} | {v} |")
+    if any(non_web_ports(h.ports) for h in hosts if not h.wildcard):
+        lines.append("")
+        lines.append("> **Bold** ports are non-web services (SSH, RDP, databases, etc.) — the "
+                     "HTTP probe never touches them, so they need a manual look.")
 
     if vulns:
         lines += ["", "## CVE hits (validate before reporting)", ""]
@@ -619,20 +640,26 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- Attack surface (primary table, always open) ----
     rows = []
+    any_nonweb = False
     for h in hosts:
         if h.wildcard:
             continue
         cves = ", ".join(h.vulns[:5]) or "—"
+        if non_web_ports(h.ports):
+            any_nonweb = True
         rows.append(
             f"<tr><td>{esc(h.subdomain)}</td><td>{', '.join(h.ips) or '—'}</td>"
             f"<td>{esc(((h.asn or '') + ' ' + (h.org or '')).strip())[:40] or '—'}</td>"
-            f"<td>{', '.join(map(str, h.ports)) or '—'}</td>"
+            f"<td>{_format_ports_html(h.ports)}</td>"
             f"<td>{esc(h.server or h.powered_by or None)}</td>"
             f"<td>{(str(h.http_status) if h.http_status else '—')}</td>"
             f"<td>{esc(cves)}</td></tr>")
     body = (f'{_html_export_button("t-attacksurface", "attack_surface.csv")}'
             f'<table id="t-attacksurface"><tr><th>Subdomain</th><th>IP(s)</th><th>ASN/Org</th>'
             f'<th>Open Ports</th><th>Tech</th><th>HTTP</th><th>CVEs</th></tr>{"".join(rows)}</table>')
+    if any_nonweb:
+        body += ('<p class="note">Highlighted ports are non-web services (SSH, RDP, databases, '
+                'etc.) — the HTTP probe never touches them, so they need a manual look.</p>')
     sections.append(_html_section("attacksurface", "Attack surface", len(rows), body, open_default=True))
 
     # ---- CVE hits ----
@@ -702,6 +729,8 @@ tr:nth-child(even) {{ background: #fafafa; }}
 .sev-medium {{ background: #e67e22; color: #fff; }}
 .sev-low {{ background: #95a5a6; color: #fff; }}
 .sev-info {{ background: #bdc3c7; color: #333; }}
+.portflag {{ background: #e67e22; color: #fff; padding: 0 5px; border-radius: 3px;
+            font-weight: 600; cursor: help; }}
 @media (prefers-color-scheme: dark) {{
   :root {{ color-scheme: dark; }}
   body {{ background: #16181c; color: #e6e6e6; }}

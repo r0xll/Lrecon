@@ -70,7 +70,8 @@ def log(msg: str) -> None:
 # names re-exported to sibling modules via `from .common import *`
 __all__ = [
     "log", "Host", "Person", "RateLimiter", "load_keys",
-    "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
+    "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "WEB_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
+    "non_web_ports",
     "_HAVE_DNS", "_HAVE_RICH", "_console",
     "Progress", "SpinnerColumn", "BarColumn", "TextColumn",
     "TimeElapsedColumn", "MofNCompleteColumn",
@@ -89,6 +90,18 @@ DEFAULT_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4"]
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 389, 443, 445,
              465, 587, 993, 995, 1433, 1723, 3306, 3389, 5432, 5900, 5985,
              6379, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9200, 9443, 27017]
+
+# General-purpose HTTP(S) app/proxy ports — what lrecon's HTTP probe and
+# tech-detect actually touch. Everything else in TOP_PORTS (or reported by
+# Shodan/InternetDB/naabu outside it) is a non-HTTP service the probe never
+# looks at, so it needs a human to go check it by hand.
+WEB_PORTS = {80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443}
+
+
+def non_web_ports(ports: list) -> list:
+    """Open ports outside WEB_PORTS, sorted — the ones worth a manual look
+    since the HTTP probe pipeline never touches them."""
+    return sorted(p for p in ports if p not in WEB_PORTS)
 
 TAKEOVER_SIGS = {
     "s3.amazonaws.com":     ["nosuchbucket", "the specified bucket does not exist"],
