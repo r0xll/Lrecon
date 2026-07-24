@@ -1280,30 +1280,29 @@ def test_available_backends_shape():
 # --------------------------------------------------------------------------- #
 # Reporting: CSV target list
 # --------------------------------------------------------------------------- #
-def test_write_csv_has_subdomain_ips_and_per_ip_asn_org():
+def test_write_csv_one_row_per_subdomain_ip_pair():
     hosts = [
         Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC",
              country="US", scheme="https", http_status=200, source={"crtsh"},
              ip_asn={"1.2.3.4": "AS15169"}, ip_org={"1.2.3.4": "Google LLC"}),
-        # multi-IP host, only one IP resolved to an ASN/org — both columns
-        # stay positionally parallel to ips, blank where unresolved.
+        # multi-IP host: subdomain repeats, one row per IP, only one IP
+        # resolved to an ASN/org — the other row's asn/org stay blank
+        # rather than falling back to a scalar that may belong to a
+        # different IP on the same host.
         Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"},
              ip_asn={"8.8.8.8": "AS15169"}, ip_org={"8.8.8.8": "Google LLC"}),
     ]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
         n = report.write_csv(hosts, str(path))
-        assert n == 2
         rows = list(csv.DictReader(path.open()))
-    assert list(rows[0].keys()) == ["subdomain", "ips", "asn", "org"]
-    assert rows[0]["subdomain"] == "a.x.com"
-    assert rows[0]["ips"] == "1.2.3.4"
-    assert rows[0]["asn"] == "AS15169"
-    assert rows[0]["org"] == "Google LLC"
-    assert rows[1]["subdomain"] == "multi.x.com"
-    assert rows[1]["ips"] == "9.9.9.9, 8.8.8.8"
-    assert rows[1]["asn"] == ", AS15169"          # blank for 9.9.9.9, resolved for 8.8.8.8
-    assert rows[1]["org"] == ", Google LLC"
+    assert n == 3                                  # 1 + 2 IP rows
+    assert list(rows[0].keys()) == ["subdomain", "ip", "asn", "org"]
+    assert rows[0] == {"subdomain": "a.x.com", "ip": "1.2.3.4",
+                       "asn": "AS15169", "org": "Google LLC"}
+    assert rows[1] == {"subdomain": "multi.x.com", "ip": "9.9.9.9", "asn": "", "org": ""}
+    assert rows[2] == {"subdomain": "multi.x.com", "ip": "8.8.8.8",
+                       "asn": "AS15169", "org": "Google LLC"}
 
 
 def test_write_csv_single_ip_host_falls_back_to_scalar_asn_org():
@@ -1317,6 +1316,16 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_asn_org():
         rows = list(csv.DictReader(path.open()))
     assert rows[0]["asn"] == "AS15169"
     assert rows[0]["org"] == "Google LLC"
+
+
+def test_write_csv_host_with_no_resolved_ips_still_gets_a_row():
+    h = Host("unresolved.x.com", ips=[])
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "targets.csv"
+        n = report.write_csv([h], str(path))
+        rows = list(csv.DictReader(path.open()))
+    assert n == 1
+    assert rows[0] == {"subdomain": "unresolved.x.com", "ip": "", "asn": "", "org": ""}
 
 
 # --------------------------------------------------------------------------- #

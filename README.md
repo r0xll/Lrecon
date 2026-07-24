@@ -271,7 +271,9 @@ Per run, `<out>.*`:
 - **`<out>.origin_ips.txt`** — Cloudflare-origin-candidate IPs (confirmed + unconfirmed),
   one per line, if any were found — direct handoff to `nmap -iL` / `nuclei -l` to scan what
   Cloudflare was masking. Not written if no candidates were found.
-- **`<out>.targets.csv`** — flat subdomain/IP/ASN/org list for client scope confirmation.
+- **`<out>.targets.csv`** — flat target list for client scope confirmation: one
+  row per subdomain/IP pair (a multi-IP host repeats across several rows, one
+  IP per row), each with its own ASN/org — no comma-joined multi-value cells.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
   key is configured (see [People OSINT](#people-osint-user-enumeration)).
 - **`<out>_shots/`** — live-host screenshots (with `--screenshots`).
