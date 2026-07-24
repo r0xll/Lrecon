@@ -8,7 +8,8 @@ from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
 from .core import run
-from .report import write_markdown, write_html, write_live_hosts, write_csv, write_users_csv, screenshot_hosts
+from .report import (write_markdown, write_html, write_live_hosts, write_csv, write_users_csv,
+                     write_origin_ips, screenshot_hosts)
 from .backends import available_backends
 from . import backends
 
@@ -199,6 +200,7 @@ def main() -> None:
     live_path = f"{out_base}.live.txt"
     csv_path = f"{out_base}.targets.csv"
     users_path = f"{out_base}.users.csv"
+    origin_path = f"{out_base}.origin_ips.txt"
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
@@ -216,6 +218,9 @@ def main() -> None:
     if people:
         write_users_csv(people, users_path)
         outputs.append(users_path)
+    n_origin = write_origin_ips(res.get("cf") or {}, origin_path)
+    if n_origin:
+        outputs.append(origin_path)
     if args.screenshots:
         urls = [l for l in Path(live_path).read_text().splitlines() if l]
         shot_dir = f"{out_base}_shots"
@@ -227,7 +232,8 @@ def main() -> None:
     n_entry = len(res.get("entry_points") or [])
     n_dorks = len(res.get("dorks") or [])
     log(f"[+] done in {time.time()-t0:.1f}s — {len(hosts)} hosts, {n_live} live URLs, "
-        f"{n_entry} potential entry point(s), {len(people)} enumerated user(s), {n_dorks} dork hit(s)")
+        f"{n_entry} potential entry point(s), {len(people)} enumerated user(s), {n_dorks} dork hit(s), "
+        f"{n_origin} CF-origin candidate IP(s)")
     log(f"[+] {'  '.join(outputs)}")
 
 

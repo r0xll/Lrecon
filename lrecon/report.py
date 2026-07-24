@@ -69,6 +69,20 @@ def write_live_hosts(hosts, path) -> int:
     return len(urls)
 
 
+def write_origin_ips(cf, path) -> int:
+    """
+    Flat list of Cloudflare-origin-candidate IPs (confirmed + unconfirmed)
+    for direct handoff to nmap/nuclei — the natural next step once a
+    candidate is found is to scan it and see what Cloudflare was masking.
+    Unconfirmed candidates are included too, not just confirmed ones: an
+    active scan against the candidate is itself a stronger confirmation
+    signal than the passive sourcing that put it on the list.
+    """
+    ips = sorted((cf or {}).get("candidates", {}).keys())
+    Path(path).write_text("\n".join(ips) + ("\n" if ips else ""))
+    return len(ips)
+
+
 def _whois_privacy_cell(w: dict) -> str:
     pp = w.get("privacy_protected")
     if pp is True:

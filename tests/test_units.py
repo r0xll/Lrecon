@@ -1198,6 +1198,41 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_asn_org():
 
 
 # --------------------------------------------------------------------------- #
+# Reporting: CF-origin-candidate IP list (nmap/nuclei handoff)
+# --------------------------------------------------------------------------- #
+def test_write_origin_ips_includes_confirmed_and_unconfirmed_sorted():
+    cf = {"detected": True, "fronted": ["x.com"],
+          "candidates": {
+              "45.79.10.20": {"sources": ["unproxied:dev.x.com"], "confirmed": True},
+              "9.9.9.9": {"sources": ["spf:x.com"], "confirmed": False},
+          }}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.origin_ips.txt"
+        n = report.write_origin_ips(cf, str(path))
+        content = path.read_text()
+    assert n == 2
+    assert content == "45.79.10.20\n9.9.9.9\n"       # sorted, one per line
+
+
+def test_write_origin_ips_empty_when_no_candidates():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.origin_ips.txt"
+        n = report.write_origin_ips({"detected": False, "candidates": {}}, str(path))
+        content = path.read_text()
+    assert n == 0
+    assert content == ""
+
+
+def test_write_origin_ips_handles_missing_cf_key_gracefully():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.origin_ips.txt"
+        n = report.write_origin_ips({}, str(path))
+        assert n == 0
+        n2 = report.write_origin_ips(None, str(path))
+        assert n2 == 0
+
+
+# --------------------------------------------------------------------------- #
 # Reporting: HTML report — collapsible sections + escaping
 # --------------------------------------------------------------------------- #
 def test_write_html_minimal_data_does_not_crash_and_has_attack_surface():
