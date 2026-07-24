@@ -43,6 +43,8 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
       * SPF ip4:/ip6: literals and MX host IPs on the apex
       * Shodan cert search: ssl.cert.subject.CN:"domain" -> non-CF IPs
     Confirmation (active, touches candidate IP): spoofed Host header.
+    Every candidate is also enriched with ASN/org (IPinfo, if a token is
+    configured) so the report shows who actually hosts the leaked origin.
 
     `client` (cert-verified) is used for the Shodan API lookup; `probe_client`
     (unverified) is used to touch candidate origin IPs directly, since those
@@ -128,8 +130,28 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
                 except Exception:
                     continue
 
+    # 5. ASN/org enrichment for each candidate IP — reuses the same IPinfo
+    # enrichment path as in-scope hosts, so a client can immediately see
+    # who actually hosts a leaked origin (own datacenter vs. a cloud
+    # provider vs. another org's shared infrastructure).
+    ipinfo_token = keys.get("ipinfo")
+    if ipinfo_token and cands:
+        for ip in list(cands):
+            info = await enrich_ipinfo(client, ip, ipinfo_token)
+            org = info.get("org")           # e.g. "AS15169 Google LLC"
+            asn = org_name = None
+            if org:
+                parts = org.split(" ", 1)
+                if parts[0].startswith("AS"):
+                    asn, org_name = parts[0], (parts[1] if len(parts) > 1 else org)
+                else:
+                    org_name = org
+            cands[ip]["asn"] = asn
+            cands[ip]["org"] = org_name
+
     result["candidates"] = {ip: {"sources": sorted(v["sources"]),
-                                 "confirmed": v["confirmed"], "evidence": v["evidence"]}
+                                 "confirmed": v["confirmed"], "evidence": v["evidence"],
+                                 "asn": v.get("asn"), "org": v.get("org")}
                             for ip, v in cands.items()}
     return result
 
@@ -292,19 +314,48 @@ async def mail_infra_lookup(client, mx_records: list, ipinfo_token: str | None, 
 # redirector to the authoritative RDAP server for whatever TLD the domain is
 # under, so one endpoint covers the large majority of TLDs without needing to
 # chase IANA referrals ourselves.
+#
+# rdap.org routes to the REGISTRY's RDAP server (e.g. Verisign for .com,
+# PIR for .org), which — post-GDPR — omits registrant data entirely for
+# most gTLDs; that data instead lives at the REGISTRAR's own RDAP server,
+# referenced by a `rel=related` link in the registry response. rdap_lookup()
+# follows that one extra hop when the registry response has no registrant
+# entity, since that's what actually surfaces privacy-protection status for
+# the common case (confirmed live: registry-level namecheap.com has no
+# registrant entity at all; the registrar-level referral shows
+# rdapConformance containing "redacted" plus a registrant vcard org of
+# "Privacy service provided by Withheld for Privacy ehf").
 # --------------------------------------------------------------------------- #
-def _rdap_entity_name(entity: dict) -> str | None:
-    """Registrar/registrant name is buried in jCard format: vcardArray[1] is
-    a list of [field, params, type, value, ...] entries; find the "fn" one."""
+_PRIVACY_KEYWORDS = ("privacy", "proxy", "redacted", "withheld", "protect", "whoisguard")
+
+
+def _rdap_vcard_field(entity: dict, field: str) -> str | None:
+    """A jCard field (vcardArray[1] is a list of [field, params, type, value, ...]
+    entries) — e.g. "fn" (name) or "org" (organization, often where a privacy
+    service's own name shows up for a redacted registrant)."""
     for item in (entity.get("vcardArray") or [None, []])[1]:
-        if len(item) >= 4 and item[0] == "fn" and item[3]:
+        if len(item) >= 4 and item[0] == field and item[3]:
             return item[3]
+    return None
+
+
+def _rdap_entity_name(entity: dict) -> str | None:
+    return _rdap_vcard_field(entity, "fn")
+
+
+def _rdap_referral_link(data: dict) -> str | None:
+    """The registrar's own RDAP endpoint, if the registry response links to one."""
+    for link in data.get("links", []) or []:
+        if link.get("rel") == "related" and "rdap" in (link.get("type") or "").lower():
+            return link.get("href")
     return None
 
 
 def _parse_rdap(data: dict) -> dict:
     out = {"registrar": None, "created": None, "expires": None,
-          "last_changed": None, "nameservers": [], "status": []}
+          "last_changed": None, "nameservers": [], "status": [],
+          "registrant_name": None, "registrant_org": None,
+          "privacy_protected": None, "privacy_provider": None}
     for ev in data.get("events", []) or []:
         action = ev.get("eventAction")
         if action == "registration":
@@ -320,6 +371,22 @@ def _parse_rdap(data: dict) -> dict:
                      None)
     if registrar:
         out["registrar"] = _rdap_entity_name(registrar)
+
+    registrant = next((e for e in data.get("entities", []) or [] if "registrant" in (e.get("roles") or [])),
+                      None)
+    if registrant:
+        name = _rdap_entity_name(registrant)
+        org = _rdap_vcard_field(registrant, "org")
+        out["registrant_name"] = name
+        out["registrant_org"] = org
+        redacted_ext = bool(data.get("redacted")) or "redacted" in (data.get("rdapConformance") or [])
+        looks_private = any(k in (org or "").lower() for k in _PRIVACY_KEYWORDS) or \
+                        any(k in (name or "").lower() for k in _PRIVACY_KEYWORDS)
+        if redacted_ext or looks_private or not name:
+            out["privacy_protected"] = True
+            out["privacy_provider"] = org if (org and looks_private) else None
+        else:
+            out["privacy_protected"] = False
     return out
 
 
@@ -331,11 +398,37 @@ async def rdap_lookup(client, domain: str) -> dict:
     Returns {} on any failure — many domains (privacy-protected registrants,
     some ccTLDs without RDAP support yet) simply won't resolve; that's
     expected, not an error worth logging loudly.
+
+    If the registry response has no registrant entity (the common case for
+    thin gTLD registries), follows the registrar's own RDAP referral link
+    once to fill in registrant/privacy-protection fields — best-effort, a
+    failed or missing referral just leaves those fields as "unknown" rather
+    than failing the whole lookup.
     """
     try:
         r = await client.get(f"https://rdap.org/domain/{domain}", timeout=20, follow_redirects=True)
-        if r.status_code == 200:
-            return _parse_rdap(r.json())
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        out = _parse_rdap(data)
+        if out["registrant_name"] is None and out["registrant_org"] is None \
+                and out["privacy_protected"] is None:
+            referral = _rdap_referral_link(data)
+            if referral:
+                try:
+                    r2 = await client.get(referral, timeout=20, follow_redirects=True)
+                    if r2.status_code == 200:
+                        ref = _parse_rdap(r2.json())
+                        for k in ("registrant_name", "registrant_org",
+                                 "privacy_protected", "privacy_provider"):
+                            out[k] = ref[k]
+                        for k in ("registrar", "created", "expires", "last_changed"):
+                            out[k] = out[k] or ref[k]
+                        out["nameservers"] = out["nameservers"] or ref["nameservers"]
+                        out["status"] = out["status"] or ref["status"]
+                except Exception:
+                    pass   # referral hop is best-effort; registry data still returned
+        return out
     except Exception as e:
         log(f"[!] whois/rdap {domain}: {e}")
     return {}

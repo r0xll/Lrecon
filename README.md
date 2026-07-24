@@ -282,10 +282,13 @@ unclaimed-service signature (high confidence) from a takeover-prone CNAME (lead)
 **Cloudflare origin discovery.** When Cloudflare fronts a host, lrecon collects
 origin-IP candidates passively — unproxied in-scope subdomains, SPF `ip4:`/`ip6:`
 literals, MX host IPs, and a Shodan `ssl.cert.subject.CN` search — then (active
-mode only) confirms a candidate by sending it a spoofed `Host` header. A confirmed
-origin is an **origin IP disclosure / WAF-bypass** finding; the report includes a
-baseline CVSS vector and remediation (restrict origin firewall to Cloudflare
-ranges / Authenticated Origin Pulls / cloudflared tunnel).
+mode only) confirms a candidate by sending it a spoofed `Host` header. Every
+candidate IP is enriched with ASN/org (via IPinfo, if configured) so you can
+immediately see whether a leaked origin sits on the client's own infrastructure
+or a third party's. A confirmed origin is an **origin IP disclosure / WAF-bypass**
+finding; the report includes a baseline CVSS vector and remediation (restrict
+origin firewall to Cloudflare ranges / Authenticated Origin Pulls / cloudflared
+tunnel).
 
 ---
 
@@ -364,9 +367,23 @@ structured-JSON successor to WHOIS), queried keylessly over HTTPS through
 system `whois` binary is used or required. This always runs, including
 under `--passive-only`, since it only touches a third-party registry, never
 the target's own infrastructure. A domain expiring within 30 days is flagged
-in the run log as worth raising with the client. Some domains — privacy-
-protected registrants, a few ccTLDs without RDAP support yet — simply won't
-resolve; that's expected, not an error.
+in the run log as worth raising with the client.
+
+**Registrant disclosure & privacy protection.** The registry-level RDAP
+response (what `rdap.org` returns directly) omits registrant data entirely
+for most gTLDs post-GDPR — that's normal, not an error. lrecon follows the
+registrar's own RDAP referral link (present in the registry response) one
+extra hop to get the fuller picture, then reports one of three states per
+domain:
+
+- **Privacy-protected** — a redaction marker or a privacy-service name
+  (WhoisGuard, Withheld for Privacy, Domains By Proxy, etc.) was found; the
+  provider name is shown.
+- **Registrant name/org shown** — real registrant data was disclosed (no
+  redaction marker, no privacy-service pattern).
+- **Unknown** — no registrant entity was returned by either the registry or
+  the registrar referral (common for some ccTLDs); this is *not* the same
+  as "confirmed not privacy-protected," and the report says so explicitly.
 
 ## DNS records & mail infrastructure
 

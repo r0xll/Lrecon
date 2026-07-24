@@ -331,12 +331,96 @@ def test_parse_rdap_extracts_registrar_dates_nameservers_status():
 def test_parse_rdap_handles_missing_fields_gracefully():
     out = intel._parse_rdap({})
     assert out == {"registrar": None, "created": None, "expires": None,
-                   "last_changed": None, "nameservers": [], "status": []}
+                   "last_changed": None, "nameservers": [], "status": [],
+                   "registrant_name": None, "registrant_org": None,
+                   "privacy_protected": None, "privacy_provider": None}
 
 
 def test_rdap_entity_name_returns_none_when_no_fn_field():
     assert intel._rdap_entity_name({"vcardArray": ["vcard", [["version", {}, "text", "4.0"]]]}) is None
     assert intel._rdap_entity_name({}) is None
+
+
+def test_parse_rdap_no_registrant_entity_leaves_privacy_unknown():
+    # thin-registry response (e.g. registry-level .com via Verisign) — no
+    # registrant entity at all, distinct from "confirmed not protected"
+    out = intel._parse_rdap(_EXAMPLE_COM_RDAP)
+    assert out["registrant_name"] is None
+    assert out["privacy_protected"] is None
+
+
+def test_parse_rdap_detects_privacy_via_redacted_conformance_extension():
+    data = {
+        "rdapConformance": ["rdap_level_0", "redacted"],
+        "entities": [{"roles": ["registrant"],
+                     "vcardArray": ["vcard", [["version", {}, "text", "4.0"],
+                                              ["fn", {}, "text", ""],
+                                              ["org", {}, "text",
+                                               "Privacy service provided by Withheld for Privacy ehf"]]]}],
+    }
+    out = intel._parse_rdap(data)
+    assert out["privacy_protected"] is True
+    assert out["privacy_provider"] == "Privacy service provided by Withheld for Privacy ehf"
+
+
+def test_parse_rdap_detects_privacy_via_org_keyword_without_conformance_flag():
+    data = {"entities": [{"roles": ["registrant"],
+                         "vcardArray": ["vcard", [["fn", {}, "text", "Domain Admin"],
+                                                  ["org", {}, "text", "WhoisGuard Protected"]]]}]}
+    out = intel._parse_rdap(data)
+    assert out["privacy_protected"] is True
+    assert out["privacy_provider"] == "WhoisGuard Protected"
+
+
+def test_parse_rdap_real_disclosed_registrant_not_flagged_private():
+    data = {"entities": [{"roles": ["registrant"],
+                         "vcardArray": ["vcard", [["fn", {}, "text", "Jane Doe"],
+                                                  ["org", {}, "text", "Acme Corp"]]]}]}
+    out = intel._parse_rdap(data)
+    assert out["privacy_protected"] is False
+    assert out["registrant_name"] == "Jane Doe"
+    assert out["registrant_org"] == "Acme Corp"
+    assert out["privacy_provider"] is None
+
+
+def test_rdap_referral_link_finds_related_rdap_url():
+    data = {"links": [{"rel": "self", "type": "application/rdap+json", "href": "https://registry/x"},
+                      {"rel": "related", "type": "application/rdap+json", "href": "https://registrar/x"}]}
+    assert intel._rdap_referral_link(data) == "https://registrar/x"
+    assert intel._rdap_referral_link({}) is None
+
+
+async def test_rdap_lookup_follows_registrar_referral_when_registry_has_no_registrant():
+    registry_resp = {**_EXAMPLE_COM_RDAP,
+                     "links": [{"rel": "related", "type": "application/rdap+json",
+                                "href": "https://rdap.registrar.example/domain/x.com"}]}
+    registrar_resp = {
+        "rdapConformance": ["redacted"],
+        "entities": [{"roles": ["registrant"],
+                     "vcardArray": ["vcard", [["fn", {}, "text", ""],
+                                              ["org", {}, "text", "Privacy service"]]]}],
+    }
+    calls = []
+
+    async def fake_get(url, timeout=None, follow_redirects=None):
+        calls.append(url)
+        if "registrar.example" in url:
+            return _FakeResp(200, registrar_resp)
+        return _FakeResp(200, registry_resp)
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await intel.rdap_lookup(client, "x.com")
+    assert len(calls) == 2                                # followed the referral
+    assert out["registrar"] == "RESERVED-IANA"            # kept from the registry response
+    assert out["privacy_protected"] is True                # filled in from the referral
+    assert out["privacy_provider"] == "Privacy service"
+
+
+async def test_rdap_lookup_no_referral_link_skips_second_hop():
+    async def fake_get(url, timeout=None, follow_redirects=None):
+        return _FakeResp(200, _EXAMPLE_COM_RDAP)          # no "links" -> no referral
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await intel.rdap_lookup(client, "example.com")
+    assert out["privacy_protected"] is None
 
 
 def test_domain_expiring_soon():
@@ -689,6 +773,27 @@ async def test_cloudflare_origin_detects_unproxied_leak():
     assert res["detected"] is True
     assert "x.com" in res["fronted"]
     assert "45.79.10.20" in res["candidates"]
+    # no ipinfo token configured -> asn/org present but unresolved
+    assert res["candidates"]["45.79.10.20"]["asn"] is None
+
+
+async def test_cloudflare_origin_enriches_candidates_with_asn_org(monkeypatch):
+    nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
+    hosts = {
+        "x.com":     Host("x.com", ips=["104.16.5.5"]),
+        "dev.x.com": Host("dev.x.com", ips=["45.79.10.20"]),
+    }
+
+    async def fake_get(url, timeout=None):
+        assert "45.79.10.20" in url
+        return _FakeResp(200, {"org": "AS63949 Linode, LLC", "country": "US"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    res = await intel.cloudflare_origin_analysis(
+        client, None, ["x.com"], hosts, {"ipinfo": "fake-token"}, nets,
+        active=False, resolver_ns=None)
+    cand = res["candidates"]["45.79.10.20"]
+    assert cand["asn"] == "AS63949"
+    assert cand["org"] == "Linode, LLC"
 
 
 # --------------------------------------------------------------------------- #

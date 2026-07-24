@@ -66,6 +66,28 @@ def write_live_hosts(hosts, path) -> int:
     return len(urls)
 
 
+def _whois_privacy_cell(w: dict) -> str:
+    pp = w.get("privacy_protected")
+    if pp is True:
+        return "Yes"
+    if pp is False:
+        return "No"
+    return "Unknown (not disclosed by registry)"
+
+
+def _whois_registrant_cell(w: dict) -> str:
+    pp = w.get("privacy_protected")
+    if pp is True:
+        provider = w.get("privacy_provider")
+        return f"Privacy-protected ({provider})" if provider else "Privacy-protected"
+    if pp is False:
+        name, org = w.get("registrant_name"), w.get("registrant_org")
+        if name and org and name != org:
+            return f"{name} ({org})"
+        return name or org or "—"
+    return "—"
+
+
 def write_markdown(hosts, domains, res, path) -> None:
     per_source = res.get("per_source", {})
     cf = res.get("cf", {})
@@ -110,14 +132,17 @@ def write_markdown(hosts, domains, res, path) -> None:
     whois = res.get("whois") or {}
     if whois:
         lines += ["## Domain registration (WHOIS/RDAP)", "",
-                  "| Domain | Registrar | Created | Expires | Status | Nameservers |",
-                  "|---|---|---|---|---|---|"]
+                  "| Domain | Registrar | Registrant | Privacy protected | Created | Expires | Status | Nameservers |",
+                  "|---|---|---|---|---|---|---|---|"]
         for d, w in whois.items():
             status = ", ".join(w.get("status", [])[:3]) or "—"
             ns = ", ".join(w.get("nameservers", [])[:4]) or "—"
-            lines.append(f"| {d} | {w.get('registrar') or '—'} | {w.get('created') or '—'} "
+            lines.append(f"| {d} | {w.get('registrar') or '—'} | {_whois_registrant_cell(w)} "
+                         f"| {_whois_privacy_cell(w)} | {w.get('created') or '—'} "
                          f"| {w.get('expires') or '—'} | {status} | {ns} |")
-        lines.append("")
+        lines += ["", "> \"Unknown\" means the registry-level RDAP response (and its registrar "
+                  "referral, if any) didn't include a registrant entity at all — common for some "
+                  "ccTLDs — not a confirmed absence of privacy protection.", ""]
 
     dns_records = res.get("dns") or {}
     if dns_records:
@@ -162,10 +187,14 @@ def write_markdown(hosts, domains, res, path) -> None:
                   f"Cloudflare fronts {len(cf['fronted'])} in-scope host(s). "
                   f"Origin IPs reachable outside Cloudflare let an attacker bypass "
                   f"the WAF/DDoS layer entirely (origin IP disclosure).", ""]
+        def _asn_org(v: dict) -> str:
+            return " ".join(x for x in (v.get("asn"), v.get("org")) if x) or "unknown"
+
         if conf:
             lines += ["**Confirmed origin candidates** (responded to spoofed Host header):", ""]
             for ip, v in conf.items():
-                lines.append(f"- `{ip}` — {v['evidence']} — sources: {', '.join(v['sources'])}")
+                lines.append(f"- `{ip}` ({_asn_org(v)}) — {v['evidence']} — "
+                             f"sources: {', '.join(v['sources'])}")
             lines += ["",
                       "> Finding: Origin IP disclosure enabling WAF bypass. "
                       "CVSS 3.1 AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N (5.3, Medium) baseline — "
@@ -175,7 +204,7 @@ def write_markdown(hosts, domains, res, path) -> None:
         if unconf:
             lines += ["**Unconfirmed candidate IPs** (found passively, not verified):", ""]
             for ip, v in unconf.items():
-                lines.append(f"- `{ip}` — sources: {', '.join(v['sources'])}")
+                lines.append(f"- `{ip}` ({_asn_org(v)}) — sources: {', '.join(v['sources'])}")
             lines.append("")
 
     diff = res.get("diff") or {}
@@ -376,13 +405,19 @@ def write_html(hosts, domains, res, path) -> None:
     # ---- Domain registration (WHOIS/RDAP) ----
     if whois:
         rows = "".join(
-            f"<tr><td>{esc(d)}</td><td>{esc(w.get('registrar'))}</td><td>{esc(w.get('created'))}</td>"
+            f"<tr><td>{esc(d)}</td><td>{esc(w.get('registrar'))}</td>"
+            f"<td>{esc(_whois_registrant_cell(w))}</td><td>{esc(_whois_privacy_cell(w))}</td>"
+            f"<td>{esc(w.get('created'))}</td>"
             f"<td>{esc(w.get('expires'))}</td><td>{esc(', '.join(w.get('status', [])[:3]))}</td>"
             f"<td>{esc(', '.join(w.get('nameservers', [])[:4]))}</td></tr>"
             for d, w in whois.items())
         body = (f'{_html_export_button("t-whois", "whois.csv")}'
-                f'<table id="t-whois"><tr><th>Domain</th><th>Registrar</th><th>Created</th>'
-                f'<th>Expires</th><th>Status</th><th>Nameservers</th></tr>{rows}</table>')
+                f'<table id="t-whois"><tr><th>Domain</th><th>Registrar</th><th>Registrant</th>'
+                f'<th>Privacy protected</th><th>Created</th>'
+                f'<th>Expires</th><th>Status</th><th>Nameservers</th></tr>{rows}</table>'
+                f'<p class="note">"Unknown" means the registry-level RDAP response (and its '
+                f'registrar referral, if any) didn\'t include a registrant entity at all — '
+                f'common for some ccTLDs — not a confirmed absence of privacy protection.</p>')
         sections.append(_html_section("whois", "Domain registration (WHOIS/RDAP)", len(whois), body))
 
     # ---- DNS records ----
@@ -431,18 +466,25 @@ def write_html(hosts, domains, res, path) -> None:
     if cf.get("detected"):
         conf = {ip: v for ip, v in cf["candidates"].items() if v["confirmed"]}
         unconf = {ip: v for ip, v in cf["candidates"].items() if not v["confirmed"]}
+
+        def _asn_org_html(v: dict) -> str:
+            return esc(" ".join(x for x in (v.get("asn"), v.get("org")) if x) or "unknown")
+
         body = (f'<p>Cloudflare fronts {len(cf["fronted"])} in-scope host(s). Origin IPs reachable '
                 f'outside Cloudflare let an attacker bypass the WAF/DDoS layer entirely.</p>')
         if conf:
-            rows = "".join(f'<tr><td><code>{esc(ip)}</code></td><td>{esc(v["evidence"])}</td>'
+            rows = "".join(f'<tr><td><code>{esc(ip)}</code></td><td>{_asn_org_html(v)}</td>'
+                          f'<td>{esc(v["evidence"])}</td>'
                           f'<td>{esc(", ".join(v["sources"]))}</td></tr>' for ip, v in conf.items())
             body += (f'<p><b>Confirmed origin candidates</b> (responded to spoofed Host header):</p>'
-                     f'<table id="t-cforigin"><tr><th>IP</th><th>Evidence</th><th>Sources</th></tr>{rows}</table>')
+                     f'<table id="t-cforigin"><tr><th>IP</th><th>ASN/Org</th><th>Evidence</th>'
+                     f'<th>Sources</th></tr>{rows}</table>')
         if unconf:
-            rows = "".join(f'<tr><td><code>{esc(ip)}</code></td><td>{esc(", ".join(v["sources"]))}</td></tr>'
+            rows = "".join(f'<tr><td><code>{esc(ip)}</code></td><td>{_asn_org_html(v)}</td>'
+                          f'<td>{esc(", ".join(v["sources"]))}</td></tr>'
                           for ip, v in unconf.items())
             body += (f'<p><b>Unconfirmed candidate IPs</b> (found passively, not verified):</p>'
-                     f'<table><tr><th>IP</th><th>Sources</th></tr>{rows}</table>')
+                     f'<table><tr><th>IP</th><th>ASN/Org</th><th>Sources</th></tr>{rows}</table>')
         sections.append(_html_section("cforigin", "Cloudflare origin exposure",
                                       len(cf["candidates"]), body))
 
