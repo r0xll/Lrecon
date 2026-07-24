@@ -93,7 +93,8 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 
 Sources are keyless except **Shodan** and **subfinder**. Shodan/InternetDB only
 hold data for IPs they have already indexed, so they are often empty — that is
-expected. IPinfo fills ASN/org/rDNS regardless.
+expected. IPinfo fills ASN/org/rDNS regardless of whether a token is
+configured — keyless requests just hit a lower, unauthenticated rate limit.
 
 ---
 
@@ -134,7 +135,7 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 | Service | Purpose | Flag | Env | Free tier |
 |---|---|---|---|---|
 | Shodan | ports/CVE enrichment, passive DNS, cert search | `--shodan-key` | `SHODAN_API_KEY` | limited |
-| IPinfo | ASN / org / reverse-DNS / geo | `--ipinfo-key` | `IPINFO_TOKEN` | 50k/mo |
+| IPinfo | ASN / org / reverse-DNS / geo | `--ipinfo-key` | `IPINFO_TOKEN` | 50k/mo keyed; keyless also works at a lower, unauthenticated rate limit |
 | GitHub | code dorking for leaked secrets/hostnames; also company email harvest (see [People OSINT](#people-osint-user-enumeration)) | — | `GITHUB_TOKEN` | free |
 | HIBP | breach-by-domain (keyless list endpoint) | — | `HIBP_API_KEY` | keyless list |
 | Hunter.io | company email enumeration + naming-pattern detection | `--hunter-key` | `HUNTER_API_KEY` | limited |
@@ -163,7 +164,7 @@ later in the run:
 
 ```
 [+] Shodan API: Ready — query credits: 100
-[!] IPinfo API: Invalid — falling back to keyless (ASN/org/rDNS disabled)
+[!] IPinfo API: Invalid — falling back to keyless (lower rate limit, ASN/org/rDNS still enriched)
 [+] GitHub API: Ready (as octocat)
 [!] Hunter.io API: Invalid — company email OSINT via Hunter disabled
 ```

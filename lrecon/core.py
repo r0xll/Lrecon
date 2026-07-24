@@ -65,7 +65,8 @@ async def verify_keys(client, keys: dict) -> None:
             if r.status_code == 200 and "error" not in body:
                 log("[+] IPinfo API: Ready")
             elif r.status_code in (401, 403) or "error" in body:
-                log("[!] IPinfo API: Invalid — falling back to keyless (ASN/org/rDNS disabled)")
+                log("[!] IPinfo API: Invalid — falling back to keyless (lower rate limit, "
+                    "ASN/org/rDNS still enriched)")
                 keys["ipinfo"] = None
             else:
                 log(f"[!] IPinfo API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
@@ -209,14 +210,17 @@ async def run(domains, args, keys) -> list:
         unique_ips = list(ip_to_hosts)
         if unique_ips:
             ports_src = "shodan" if shodan_key else "internetdb"
-            layers = ["ports/CVE:" + ports_src] + (["ipinfo"] if ipinfo_token else [])
+            # IPinfo's /json endpoint works keylessly (lower, unauthenticated
+            # rate limit) — always attempt it rather than skipping ASN/org/
+            # rDNS enrichment outright just because no token is configured.
+            layers = ["ports/CVE:" + ports_src, "ipinfo" + ("" if ipinfo_token else " (keyless)")]
             enrich_sem = asyncio.Semaphore(args.concurrency)
 
             async def enrich_ip(ip):
                 async with enrich_sem:
                     ports_data = (await enrich_shodan_host(client, ip, shodan_key, shodan_limiter)
                                   if shodan_key else await enrich_internetdb(client, ip))
-                    info = await enrich_ipinfo(client, ip, ipinfo_token) if ipinfo_token else {}
+                    info = await enrich_ipinfo(client, ip, ipinfo_token)
                 return ip, ports_data, info
             results = await _gather_with_progress(
                 (enrich_ip(ip) for ip in unique_ips),

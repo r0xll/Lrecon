@@ -133,9 +133,10 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
     # 5. ASN/org enrichment for each candidate IP — reuses the same IPinfo
     # enrichment path as in-scope hosts, so a client can immediately see
     # who actually hosts a leaked origin (own datacenter vs. a cloud
-    # provider vs. another org's shared infrastructure).
+    # provider vs. another org's shared infrastructure). IPinfo's /json
+    # endpoint works keylessly, so this runs even without a token.
     ipinfo_token = keys.get("ipinfo")
-    if ipinfo_token and cands:
+    if cands:
         for ip in list(cands):
             info = await enrich_ipinfo(client, ip, ipinfo_token)
             org = info.get("org")           # e.g. "AS15169 Google LLC"
@@ -291,7 +292,7 @@ async def mail_infra_lookup(client, mx_records: list, ipinfo_token: str | None, 
                 entry["ips"] = sorted(str(r) for r in await res.resolve(host, "A"))
             except Exception:
                 pass
-        if entry["ips"] and ipinfo_token:
+        if entry["ips"]:
             info = await enrich_ipinfo(client, entry["ips"][0], ipinfo_token)
             org = info.get("org")           # e.g. "AS15169 Google LLC"
             if org:
