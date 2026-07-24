@@ -1,5 +1,6 @@
 """Unit tests for LRecon pure-logic and backend parsers (no network required)."""
 import argparse
+import asyncio
 import csv
 import ipaddress
 import sys
@@ -1130,14 +1131,135 @@ async def test_httpx_parse(monkeypatch):
 
 async def test_nuclei_parse(monkeypatch):
     monkeypatch.setattr(backends, "have", lambda t: True)
-    async def fake_run(cmd, stdin=None, timeout=1800):
+    async def fake_run_nuclei(cmd, stdin=None, timeout=1800):
         return ('{"host":"x.com","template-id":"t","matched-at":"https://x.com",'
                 '"info":{"name":"Bug","severity":"high",'
                 '"classification":{"cve-id":["CVE-2026-1"]}}}')
-    monkeypatch.setattr(backends, "_run", fake_run)
+    monkeypatch.setattr(backends, "_run_nuclei", fake_run_nuclei)
     res = await backends.nuclei_scan(["https://x.com"])
     assert res[0]["severity"] == "high"
     assert res[0]["cve"] == ["CVE-2026-1"]
+
+
+def test_looks_like_nuclei_finding_requires_both_fields():
+    assert backends._looks_like_nuclei_finding(
+        '{"template-id":"t","matched-at":"https://x.com"}') is True
+    # a -stats status line: valid JSON, but not a finding
+    assert backends._looks_like_nuclei_finding(
+        '{"duration":"5s","hosts":3,"requests":120,"rps":24}') is False
+    assert backends._looks_like_nuclei_finding("not json at all") is False
+    assert backends._looks_like_nuclei_finding('{"template-id":"t"}') is False   # missing matched-at
+
+
+class _FakeStreamReader:
+    """Async-iterable fake for asyncio.StreamReader — yields pre-canned
+    byte lines then raises StopAsyncIteration, matching `async for line in
+    reader` usage."""
+    def __init__(self, lines):
+        self._lines = [l if isinstance(l, bytes) else l.encode() for l in lines]
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._lines:
+            raise StopAsyncIteration
+        return self._lines.pop(0)
+
+
+class _FakeStreamWriter:
+    def __init__(self):
+        self.written = b""
+        self.closed = False
+
+    def write(self, data):
+        self.written += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeNucleiProc:
+    def __init__(self, stdout_lines, stderr_lines):
+        self.stdin = _FakeStreamWriter()
+        self.stdout = _FakeStreamReader(stdout_lines)
+        self.stderr = _FakeStreamReader(stderr_lines)
+        self.returncode = 0
+        self.killed = False
+
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+async def test_run_nuclei_separates_findings_from_progress_and_streams_stderr(monkeypatch):
+    stdout_lines = [
+        '{"duration":"5s","hosts":3,"matched":0,"requests":120,"rps":24}\n',   # stats line
+        '{"host":"x.com","template-id":"t1","matched-at":"https://x.com",'
+        '"info":{"severity":"high"}}\n',
+        "\n",                                                                  # blank -> skipped
+    ]
+    stderr_lines = ["[INF] some nuclei banner line\n"]
+    fake_proc = _FakeNucleiProc(stdout_lines, stderr_lines)
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return fake_proc
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    logged = []
+    monkeypatch.setattr(backends, "log", lambda msg: logged.append(msg))
+
+    out = await backends._run_nuclei(["nuclei"], stdin=b"https://x.com\n", timeout=30)
+    assert '"template-id":"t1"' in out
+    assert "duration" not in out                       # stats line not returned as a finding
+    assert fake_proc.stdin.written == b"https://x.com\n"
+    assert fake_proc.stdin.closed is True
+    assert any("duration" in m for m in logged)         # stats line logged live
+    assert any("banner" in m for m in logged)           # stderr line logged live
+
+
+async def test_run_nuclei_kills_process_on_timeout(monkeypatch):
+    class _HangingStreamReader:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(10)   # never resolves within the test's timeout budget
+            raise StopAsyncIteration
+
+    class _HangingProc:
+        def __init__(self):
+            self.stdin = _FakeStreamWriter()
+            self.stdout = _HangingStreamReader()
+            self.stderr = _HangingStreamReader()
+            self.returncode = None
+            self.killed = False
+
+        async def wait(self):
+            return 0
+
+        def kill(self):
+            self.killed = True
+            self.returncode = -9
+
+    fake_proc = _HangingProc()
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        return fake_proc
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    logged = []
+    monkeypatch.setattr(backends, "log", lambda msg: logged.append(msg))
+
+    out = await backends._run_nuclei(["nuclei"], stdin=b"x\n", timeout=0.05)
+    assert out == ""
+    assert fake_proc.killed is True
+    assert any("timed out" in m for m in logged)
 
 
 async def test_naabu_parse(monkeypatch):
