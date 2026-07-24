@@ -79,6 +79,61 @@ def apply_ports(h: Host, data: dict, src: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Tech-stack confirmation — cross-references Shodan/InternetDB-reported CPEs
+# (the basis for h.vulns/h.cpes-derived CVE hits) against the live tech-detect
+# probe (h.tech, Wappalyzer via the ProjectDiscovery httpx backend's -td flag).
+# Shodan/InternetDB data comes from a periodic internet-wide scan that can be
+# weeks old; this flags whether the reported vulnerable software still looks
+# live, cutting down manual CVE triage instead of chasing every stale banner.
+# --------------------------------------------------------------------------- #
+def _cpe_vendor_product(cpe: str) -> tuple:
+    """(vendor, product) from a CPE 2.2 or 2.3 string, lowercased with
+    underscores turned to spaces for loose matching against Wappalyzer-style
+    tech names — e.g. cpe:2.3:a:apache:http_server:2.4.49:... ->
+    ("apache", "http server")."""
+    body = cpe[5:] if cpe.startswith("cpe:/") else cpe.removeprefix("cpe:2.3:")
+    parts = body.split(":")
+
+    def norm(x):
+        return x.replace("_", " ").lower() if x and x not in ("*", "-") else None
+
+    vendor = norm(parts[1]) if len(parts) > 1 else None
+    product = norm(parts[2]) if len(parts) > 2 else None
+    return vendor, product
+
+
+def tech_stack_confirms_cpe(tech: list, cpe: str) -> bool:
+    """True if any live-detected tech entry (e.g. "WordPress:6.4.2") names
+    the same vendor/product as the CPE — i.e. what's actually being served
+    right now still looks like the software the CVE data is about."""
+    vendor, product = _cpe_vendor_product(cpe)
+    needles = [n for n in (vendor, product) if n]
+    if not needles:
+        return False
+    for entry in tech or []:
+        name = entry.split(":", 1)[0].replace("_", " ").lower()
+        if any(needle in name or name in needle for needle in needles):
+            return True
+    return False
+
+
+def confirm_tech_stack(h: Host) -> bool | None:
+    """
+    True  — at least one Shodan/InternetDB-reported CPE matches something
+            live-detected — the CVE-relevant software still looks present.
+    False — CPEs were reported but none matched what's live right now — the
+            banner may be stale, already patched, or the service replaced;
+            worth a second look before spending validation time on it.
+    None  — nothing to compare (no live tech-detect data, or no CPEs
+            reported for this host).
+    """
+    if not h.tech or not h.cpes:
+        return None
+    return any(tech_stack_confirms_cpe(h.tech, cpe) for cpe in h.cpes)
+
+
+
+# --------------------------------------------------------------------------- #
 # Favicon hashing (Shodan-compatible mmh3) + pivot
 # --------------------------------------------------------------------------- #
 def _favicon_mmh3(content: bytes) -> int:

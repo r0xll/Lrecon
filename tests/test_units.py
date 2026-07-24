@@ -57,6 +57,56 @@ def test_apply_ports_merges_and_tags_source():
 
 
 # --------------------------------------------------------------------------- #
+# Tech-stack confirmation (live probe vs. Shodan/InternetDB CPEs)
+# --------------------------------------------------------------------------- #
+def test_cpe_vendor_product_extracts_from_cpe23():
+    assert enrich._cpe_vendor_product("cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*") == \
+        ("apache", "http server")
+
+
+def test_cpe_vendor_product_extracts_from_cpe22():
+    assert enrich._cpe_vendor_product("cpe:/a:wordpress:wordpress:6.4.2") == \
+        ("wordpress", "wordpress")
+
+
+def test_cpe_vendor_product_handles_wildcards_and_short_strings():
+    assert enrich._cpe_vendor_product("cpe:2.3:a:*:*:*:*:*:*:*:*:*:*") == (None, None)
+    assert enrich._cpe_vendor_product("cpe:2.3:a") == (None, None)
+
+
+def test_tech_stack_confirms_cpe_matches_product_name():
+    assert enrich.tech_stack_confirms_cpe(["WordPress:6.4.2"],
+                                          "cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*") is True
+    assert enrich.tech_stack_confirms_cpe(["nginx"],
+                                          "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*") is False
+
+
+def test_tech_stack_confirms_cpe_matches_underscore_normalized_product():
+    # "http_server" (CPE) vs "Apache" (live tech) — vendor match via substring
+    assert enrich.tech_stack_confirms_cpe(["Apache:2.4.49"],
+                                          "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*") is True
+
+
+def test_tech_stack_confirms_cpe_false_when_no_tech_data():
+    assert enrich.tech_stack_confirms_cpe([], "cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*") is False
+
+
+def test_confirm_tech_stack_true_when_a_cpe_matches():
+    h = Host("a.x.com", cpes=["cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"], tech=["Apache:2.4.49"])
+    assert enrich.confirm_tech_stack(h) is True
+
+
+def test_confirm_tech_stack_false_when_no_cpe_matches():
+    h = Host("a.x.com", cpes=["cpe:2.3:a:apache:http_server:2.4.49:*:*:*:*:*:*:*"], tech=["nginx"])
+    assert enrich.confirm_tech_stack(h) is False
+
+
+def test_confirm_tech_stack_none_when_no_live_tech_or_no_cpes():
+    assert enrich.confirm_tech_stack(Host("a.x.com", cpes=["cpe:2.3:a:x:y:1:*"], tech=[])) is None
+    assert enrich.confirm_tech_stack(Host("a.x.com", cpes=[], tech=["nginx"])) is None
+
+
+# --------------------------------------------------------------------------- #
 # Passive enum: crt.sh retry/backoff hardening
 # --------------------------------------------------------------------------- #
 class _FakeResp:
@@ -689,6 +739,19 @@ def test_summarize_entry_points_includes_nvd_only_cves():
     assert "CVE-2026-9999" in eps[0]["summary"]
 
 
+def test_summarize_entry_points_notes_tech_confirmed_status():
+    cf = {"detected": False, "candidates": {}}
+    confirmed = Host("a.x.com", vulns=["CVE-2026-1"], tech_confirmed=True)
+    unconfirmed = Host("b.x.com", vulns=["CVE-2026-2"], tech_confirmed=False)
+    unknown = Host("c.x.com", vulns=["CVE-2026-3"], tech_confirmed=None)
+    eps = intel.summarize_entry_points([confirmed, unconfirmed, unknown], cf, [], {}, [], [])
+    by_target = {e["target"]: e["summary"] for e in eps}
+    assert "[tech-stack confirmed live]" in by_target["a.x.com"]
+    assert "[unconfirmed" in by_target["b.x.com"]
+    assert "[tech-stack confirmed live]" not in by_target["c.x.com"]
+    assert "[unconfirmed" not in by_target["c.x.com"]
+
+
 def test_summarize_entry_points_merges_vulns_and_nvd_by_max_cvss():
     h = Host("legacy.x.com", vulns=["CVE-2026-1"],
              nvd_cves=[{"id": "CVE-2026-1", "cvss": 5.0}, {"id": "CVE-2026-2", "cvss": 8.5}])
@@ -955,6 +1018,37 @@ def test_write_html_renders_sections_only_when_data_present():
     # sections with no data still absent
     assert 'id="nuclei"' not in content
     assert 'id="people"' not in content
+
+
+def test_write_html_cve_section_shows_tech_confirmed_badge():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"], vulns=["CVE-2026-1"], tech_confirmed=True),
+             Host("b.x.com", ips=["5.6.7.8"], vulns=["CVE-2026-2"], tech_confirmed=False)]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "TECH-CONFIRMED" in content
+    assert "UNCONFIRMED" in content
+    assert "CVE-2026-1" in content and "CVE-2026-2" in content
+
+
+def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():
+    # core.py always populates one whois entry per domain, even on a total
+    # RDAP lookup failure (unsupported TLD, network issue, domain not
+    # found) — the section must still render that domain's row rather than
+    # vanishing entirely just because every field came back empty.
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = {"whois": {"x.com": {"registrar": None, "created": None, "expires": None,
+                               "last_changed": None, "nameservers": [], "status": [],
+                               "registrant_name": None, "registrant_org": None,
+                               "privacy_protected": None, "privacy_provider": None}}}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert 'id="whois"' in content
+    assert "x.com" in content
+    assert "Unknown" in content
 
 
 def test_write_html_export_buttons_reference_a_table_id_that_exists():

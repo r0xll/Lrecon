@@ -290,6 +290,20 @@ finding; the report includes a baseline CVSS vector and remediation (restrict
 origin firewall to Cloudflare ranges / Authenticated Origin Pulls / cloudflared
 tunnel).
 
+**Tech-stack confirmation for CVE hits.** Shodan/InternetDB CVE data comes
+from a periodic internet-wide scan that can be weeks old. Where a live
+tech-detect probe is available (ProjectDiscovery `httpx -td`, Wappalyzer-based —
+see [Optional backends](#optional-backends-projectdiscovery--psql)), lrecon
+cross-references each host's reported CPEs against what's actually being
+served right now and marks the CVE hit **tech-confirmed** (still corroborated)
+or **unconfirmed** (no live match — banner may be stale, or the software's
+been patched/replaced) in both the CVE hits table and the entry-points
+summary. Triage tech-confirmed hosts first to cut down manual validation
+work. Without the `httpx` binary installed, lrecon falls back to reading
+just the `Server`/`X-Powered-By` headers — no Wappalyzer fingerprinting — so
+confirmation stays unavailable (`None`, shown as `—`) until it's installed;
+run `lrecon --check-backends` to confirm it's on PATH.
+
 ---
 
 ## People OSINT (user enumeration)
@@ -368,6 +382,11 @@ system `whois` binary is used or required. This always runs, including
 under `--passive-only`, since it only touches a third-party registry, never
 the target's own infrastructure. A domain expiring within 30 days is flagged
 in the run log as worth raising with the client.
+
+Every in-scope domain gets a row in the report's "Domain registration
+(WHOIS/RDAP)" section, even if the lookup itself came back empty
+(unsupported TLD, typo, transient failure) — check the run log for a
+`whois/rdap` line when a domain shows all `—`.
 
 **Registrant disclosure & privacy protection.** The registry-level RDAP
 response (what `rdap.org` returns directly) omits registrant data entirely
