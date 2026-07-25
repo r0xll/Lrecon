@@ -522,6 +522,253 @@ async def test_rdap_lookup_no_referral_link_skips_second_hop():
     assert out["privacy_protected"] is None
 
 
+# --------------------------------------------------------------------------- #
+# Classic WHOIS (port 43) fallback — for TLDs with no RDAP service at all
+# --------------------------------------------------------------------------- #
+class _FakeWhoisReader:
+    """Fake asyncio StreamReader — serves canned bytes, naturally exhausting
+    (returns b"") once consumed, so both .read(-1) (whole buffer) and
+    chunked .read(n) call patterns terminate correctly."""
+    def __init__(self, data: bytes):
+        self._data = data
+        self._pos = 0
+
+    async def read(self, n=-1):
+        if self._pos >= len(self._data):
+            return b""
+        end = len(self._data) if n == -1 else self._pos + n
+        chunk = self._data[self._pos:end]
+        self._pos = end
+        return chunk
+
+
+class _FakeWhoisWriter:
+    def __init__(self):
+        self.written = b""
+        self.closed = False
+
+    def write(self, data):
+        self.written += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+_REAL_IO_WHOIS_SAMPLE = """Domain Name: nic.io
+Registry Domain ID: REDACTED
+Registrar WHOIS Server: whois.identitydigital.services
+Registrar URL: https://identity.digital
+Updated Date: 2024-09-23T15:51:12Z
+Creation Date: 2003-09-15T11:13:53Z
+Registry Expiry Date: 2027-05-01T00:00:02Z
+Registrar: Registry Operator acts as Registrar (9999)
+Registrar IANA ID: 9999
+Registrar Abuse Contact Email: abuse@identity.digital
+Registrar Abuse Contact Phone: +1.6664447777
+Domain Status: serverDeleteProhibited
+Domain Status: serverTransferProhibited
+Domain Status: serverUpdateProhibited
+Name Server: NS1.EXAMPLE.COM
+Name Server: NS2.EXAMPLE.COM
+"""
+
+_RIPE_STYLE_WHOIS_SAMPLE = """% This is a RIPE-style whois server.
+domain: example.fr
+status: active
+registrar: Example Registrar SAS
+Expiry Date: 2027-03-01T00:00:00Z
+created: 2015-03-01T00:00:00Z
+last-update: 2025-01-01T00:00:00Z
+nserver: ns1.example.fr
+nserver: ns2.example.fr
+Registrant Organization: REDACTED FOR PRIVACY
+Registrant Name: REDACTED FOR PRIVACY
+"""
+
+
+def test_parse_whois43_extracts_real_captured_io_registry_format():
+    # captured from a real .io registry WHOIS response — regression-guards
+    # against "Registrar WHOIS Server:"/"Registrar Abuse..."/etc. false-
+    # matching the "registrar:" pattern (re.match anchors at line start,
+    # so only a line literally starting with "Registrar:" matches).
+    out = intel._parse_whois43(_REAL_IO_WHOIS_SAMPLE)
+    assert out["registrar"] == "Registry Operator acts as Registrar (9999)"
+    assert out["created"] == "2003-09-15T11:13:53Z"
+    assert out["expires"] == "2027-05-01T00:00:02Z"
+    assert out["last_changed"] == "2024-09-23T15:51:12Z"
+    assert out["nameservers"] == ["ns1.example.com", "ns2.example.com"]
+    assert out["status"] == ["serverDeleteProhibited", "serverTransferProhibited",
+                             "serverUpdateProhibited"]
+
+
+def test_parse_whois43_ripe_style_lowercase_labels_and_privacy_redaction():
+    out = intel._parse_whois43(_RIPE_STYLE_WHOIS_SAMPLE)
+    assert out["registrar"] == "Example Registrar SAS"
+    assert out["created"] == "2015-03-01T00:00:00Z"
+    assert out["expires"] == "2027-03-01T00:00:00Z"
+    assert out["last_changed"] == "2025-01-01T00:00:00Z"
+    assert out["nameservers"] == ["ns1.example.fr", "ns2.example.fr"]
+    assert out["privacy_protected"] is True
+    assert out["registrant_org"] == "REDACTED FOR PRIVACY"
+
+
+def test_parse_whois43_empty_text_returns_default_shape():
+    assert intel._parse_whois43("") == intel.empty_whois_entry()
+    assert intel._parse_whois43(None) == intel.empty_whois_entry()
+
+
+async def test_iana_whois_referral_extracts_server(monkeypatch):
+    reader = _FakeWhoisReader(b"whois: whois.identitydigital.services\r\nstatus: active\r\n")
+    writer = _FakeWhoisWriter()
+
+    async def fake_open_connection(host, port):
+        assert host == "whois.iana.org" and port == 43
+        return reader, writer
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+
+    server = await intel._iana_whois_referral("io")
+    assert server == "whois.identitydigital.services"
+    assert writer.written == b"io\r\n"
+    assert writer.closed is True
+
+
+async def test_iana_whois_referral_returns_none_when_no_whois_line(monkeypatch):
+    async def fake_open_connection(host, port):
+        return _FakeWhoisReader(b"status: legacy\r\n"), _FakeWhoisWriter()
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+    assert await intel._iana_whois_referral("zz") is None
+
+
+async def test_iana_whois_referral_returns_none_on_connection_failure(monkeypatch):
+    async def fake_open_connection(host, port):
+        raise OSError("network unreachable")
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+    assert await intel._iana_whois_referral("io") is None
+
+
+async def test_whois43_query_sends_domain_and_accumulates_chunks(monkeypatch):
+    reader = _FakeWhoisReader(b"Domain Name: X.IO\r\nRegistrar: Test\r\n")
+    writer = _FakeWhoisWriter()
+
+    async def fake_open_connection(host, port):
+        assert host == "whois.example.io" and port == 43
+        return reader, writer
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+
+    text = await intel._whois43_query("whois.example.io", "x.io")
+    assert "Registrar: Test" in text
+    assert writer.written == b"x.io\r\n"
+    assert writer.closed is True
+
+
+async def test_whois43_query_returns_none_on_failure(monkeypatch):
+    async def fake_open_connection(host, port):
+        raise OSError("connection refused")
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+    assert await intel._whois43_query("whois.example.io", "x.io") is None
+
+
+async def test_whois43_lookup_full_flow(monkeypatch):
+    async def fake_referral(tld):
+        assert tld == "io"
+        return "whois.identitydigital.services"
+
+    async def fake_query(server, domain):
+        assert server == "whois.identitydigital.services" and domain == "x.io"
+        return "Registrar: Test Registrar\r\nCreation Date: 2020-01-01T00:00:00Z\r\n"
+    monkeypatch.setattr(intel, "_iana_whois_referral", fake_referral)
+    monkeypatch.setattr(intel, "_whois43_query", fake_query)
+
+    out = await intel.whois43_lookup("x.io")
+    assert out["registrar"] == "Test Registrar"
+
+
+async def test_whois43_lookup_empty_when_no_referral(monkeypatch):
+    async def fake_referral(tld):
+        return None
+    monkeypatch.setattr(intel, "_iana_whois_referral", fake_referral)
+    assert await intel.whois43_lookup("x.zz") == {}
+
+
+async def test_whois43_lookup_empty_when_nothing_useful_parsed(monkeypatch):
+    async def fake_referral(tld):
+        return "whois.example"
+
+    async def fake_query(server, domain):
+        return "% no useful data here\r\n"
+    monkeypatch.setattr(intel, "_iana_whois_referral", fake_referral)
+    monkeypatch.setattr(intel, "_whois43_query", fake_query)
+    assert await intel.whois43_lookup("x.zz") == {}
+
+
+async def test_whois_lookup_uses_rdap_only_when_registrar_present(monkeypatch):
+    async def fake_rdap(client, domain):
+        return {**intel.empty_whois_entry(), "registrar": "RDAP Registrar"}
+    called = []
+
+    async def fake_whois43(domain):
+        called.append(domain)
+        return {}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    out = await intel.whois_lookup(None, "x.com")
+    assert out["registrar"] == "RDAP Registrar"
+    assert out["source"] == "rdap"
+    assert called == []                      # whois43 not needed, never called
+
+
+async def test_whois_lookup_falls_back_to_whois43_when_rdap_empty(monkeypatch):
+    async def fake_rdap(client, domain):
+        return {}
+
+    async def fake_whois43(domain):
+        return {**intel.empty_whois_entry(), "registrar": "WHOIS43 Registrar"}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    out = await intel.whois_lookup(None, "x.io")
+    assert out["registrar"] == "WHOIS43 Registrar"
+    assert out["source"] == "whois43"
+
+
+async def test_whois_lookup_merges_rdap_and_whois43_preferring_rdap_values(monkeypatch):
+    # RDAP has dates/nameservers but no registrar; whois43 fills registrar
+    # only — RDAP's existing values must not be clobbered by whois43's.
+    async def fake_rdap(client, domain):
+        return {**intel.empty_whois_entry(), "created": "2020-01-01T00:00:00Z",
+               "nameservers": ["ns1.x.com"]}
+
+    async def fake_whois43(domain):
+        return {**intel.empty_whois_entry(), "registrar": "WHOIS43 Registrar",
+               "created": "SHOULD-NOT-OVERRIDE-RDAP"}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    out = await intel.whois_lookup(None, "x.com")
+    assert out["registrar"] == "WHOIS43 Registrar"
+    assert out["created"] == "2020-01-01T00:00:00Z"
+    assert out["nameservers"] == ["ns1.x.com"]
+    assert out["source"] == "rdap+whois43"
+
+
+async def test_whois_lookup_empty_entry_with_none_source_when_both_fail(monkeypatch):
+    async def fake_rdap(client, domain):
+        return {}
+
+    async def fake_whois43(domain):
+        return {}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    out = await intel.whois_lookup(None, "x.zz")
+    assert out["registrar"] is None
+    assert out["source"] is None
+
+
 def test_domain_expiring_soon():
     from datetime import datetime, timezone, timedelta
     soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
@@ -1508,6 +1755,52 @@ def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():
     assert 'id="whois"' in content
     assert "x.com" in content
     assert "Unknown" in content
+
+
+def test_write_html_whois_shows_source_and_vt_mirror_cross_reference():
+    hosts = [Host("a.io", ips=["1.2.3.4"])]
+    res = {
+        "whois": {"x.io": {**intel.empty_whois_entry(), "registrar": "WHOIS43 Registrar",
+                           "source": "whois43"}},
+        "vt": {"x.io": {"whois": "Domain Name: X.IO\nRegistrar: WHOIS43 Registrar\n"}},
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.io"], res, str(path))
+        content = path.read_text()
+    assert "WHOIS (port 43)" in content
+
+
+def test_write_html_whois_omits_vt_mirror_when_registrar_already_found():
+    # VT's raw text is only surfaced as a cross-reference when the
+    # structured lookup came up empty — not shown otherwise, to avoid
+    # dumping an unparsed wall of text when it isn't needed.
+    hosts = [Host("a.com", ips=["1.2.3.4"])]
+    res = {
+        "whois": {"x.com": {**intel.empty_whois_entry(), "registrar": "MarkMonitor Inc.",
+                            "source": "rdap"}},
+        "vt": {"x.com": {"whois": "Domain Name: X.COM\nRegistrar: MarkMonitor Inc.\n"}},
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert "VirusTotal WHOIS mirror" not in content
+    assert "RDAP</td>" in content
+
+
+def test_write_markdown_whois_shows_source_and_vt_mirror_cross_reference():
+    hosts = [Host("a.io", ips=["1.2.3.4"])]
+    res = {
+        "whois": {"x.io": {**intel.empty_whois_entry(), "source": None}},
+        "vt": {"x.io": {"whois": "Domain Name: X.IO\nRegistrar: Some Registrar\n"}},
+    }
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown(hosts, ["x.io"], res, str(path))
+        content = path.read_text()
+    assert "VirusTotal WHOIS mirror" in content
+    assert "Some Registrar" in content
 
 
 def test_write_html_export_buttons_reference_a_table_id_that_exists():

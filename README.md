@@ -84,7 +84,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | Expansion | ASN->netblock (RIPEstat) + reverse-DNS sweep, rDNS wire-back | DNS only |
 | Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
 | DNS records | apex A/AAAA/MX/NS/SOA snapshot + mail infrastructure ID (provider/ASN/org per MX host) | DNS only |
-| WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status (always on) | none (third-party registry) |
+| WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status; falls back to classic WHOIS (port 43) for TLDs with no RDAP service (always on) | none (third-party registry) |
 | People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
 | VirusTotal domain intel | historical IP/hosting resolutions, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
@@ -419,16 +419,36 @@ reporting it, since a Google result can be stale.
 Every run looks up each domain's registration data — registrar, creation/
 expiration dates, nameservers, and status codes — via **RDAP** (the
 structured-JSON successor to WHOIS), queried keylessly over HTTPS through
-`rdap.org`'s public bootstrap redirector to the authoritative registry. No
-system `whois` binary is used or required. This always runs, including
-under `--passive-only`, since it only touches a third-party registry, never
-the target's own infrastructure. A domain expiring within 30 days is flagged
-in the run log as worth raising with the client.
+`rdap.org`'s public bootstrap redirector to the authoritative registry. This
+always runs, including under `--passive-only`, since it only touches
+third-party registries/registrars, never the target's own infrastructure. A
+domain expiring within 30 days is flagged in the run log as worth raising
+with the client.
+
+**No RDAP for a domain's TLD isn't a bug.** Checked against IANA's own
+canonical RDAP bootstrap registry, several very common TLDs simply have no
+RDAP service published at all — **`.io`, `.co`, `.me`**, and others — RDAP
+just doesn't exist for them yet, at any registry. For those, lrecon falls
+back to the **classic WHOIS protocol** (port 43, RFC 3912): a pure-Python
+socket client (no external `whois` binary — the "no system binary" design
+holds) asks `whois.iana.org` which registry WHOIS server is authoritative
+for the TLD, then queries it directly and parses whatever fields it can out
+of the free-text reply (registrar, dates, nameservers, status, registrant
+disclosure). Free-text parsing is necessarily best-effort — format varies
+by registry, unlike RDAP's structured JSON — so treat it as a lead like
+everything else in the pipeline, not a certainty. Each domain's report row
+carries a **Source** column (`RDAP`, `WHOIS (port 43)`, or
+`RDAP + WHOIS (port 43)` when RDAP supplied some fields and WHOIS filled
+the rest) so it's clear which method actually produced the data. If
+`--vt` found VirusTotal's own cached WHOIS text for a domain that neither
+RDAP nor classic WHOIS could get a registrar for, that raw text is shown
+as an unparsed, collapsible cross-reference right in this section — read
+it yourself rather than lrecon guessing at yet another free-text format.
 
 Every in-scope domain gets a row in the report's "Domain registration
-(WHOIS/RDAP)" section, even if the lookup itself came back empty
-(unsupported TLD, typo, transient failure) — check the run log for a
-`whois/rdap` line when a domain shows all `—`.
+(WHOIS/RDAP)" section, even if every lookup came back empty (unsupported
+TLD with no WHOIS referral either, typo, transient failure) — check the
+run log for a `whois/rdap` line when a domain shows all `—`.
 
 **Registrant disclosure & privacy protection.** The registry-level RDAP
 response (what `rdap.org` returns directly) omits registrant data entirely
