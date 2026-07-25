@@ -19,9 +19,12 @@ can act on, not noise.
 lrecon/
   cli.py         argparse + driver          core.py      orchestration (run)
   common.py      log, Host, keys, consts    sources.py   passive enum + DNS
-  enrich.py      ipinfo/shodan/nvd/favicon  intel.py     cloudflare/email/github/buckets/breach
+  enrich.py      ipinfo/shodan/nvd/favicon  intel.py     cloudflare/email/github/buckets/breach/auth-surface
   active.py      http probe + tcp scan      backends.py  ProjectDiscovery wiring
   state.py       cache + diff               report.py    markdown / html / live / screenshots
+  people.py      company email/people OSINT dorking.py   Google CSE dork search
+  llm.py         provider-neutral LLM layer news.py      factual company-intel (SEC EDGAR)
+  dossier.py     dossier assembly + writers
 ```
 
 ## Optional backends (ProjectDiscovery + psql)
@@ -85,6 +88,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
 | DNS records | apex A/AAAA/MX/NS/SOA snapshot + mail infrastructure ID (provider/ASN/org per MX host) | DNS only |
 | WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status; falls back to classic WHOIS (port 43), then to `--vt`'s cached WHOIS text, for TLDs/environments where RDAP has nothing (always on) | none (third-party registry) |
+| Auth surface | passive OIDC/SSO discovery — reads each live host's `/.well-known/openid-configuration` and fingerprints the identity provider (Okta, Entra/Azure AD, Auth0, Ping, ADFS, Google, Keycloak). Discovery only: no login/credential probing (not run under `--passive-only`) | yes (one GET/host) |
 | People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
 | VirusTotal domain intel | historical IP/hosting resolutions, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
@@ -266,7 +270,8 @@ Per run, `<out>.*`:
   toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
   no server, no external JS/CSS, works fully offline from the file.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
-  favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people).
+  favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people,
+  auth_surface).
 - **`<out>.live.txt`** — deduplicated live URLs for tool handoff.
 - **`<out>.origin_ips.txt`** — Cloudflare-origin-candidate IPs (confirmed + unconfirmed),
   one per line, if any were found — direct handoff to `nmap -iL` / `nuclei -l` to scan what
@@ -276,6 +281,8 @@ Per run, `<out>.*`:
   IP per row), each with its own org — no comma-joined multi-value cells.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
   key is configured (see [People OSINT](#people-osint-user-enumeration)).
+- **`<out>.dossier.json` / `<out>.dossier.md`** — the structured target dossier, with the
+  `dossier` / `full-report` subcommands (see [AI-assisted dossier engine](#ai-assisted-dossier-engine-llm-synthesis)).
 - **`<out>_shots/`** — live-host screenshots (with `--screenshots`).
 
 Run snapshots are cached under `~/.local/share/lrecon/` to power `--diff`.
@@ -383,6 +390,86 @@ address accepted too) and marks every result `catch-all` rather than reporting
 false `valid` positives. Many providers (Microsoft 365, Google Workspace, or
 anything blocking port 25 from cloud/datacenter source IPs) will make this come
 back `unknown` for the whole domain — expected, not a bug.
+
+---
+
+## AI-assisted dossier engine (LLM synthesis)
+
+lrecon can synthesize a structured **target dossier** — company profile, tech
+stack, entry points, authentication surface, and passive people OSINT — from the
+data the pipeline already collects, with narrative sections written by an LLM
+backend. Everything the dossier reports is derived from the recon pass; the LLM
+only summarizes collected facts.
+
+### Subcommands
+
+```bash
+# Recon, then emit a dossier (JSON + Markdown) alongside the usual outputs
+lrecon dossier --company "Acme Corp" acme.com
+lrecon full-report --company "Acme Corp" acme.com        # same pipeline
+
+# Passive company-email / people OSINT only (no full recon)
+lrecon enum --company "Acme Corp" acme.com --verify-emails
+
+# Probe the configured LLM backend and exit
+lrecon --check-llm
+```
+
+The default invocation (`lrecon acme.com …`) is unchanged — the subcommands are
+additive.
+
+### Swappable LLM backends
+
+Provider-neutral, spoken over the same httpx client as everything else (no vendor
+SDK is added to the dependency set). One OpenAI-compatible adapter covers OpenAI,
+Ollama, LM Studio, and vLLM; Anthropic and Google have their own adapters.
+Configured via `--llm-provider`/`--llm-model`/`--llm-base-url` or the `llm`
+section of `config.json`:
+
+```json
+{
+  "llm": {
+    "provider": "ollama",
+    "model": "llama3.1",
+    "base_url": "http://127.0.0.1:11434/v1",
+    "temperature": 0.2,
+    "max_tokens": 1024,
+    "per_module": { "news": { "model": "llama3.1", "max_tokens": 512 } },
+    "news": { "sources": ["https://example.com/press.json"] }
+  }
+}
+```
+
+Cloud-provider keys come from `openai_api_key` / `anthropic_api_key` /
+`google_ai_api_key` in `config.json`, or `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` /
+`GOOGLE_AI_API_KEY` in the environment.
+
+**No-exfiltration default.** The default provider is **local** (Ollama on
+`127.0.0.1`); recon data leaves the operator's machine only when a cloud provider
+is explicitly configured, and whenever a cloud provider is active lrecon logs a
+one-line egress notice so it's never silent. If no LLM backend is reachable the
+dossier still writes — with structured findings and empty narrative fields, so
+the JSON stays machine-consumable.
+
+### Factual company intel
+
+The dossier's company-profile section pulls recent public records — **SEC EDGAR**
+full-text search (public, keyless) plus any extra JSON/RSS endpoints the operator
+lists under `llm.news.sources` — and has the LLM condense them into a neutral
+factual summary and event buckets (`m&a`, `exec-change`, `product`,
+`office-move`, `security-incident`, `tech-migration`). Every source is off unless
+reachable/configured.
+
+### Intentionally not built
+
+This is a reconnaissance dossier engine. It does **not** generate phishing or
+social-engineering pretext/lure content (no email bodies, spoofed senders,
+urgency hooks, or impersonation), does **not** score findings for "pretext
+potential," and does **not** perform active credential-oracle account
+enumeration (forgot-password differential, login timing, OAuth-error, or
+O365/Azure user-validation). Those capabilities are out of scope by design; the
+passive people OSINT above and the operator-gated `--verify-emails` SMTP probe
+are the only account-related features.
 
 ---
 

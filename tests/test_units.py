@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import enrich, intel, state, backends, sources, report, people, cli, core, dorking, vt
+from lrecon import (enrich, intel, state, backends, sources, report, people, cli, core,
+                    dorking, vt, llm, news, dossier)
 from lrecon.common import Host, Person, CF_FALLBACK, WEB_PORTS, non_web_ports
 
 
@@ -1994,6 +1995,80 @@ def test_verify_emails_conflicts_with_passive_only(monkeypatch, capsys):
     assert "--verify-emails conflicts with --passive-only" in capsys.readouterr().err
 
 
+def test_cli_no_subcommand_runs_default_recon(monkeypatch):
+    # Back-compat: `lrecon example.com` must still route into the flat recon
+    # flow, unchanged by the subcommand dispatch.
+    called = {}
+
+    def fake_recon(argv=None, emit_dossier=False):
+        called["argv"] = argv
+        called["emit_dossier"] = emit_dossier
+    monkeypatch.setattr(cli, "_recon", fake_recon)
+    monkeypatch.setattr(sys, "argv", ["lrecon", "example.com"])
+    cli.main()
+    assert called["argv"] == ["example.com"]
+    assert called["emit_dossier"] is False
+
+
+def test_cli_dossier_subcommand_sets_emit_flag(monkeypatch):
+    called = {}
+
+    def fake_recon(argv=None, emit_dossier=False):
+        called["argv"] = argv
+        called["emit_dossier"] = emit_dossier
+    monkeypatch.setattr(cli, "_recon", fake_recon)
+    monkeypatch.setattr(sys, "argv", ["lrecon", "dossier", "--company", "Acme", "acme.com"])
+    cli.main()
+    assert called["argv"] == ["--company", "Acme", "acme.com"]
+    assert called["emit_dossier"] is True
+
+
+def test_cli_full_report_subcommand_sets_emit_flag(monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli, "_recon", lambda argv=None, emit_dossier=False: called.update(
+        argv=argv, emit=emit_dossier))
+    monkeypatch.setattr(sys, "argv", ["lrecon", "full-report", "acme.com"])
+    cli.main()
+    assert called["emit"] is True
+
+
+def test_cli_enum_subcommand_dispatches(monkeypatch):
+    called = {}
+    monkeypatch.setattr(cli, "_cmd_enum", lambda argv: called.update(argv=argv))
+    monkeypatch.setattr(sys, "argv", ["lrecon", "enum", "--company", "Acme", "acme.com"])
+    cli.main()
+    assert called["argv"] == ["--company", "Acme", "acme.com"]
+
+
+def test_cli_check_llm_early_returns(monkeypatch, capsys):
+    # --check-llm probes the backend and exits before recon. Stub the probe.
+    async def fake_check(cfg):
+        return {"provider": cfg.provider, "model": cfg.model, "base_url": cfg.base_url,
+                "reachable": False, "note": "stubbed"}
+    monkeypatch.setattr(cli, "_check_llm", fake_check)
+    monkeypatch.setattr(sys, "argv", ["lrecon", "--check-llm", "--config", "/nonexistent"])
+    cli.main()                                          # must not require a domain
+    assert "LLM backend self-check" in capsys.readouterr().err   # log() -> stderr
+
+
+def test_cli_company_alias_and_domain_merge(monkeypatch):
+    # `--company` aliases `--company-name`; `--domain` merges into positional.
+    captured = {}
+
+    def fake_run(domains, args, keys):
+        captured["domains"] = domains
+        captured["company"] = args.company_name
+        raise SystemExit(0)                             # bail before output writing
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(sys, "argv",
+                        ["lrecon", "--company", "Acme Corp", "--domain", "b.com",
+                         "--passive-only", "--config", "/nonexistent", "a.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert set(captured["domains"]) == {"a.com", "b.com"}
+    assert captured["company"] == "Acme Corp"
+
+
 def test_apply_pattern_supports_first_last_f_l_tokens():
     assert people._apply_pattern("{first}.{last}", "Jane", "Doe", "x.com") == "jane.doe@x.com"
     assert people._apply_pattern("{f}{last}", "Jane", "Doe", "x.com") == "jdoe@x.com"
@@ -2252,3 +2327,370 @@ async def test_verify_keys_check_failure_does_not_null_the_key():
             "hunter": None, "rocketreach": None}
     await core.verify_keys(_RaisingClient(), keys)
     assert keys["shodan"] == "sk"
+
+
+# --------------------------------------------------------------------------- #
+# LLM abstraction layer (lrecon/llm.py)
+# --------------------------------------------------------------------------- #
+class _FakeLLMResp:
+    def __init__(self, data, status=200):
+        self._d = data
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        return self._d
+
+
+class _FakeLLMClient:
+    """Records the last POST and replays a canned JSON body. `fail_times`
+    raises before succeeding, to exercise retry/backoff."""
+    def __init__(self, data, fail_times=0):
+        self.data = data
+        self.fail_times = fail_times
+        self.calls = 0
+        self.last = None
+
+    async def post(self, url, headers=None, json=None, timeout=None):
+        self.calls += 1
+        self.last = {"url": url, "headers": headers or {}, "json": json}
+        if self.calls <= self.fail_times:
+            raise ConnectionError("boom")
+        return _FakeLLMResp(self.data)
+
+
+def _no_sleep(monkeypatch):
+    async def _s(*a, **k):
+        return None
+    monkeypatch.setattr(llm.asyncio, "sleep", _s)
+
+
+async def test_llm_openai_compat_shapes_request_and_reads_choice():
+    c = _FakeLLMClient({"choices": [{"message": {"content": " hi there "}}]})
+    cfg = llm.LLMConfig(provider="ollama", model="llama3.1")
+    out = await llm.complete(c, cfg, [{"role": "user", "content": "q"}])
+    assert out == "hi there"
+    assert c.last["url"].endswith("/chat/completions")
+    assert c.last["json"]["model"] == "llama3.1"
+    assert "Authorization" not in c.last["headers"]     # local, no key
+
+
+async def test_llm_openai_compat_sends_bearer_when_keyed():
+    c = _FakeLLMClient({"choices": [{"message": {"content": "x"}}]})
+    cfg = llm.LLMConfig(provider="openai", model="gpt-4o", api_key="sk-abc")
+    await llm.complete(c, cfg, [{"role": "user", "content": "q"}])
+    assert c.last["headers"]["Authorization"] == "Bearer sk-abc"
+
+
+async def test_llm_anthropic_uses_system_field_and_headers():
+    c = _FakeLLMClient({"content": [{"type": "text", "text": "ans"}], "stop_reason": "end_turn"})
+    cfg = llm.LLMConfig(provider="anthropic", model="claude-opus-5", api_key="k")
+    out = await llm.complete(c, cfg, [{"role": "system", "content": "sys"},
+                                      {"role": "user", "content": "hi"}])
+    assert out == "ans"
+    assert c.last["url"].endswith("/messages")
+    assert c.last["headers"]["x-api-key"] == "k"
+    assert c.last["headers"]["anthropic-version"] == "2023-06-01"
+    assert c.last["json"]["system"] == "sys"            # system split out of messages
+    assert all(m["role"] != "system" for m in c.last["json"]["messages"])
+
+
+async def test_llm_google_folds_system_into_first_user_turn():
+    c = _FakeLLMClient({"candidates": [{"content": {"parts": [{"text": "g"}]}}]})
+    cfg = llm.LLMConfig(provider="google", model="gemini-1.5-flash", api_key="gk")
+    out = await llm.complete(c, cfg, [{"role": "system", "content": "SYS"},
+                                      {"role": "user", "content": "hi"}])
+    assert out == "g"
+    assert "generateContent" in c.last["url"] and c.last["url"].endswith("key=gk")
+    assert c.last["json"]["contents"][0]["parts"][0]["text"].startswith("SYS")
+
+
+async def test_llm_unknown_provider_returns_none():
+    cfg = llm.LLMConfig(provider="nope", model="m")
+    assert await llm.complete(_FakeLLMClient({}), cfg, [{"role": "user", "content": "q"}]) is None
+
+
+async def test_llm_retries_then_succeeds(monkeypatch):
+    _no_sleep(monkeypatch)
+    c = _FakeLLMClient({"choices": [{"message": {"content": "ok"}}]}, fail_times=2)
+    cfg = llm.LLMConfig(provider="ollama", model="m")
+    out = await llm.complete(c, cfg, [{"role": "user", "content": "q"}])
+    assert out == "ok"
+    assert c.calls == 3                                 # 2 failures + 1 success
+
+
+async def test_llm_falls_back_to_secondary_provider(monkeypatch):
+    _no_sleep(monkeypatch)
+
+    # Primary always fails; fallback (a different provider) answers. Because
+    # both go through the same fake client, distinguish by the response shape:
+    # the fake returns an OpenAI-style body, which only the compat adapter reads.
+    class _PrimaryFails:
+        def __init__(self):
+            self.calls = 0
+
+        async def post(self, url, headers=None, json=None, timeout=None):
+            self.calls += 1
+            if "/messages" in url:                      # anthropic primary
+                raise ConnectionError("down")
+            return _FakeLLMResp({"choices": [{"message": {"content": "from-fallback"}}]})
+
+    fb = llm.LLMConfig(provider="ollama", model="local")
+    cfg = llm.LLMConfig(provider="anthropic", model="claude-opus-5", api_key="k", fallback=fb)
+    out = await llm.complete(_PrimaryFails(), cfg, [{"role": "user", "content": "q"}])
+    assert out == "from-fallback"
+
+
+def test_llm_config_per_module_overrides():
+    cfg = llm.LLMConfig(provider="ollama", model="base", temperature=0.2, max_tokens=1024,
+                        per_module={"news": {"model": "fast", "max_tokens": 256}})
+    assert cfg.for_module("news") == {"model": "fast", "temperature": 0.2, "max_tokens": 256}
+    assert cfg.for_module("dossier") == {"model": "base", "temperature": 0.2, "max_tokens": 1024}
+    assert cfg.for_module(None)["model"] == "base"
+
+
+def test_llm_config_is_cloud_flag():
+    assert llm.LLMConfig(provider="ollama").is_cloud is False
+    assert llm.LLMConfig(provider="lmstudio").is_cloud is False
+    assert llm.LLMConfig(provider="anthropic").is_cloud is True
+    assert llm.LLMConfig(provider="openai").is_cloud is True
+
+
+def test_llm_config_from_keys_selects_provider_key():
+    keys = {"llm": {"provider": "anthropic", "model": "claude-opus-5"},
+            "openai": "o", "anthropic": "a", "google_ai": "g"}
+    cfg = llm.config_from_keys(keys)
+    assert cfg.provider == "anthropic" and cfg.api_key == "a"
+    # default when nothing configured -> local ollama, no key
+    cfg2 = llm.config_from_keys({"llm": None})
+    assert cfg2.provider == "ollama" and cfg2.api_key is None
+
+
+def test_llm_config_defaults_local_base_urls():
+    assert "11434" in llm.LLMConfig(provider="ollama").base_url
+    assert "1234" in llm.LLMConfig(provider="lmstudio").base_url
+    assert llm.LLMConfig(provider="anthropic").base_url.endswith("anthropic.com/v1")
+
+
+async def test_check_llm_reports_reachability(monkeypatch):
+    _no_sleep(monkeypatch)                              # skip retry backoff on the dead-client path
+    c = _FakeLLMClient({"choices": [{"message": {"content": "ok"}}]})
+    row = await llm.check_llm(c, llm.LLMConfig(provider="ollama", model="m"))
+    assert row["reachable"] is True and row["provider"] == "ollama"
+
+    class _Dead:
+        async def post(self, *a, **k):
+            raise ConnectionError("nope")
+    row2 = await llm.check_llm(_Dead(), llm.LLMConfig(provider="ollama", model="m"))
+    assert row2["reachable"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Factual news / company-intel (lrecon/news.py) — no pretext scoring
+# --------------------------------------------------------------------------- #
+def test_news_parse_summary_variants():
+    fenced = news._parse_summary('```json\n{"summary":"s","events":[{"bucket":"m&a","description":"d"}]}\n```')
+    assert fenced["summary"] == "s"
+    assert fenced["events"][0]["bucket"] == "m&a"
+    # bogus bucket normalized to "other"
+    prose = news._parse_summary('note: {"summary":"x","events":[{"bucket":"zzz","description":"d"}]} end')
+    assert prose["events"][0]["bucket"] == "other"
+    assert news._parse_summary("no json") == {}
+    assert news._parse_summary("") == {}
+
+
+def test_news_summary_output_has_no_pretext_fields():
+    # Guard the scope boundary: whatever the model returns, the parsed shape
+    # exposes only neutral factual fields — never a pretext/lure/score field.
+    parsed = news._parse_summary(
+        '{"summary":"s","events":[{"bucket":"exec-change","description":"CFO left",'
+        '"pretext_potential":"HIGH","lure":"click here"}]}')
+    ev = parsed["events"][0]
+    assert set(ev.keys()) == {"bucket", "description", "date", "source"}
+    assert "pretext_potential" not in ev and "lure" not in ev
+
+
+async def test_news_edgar_parse_and_company_intel(monkeypatch):
+    edgar = {"hits": {"hits": [
+        {"_source": {"display_names": ["ACME CORP  (CIK 0000123)"], "file_type": "8-K",
+                     "file_date": "2026-01-15", "ciks": ["0000123"], "adsh": "0001-23-000045"}},
+    ]}}
+
+    class _C:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeLLMResp(edgar)
+    filings = await news.edgar_recent_filings(_C(), "Acme Corp")
+    assert filings and filings[0]["form"] == "8-K" and filings[0]["date"] == "2026-01-15"
+
+    # company_intel with a stubbed LLM summarizer
+    async def fake_complete(client, cfg, messages, module=None, **kw):
+        return '{"summary":"Acme makes widgets.","events":[{"bucket":"product","description":"launched X"}]}'
+    monkeypatch.setattr(news.llm, "complete", fake_complete)
+
+    class _C2:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeLLMResp(edgar)
+    out = await news.company_intel(_C2(), "Acme Corp", "acme.com",
+                                   llm.LLMConfig(provider="ollama", model="m"))
+    assert out["summary"] == "Acme makes widgets."
+    assert out["events"][0]["bucket"] == "product"
+
+
+async def test_news_company_intel_empty_when_nothing_found(monkeypatch):
+    class _C:
+        async def get(self, url, params=None, headers=None, timeout=None):
+            return _FakeLLMResp({"hits": {"hits": []}})
+    out = await news.company_intel(_C(), "Nobody Ltd", "nobody.com",
+                                   llm.LLMConfig(provider="ollama", model="m"))
+    assert out["summary"] is None and out["events"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Dossier generator (lrecon/dossier.py)
+# --------------------------------------------------------------------------- #
+def _synthetic_res():
+    h = Host("www.acme.com", ips=["1.2.3.4"], tech=["nginx", "React"], server="nginx",
+             http_status=200, scheme="https", tech_confirmed=True)
+    return {
+        "hosts": [h],
+        "mail_infra": {"acme.com": [{"host": "mx.acme.com", "provider": "Google Workspace",
+                                     "priority": 10}]},
+        "dns": {"acme.com": {"ns": ["ns1.acme.com"]}},
+        "whois": {"acme.com": {"registrant_org": "Acme Corp", "registrar": "MarkMonitor"}},
+        "entry_points": [{"type": "auth-surface", "target": "sso.acme.com",
+                          "severity": "info", "summary": "OIDC exposed — Okta"}],
+        "auth_surface": [{"host": "sso.acme.com", "idp": "Okta",
+                          "issuer": "https://acme.okta.com",
+                          "oidc_config_url": "https://sso.acme.com/.well-known/openid-configuration"}],
+        "people": [Person(email="jane@acme.com", name="Jane Doe", position="CTO",
+                          source={"hunter"})],
+    }
+
+
+async def test_build_dossier_structured_only_without_llm():
+    d = await dossier.build_dossier(None, _synthetic_res(), ["acme.com"], "Acme Corp",
+                                    llm_cfg=None, news=None)
+    assert d["generated_with_llm"] is False
+    assert d["company_profile"]["narrative"] is None
+    assert d["tech_stack"]["data"]["web_tech"] == ["React", "nginx"]
+    assert d["tech_stack"]["data"]["mail_collab_providers"] == ["Google Workspace"]
+    assert d["tech_stack"]["data"]["web_tech_confirmed_live"] == ["React", "nginx"]
+    assert d["auth_surface"]["data"][0]["idp"] == "Okta"
+    assert d["people"]["data"][0]["email"] == "jane@acme.com"
+
+
+async def test_build_dossier_with_llm_adds_narrative(monkeypatch):
+    async def fake_complete(client, cfg, messages, module=None, **kw):
+        return f"narrative for {module}"
+    monkeypatch.setattr(dossier.llm, "complete", fake_complete)
+    news_intel = {"summary": "Acme makes widgets.",
+                  "events": [{"bucket": "m&a", "description": "Acquired Foo", "date": "2026-01"}]}
+    d = await dossier.build_dossier(object(), _synthetic_res(), ["acme.com"], "Acme Corp",
+                                    llm_cfg=llm.LLMConfig(provider="ollama", model="m"),
+                                    news=news_intel)
+    assert d["generated_with_llm"] is True
+    assert d["company_profile"]["narrative"] == "narrative for dossier"
+    assert d["company_profile"]["data"]["news_summary"] == "Acme makes widgets."
+    assert d["company_profile"]["data"]["recent_events"][0]["bucket"] == "m&a"
+
+
+async def test_dossier_writers_json_and_markdown():
+    import json as _json
+    d = await dossier.build_dossier(None, _synthetic_res(), ["acme.com"], "Acme Corp", llm_cfg=None)
+    with tempfile.TemporaryDirectory() as td:
+        jp = Path(td) / "d.dossier.json"
+        mp = Path(td) / "d.dossier.md"
+        dossier.write_dossier_json(d, str(jp))
+        dossier.write_dossier_md(d, str(mp))
+        parsed = _json.loads(jp.read_text())          # valid machine-readable JSON
+        assert parsed["company"] == "Acme Corp"
+        md = mp.read_text()
+    assert "# Target dossier — Acme Corp" in md
+    assert "Google Workspace" in md
+    assert "sso.acme.com" in md
+    assert "jane@acme.com" in md
+    assert "structured findings only" in md            # no-LLM note present
+
+
+# --------------------------------------------------------------------------- #
+# Passive auth-surface mapping (lrecon/intel.py)
+# --------------------------------------------------------------------------- #
+class _AuthResp:
+    def __init__(self, status, data, url):
+        self.status_code = status
+        self._d = data
+        self.url = url
+
+    def json(self):
+        if self._d is None:
+            raise ValueError("no json")
+        return self._d
+
+
+class _AuthClient:
+    def __init__(self, resp):
+        self.resp = resp
+
+    async def get(self, url, timeout=None, follow_redirects=None):
+        return self.resp
+
+
+async def test_auth_surface_okta_fingerprint():
+    oidc = {"issuer": "https://login.example.com",
+            "authorization_endpoint": "https://example.okta.com/oauth2/v1/authorize",
+            "token_endpoint": "https://example.okta.com/oauth2/v1/token",
+            "jwks_uri": "https://example.okta.com/oauth2/v1/keys"}
+    out = await intel.auth_surface(_AuthClient(_AuthResp(200, oidc, "https://sso.example.com/x")),
+                                   "sso.example.com")
+    assert out["idp"] == "Okta"
+    assert out["issuer"] == "https://login.example.com"
+    assert "authorization_endpoint" in out["endpoints"]
+
+
+async def test_auth_surface_entra_fingerprint():
+    oidc = {"issuer": "https://login.microsoftonline.com/TENANT/v2.0",
+            "authorization_endpoint": "https://login.microsoftonline.com/TENANT/oauth2/v2.0/authorize"}
+    out = await intel.auth_surface(_AuthClient(_AuthResp(200, oidc, "x")), "login.example.com")
+    assert out["idp"] == "Microsoft Entra ID"
+
+
+async def test_auth_surface_unknown_idp_still_reports_endpoint():
+    oidc = {"issuer": "https://idp.internal.example.com",
+            "authorization_endpoint": "https://idp.internal.example.com/authorize"}
+    out = await intel.auth_surface(_AuthClient(_AuthResp(200, oidc, "x")), "idp.example.com")
+    assert out["idp"] is None                          # unrecognized IdP, but still surfaced
+    assert out["issuer"] == "https://idp.internal.example.com"
+
+
+async def test_auth_surface_empty_on_non_200_or_no_issuer():
+    assert await intel.auth_surface(_AuthClient(_AuthResp(404, None, "x")), "x.com") == {}
+    assert await intel.auth_surface(_AuthClient(_AuthResp(200, {"foo": "bar"}, "x")), "x.com") == {}
+
+
+async def test_auth_surface_empty_on_exception():
+    class _Boom:
+        async def get(self, *a, **k):
+            raise ConnectionError("refused")
+    assert await intel.auth_surface(_Boom(), "x.com") == {}
+
+
+def test_summarize_entry_points_includes_auth_surface():
+    auth = [{"host": "sso.acme.com", "idp": "Okta", "issuer": "https://acme.okta.com"}]
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, auth)
+    assert len(eps) == 1
+    assert eps[0]["type"] == "auth-surface"
+    assert eps[0]["severity"] == "info"
+    assert "Okta" in eps[0]["summary"]
+    assert eps[0]["attck"] == "T1590"
+
+
+def test_summarize_entry_points_auth_surface_ranks_below_actionable():
+    hosts = [Host("a.acme.com", takeover="unclaimed-service signature matched: s3")]
+    auth = [{"host": "sso.acme.com", "idp": "Okta", "issuer": "i"}]
+    eps = intel.summarize_entry_points(hosts, {}, [], {}, [], [], None, auth)
+    # critical takeover first, info auth-surface last
+    assert eps[0]["type"] == "subdomain-takeover"
+    assert eps[-1]["type"] == "auth-surface"

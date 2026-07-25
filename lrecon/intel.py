@@ -307,6 +307,77 @@ async def mail_infra_lookup(client, mx_records: list, ipinfo_token: str | None, 
     return out
 
 
+# --------------------------------------------------------------------------- #
+# Passive authentication-surface mapping — which SSO/OIDC identity provider a
+# host federates to, from the standard OIDC discovery document and common
+# well-known paths. DISCOVERY ONLY: a single GET of public, standards-defined
+# metadata endpoints (RFC 8414 / OpenID Connect Discovery) — no credential
+# probing, no login attempts, no account enumeration. It tells a client which
+# IdP fronts their auth (Okta, Entra/Azure AD, Auth0, Ping, ADFS, Google) so
+# federation/conditional-access review can start from fact, not guesswork.
+# ATT&CK: T1590 (Gather Victim Network Info) / T1596 (Search Open Technical
+# Databases) — reconnaissance, not access.
+# --------------------------------------------------------------------------- #
+_IDP_PATTERNS = (
+    ("Okta",              ("okta.com", "oktapreview.com", "okta-emea.com")),
+    ("Microsoft Entra ID", ("login.microsoftonline.com", "sts.windows.net",
+                            "microsoftonline.com", "windows.net")),
+    ("Auth0",             ("auth0.com",)),
+    ("Ping Identity",     ("pingone.com", "pingidentity.com", "ping-eng.com")),
+    ("Google",            ("accounts.google.com", "google.com")),
+    ("OneLogin",          ("onelogin.com",)),
+    ("ADFS",              ("/adfs/",)),
+    ("Keycloak",          ("/realms/", "/auth/realms/")),
+)
+
+_OIDC_WELL_KNOWN = "/.well-known/openid-configuration"
+
+
+def _fingerprint_idp(oidc: dict, final_url: str) -> str | None:
+    """Match issuer/endpoint hosts against known IdP domains. `oidc` is the
+    parsed discovery document; `final_url` is where the request landed
+    (captures redirect-to-IdP even when the JSON is unavailable)."""
+    haystack = " ".join([
+        (oidc or {}).get("issuer", "") or "",
+        (oidc or {}).get("authorization_endpoint", "") or "",
+        (oidc or {}).get("token_endpoint", "") or "",
+        final_url or "",
+    ]).lower()
+    for name, needles in _IDP_PATTERNS:
+        if any(n in haystack for n in needles):
+            return name
+    return None
+
+
+async def auth_surface(client, host: str) -> dict:
+    """
+    Probe a host's OIDC discovery document and report the identity provider
+    fronting it, if any. Returns {host, idp, oidc_config_url, endpoints} or
+    {} when nothing authentication-related is exposed. Best-effort and
+    passive: one HTTPS GET of a public metadata path.
+    """
+    url = f"https://{host}{_OIDC_WELL_KNOWN}"
+    try:
+        r = await client.get(url, timeout=15, follow_redirects=True)
+    except Exception:
+        return {}
+    if r.status_code != 200:
+        return {}
+    try:
+        oidc = r.json()
+    except Exception:
+        return {}
+    if not isinstance(oidc, dict) or not oidc.get("issuer"):
+        return {}
+    final_url = str(getattr(r, "url", "") or url)
+    endpoints = {k: oidc.get(k) for k in
+                 ("authorization_endpoint", "token_endpoint", "userinfo_endpoint",
+                  "jwks_uri", "end_session_endpoint") if oidc.get(k)}
+    return {"host": host, "idp": _fingerprint_idp(oidc, final_url),
+            "issuer": oidc.get("issuer"), "oidc_config_url": url,
+            "endpoints": endpoints}
+
+
 
 # --------------------------------------------------------------------------- #
 # Domain registration data (WHOIS via RDAP) — keyless, third-party registry
@@ -731,7 +802,7 @@ async def hibp_breaches(client, domain: str) -> list:
 # --------------------------------------------------------------------------- #
 # Entry-point summary — the highest-signal findings, ranked, across all phases
 # --------------------------------------------------------------------------- #
-ENTRY_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+ENTRY_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 _CVSS_SEVERITY = ((9.0, "critical"), (7.0, "high"), (4.0, "medium"))
 
 # Label + a rough severity for non-web ports worth flagging by name — direct
@@ -768,7 +839,8 @@ def _cve_severity(cvss, has_poc: bool = False) -> str:
     return sev
 
 
-def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei, dorks=None) -> list:
+def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
+                           dorks=None, auth_surfaces=None) -> list:
     """
     Pull the findings that represent a likely initial-access vector out of the
     full result set into one ranked list, so they're stated explicitly instead
@@ -809,6 +881,13 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei, 
         out.append({"type": "dork-hit", "target": d["link"], "severity": d["severity"],
                    "summary": f"{d['category']}: {d['title']} — {d['snippet']}",
                    "attck": "T1593.002"})
+
+    for a in (auth_surfaces or []):
+        idp = a.get("idp") or "unknown IdP"
+        out.append({"type": "auth-surface", "target": a["host"], "severity": "info",
+                   "summary": f"OIDC/SSO endpoint exposed — federates to {idp} "
+                              f"(issuer: {a.get('issuer') or '?'})",
+                   "attck": "T1590"})
 
     known_cve_cap = 5
     for h in hosts:

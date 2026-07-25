@@ -2,6 +2,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,6 +13,9 @@ from .report import (write_markdown, write_html, write_live_hosts, write_csv, wr
                      write_origin_ips, screenshot_hosts)
 from .backends import available_backends
 from . import backends
+from . import llm as _llm
+
+_SUBCOMMANDS = ("dossier", "enum", "full-report")
 
 
 def read_domains_file(path: str) -> list:
@@ -53,6 +57,20 @@ def apply_all_flag(args) -> None:
 
 
 def main() -> None:
+    """Dispatch subcommands (dossier / enum / full-report), else run the
+    default flat recon flow. The default path preserves the original
+    invocation (`lrecon example.com …`) unchanged."""
+    argv = sys.argv[1:]
+    if argv and argv[0] == "enum":
+        return _cmd_enum(argv[1:])
+    emit_dossier = False
+    if argv and argv[0] in ("dossier", "full-report"):
+        emit_dossier = True
+        argv = argv[1:]
+    _recon(argv, emit_dossier=emit_dossier)
+
+
+def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap = argparse.ArgumentParser(description="LRecon (Let's Recon) v3.2 — external recon (authorized use only)")
     ap.add_argument("domains", nargs="*", help="root domain(s) in scope")
     ap.add_argument("-iL", "--domains-file",
@@ -123,13 +141,40 @@ def main() -> None:
                          "rather than reporting false positives)")
     ap.add_argument("--ask-keys", action="store_true", help="prompt for keys via getpass")
     ap.add_argument("--config", help="config json path (default ~/.config/lrecon/config.json)")
+    # ---- LLM (dossier/news synthesis; see the dossier/full-report subcommands) ----
+    ap.add_argument("--llm-provider",
+                    help="LLM provider for dossier/news synthesis: ollama|lmstudio|vllm|"
+                         "openai|anthropic|google (default ollama — local, no data leaves the host)")
+    ap.add_argument("--llm-model", help="LLM model id (else config.json llm.model)")
+    ap.add_argument("--llm-base-url", help="LLM endpoint base URL (else provider default)")
+    ap.add_argument("--check-llm", action="store_true",
+                    help="probe the configured LLM backend for reachability, then exit")
+    ap.add_argument("--company",
+                    help="company name (alias for --company-name; used by the dossier "
+                         "subcommand and RocketReach people-enum)")
+    ap.add_argument("--domain", action="append", dest="extra_domains",
+                    help="in-scope domain (repeatable); merged with positional domains and -iL")
     ap.add_argument("-c", "--concurrency", type=int, default=50)
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("-o", "--out", default="lrecon",
                     help="output basename — a UTC timestamp is appended so "
                          "reruns don't overwrite prior output (<basename>_YYYYMMDD_HHMMSS.*)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     apply_all_flag(args)
+    # --company is an alias for --company-name; --domain appends to positional.
+    if getattr(args, "company", None) and not args.company_name:
+        args.company_name = args.company
+    if getattr(args, "extra_domains", None):
+        args.domains = merge_domains(args.domains, args.extra_domains)
+
+    if getattr(args, "check_llm", False):
+        keys = load_keys(args)
+        cfg = _llm.config_from_keys(keys)
+        row = asyncio.run(_check_llm(cfg))
+        log(f"[i] LLM backend self-check: provider={row['provider']} model={row['model']} "
+            f"base_url={row['base_url']}")
+        log(f"    reachable={'yes' if row['reachable'] else ' no'}  note: {row['note']}")
+        return
 
     if args.check_backends:
         rows = asyncio.run(backends.selfcheck(active=args.check_active))
@@ -207,7 +252,8 @@ def main() -> None:
 
     full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
                                 "asn", "favicon_pivots", "nuclei", "diff", "per_source",
-                                "entry_points", "whois", "dorks", "dns", "mail_infra", "vt")}
+                                "entry_points", "whois", "dorks", "dns", "mail_infra", "vt",
+                                "auth_surface")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
@@ -232,6 +278,9 @@ def main() -> None:
             outputs.append(shot_dir + "/")
             log(f"[+] {n} screenshot(s) -> {shot_dir}/")
 
+    if emit_dossier:
+        outputs += _emit_dossier(res, args, keys, out_base)
+
     n_entry = len(res.get("entry_points") or [])
     n_dorks = len(res.get("dorks") or [])
     log(f"[+] done in {time.time()-t0:.1f}s — {len(hosts)} hosts, {n_live} live URLs, "
@@ -239,6 +288,119 @@ def main() -> None:
         f"{n_origin} CF-origin candidate IP(s)")
     log(f"[+] {'  '.join(outputs)}")
 
+
+# --------------------------------------------------------------------------- #
+# LLM / dossier helpers + subcommands
+# --------------------------------------------------------------------------- #
+async def _check_llm(cfg) -> dict:
+    import httpx
+    async with httpx.AsyncClient(verify=True) as client:
+        return await _llm.check_llm(client, cfg)
+
+
+async def _build_dossier_async(res, args, keys, out_base) -> list:
+    import httpx
+    from . import dossier as _dossier
+    from . import news as _news
+    from .common import RateLimiter
+    cfg = _llm.config_from_keys(keys)
+    company = args.company_name or (args.domains[0].split(".")[0] if args.domains else "target")
+    headers = {"User-Agent": "lrecon/3.2 (authorized-assessment)"}
+    async with httpx.AsyncClient(headers=headers, verify=True) as client:
+        # Factual company intel (SEC EDGAR + operator-supplied sources).
+        news = None
+        try:
+            extra = ((keys.get("llm") or {}).get("news") or {}).get("sources")
+        except Exception:
+            extra = None
+        limiter = RateLimiter(2.0)
+        news = await _news.company_intel(client, company, args.domains[0] if args.domains else "",
+                                         cfg, extra_sources=extra, limiter=limiter)
+        dossier = await _dossier.build_dossier(client, res, args.domains, company,
+                                               llm_cfg=cfg, news=news)
+    dj = f"{out_base}.dossier.json"
+    dm = f"{out_base}.dossier.md"
+    _dossier.write_dossier_json(dossier, dj)
+    _dossier.write_dossier_md(dossier, dm)
+    log(f"[+] dossier: {'LLM-synthesized' if dossier.get('generated_with_llm') else 'structured-only'} "
+        f"-> {dm}")
+    return [dj, dm]
+
+
+def _emit_dossier(res, args, keys, out_base) -> list:
+    try:
+        return asyncio.run(_build_dossier_async(res, args, keys, out_base))
+    except Exception as e:
+        log(f"[!] dossier generation failed: {e}")
+        return []
+
+
+def _cmd_enum(argv) -> None:
+    """Passive company-email / people OSINT (Hunter.io, GitHub, RocketReach)
+    without the full recon pipeline. --verify-emails keeps the existing
+    operator-gated SMTP probe; no active credential-oracle enumeration."""
+    import httpx
+    from . import people as _people
+    from .common import RateLimiter, DEFAULT_RESOLVERS as _DR
+    ap = argparse.ArgumentParser(prog="lrecon enum",
+                                 description="passive company email / people OSINT")
+    ap.add_argument("domains", nargs="*", help="in-scope domain(s)")
+    ap.add_argument("-d", "--domain", action="append", dest="extra_domains", help="domain (repeatable)")
+    ap.add_argument("-iL", "--domains-file", help="read domains from a file")
+    ap.add_argument("--names", help="optional newline-delimited name list for pattern generation")
+    ap.add_argument("--company", dest="company_name", help="company name (RocketReach)")
+    ap.add_argument("--company-name", dest="company_name", help=argparse.SUPPRESS)
+    ap.add_argument("--verify-emails", action="store_true",
+                    help="SMTP RCPT-TO probe (active; touches target MX)")
+    ap.add_argument("--resolvers", help="comma-separated DNS servers")
+    ap.add_argument("-o", "--out", default="lrecon", help="output basename")
+    ap.add_argument("--config", help="config json path")
+    ap.add_argument("--hunter-key")
+    ap.add_argument("--rocketreach-key")
+    # load_keys reads several attributes that this subparser doesn't define.
+    for attr in ("shodan_key", "ipinfo_key", "vt_key", "google_cse_key", "google_cse_cx",
+                 "ask_keys", "llm_provider", "llm_model", "llm_base_url"):
+        ap.set_defaults(**{attr: None})
+    args = ap.parse_args(argv)
+    domains = list(args.domains)
+    if args.extra_domains:
+        domains = merge_domains(domains, args.extra_domains)
+    if args.domains_file:
+        try:
+            domains = merge_domains(domains, read_domains_file(args.domains_file))
+        except OSError as e:
+            ap.error(f"--domains-file: {e}")
+    if not domains:
+        ap.error("provide at least one domain")
+    args.domains = domains
+    keys = load_keys(args)
+    ns = args.resolvers.split(",") if args.resolvers else _DR
+
+    async def _go():
+        headers = {"User-Agent": "lrecon/3.2 (authorized-assessment)"}
+        gh_limiter = RateLimiter(0.2)
+        people = []
+        async with httpx.AsyncClient(headers=headers, verify=True) as client:
+            for d in domains:
+                people += await _people.enumerate_people(client, d, keys, gh_limiter,
+                                                         args.company_name)
+        if args.verify_emails:
+            for d in domains:
+                d_people = [p for p in people if p.email.endswith(f"@{d}")]
+                if not d_people:
+                    continue
+                statuses = await _people.verify_emails(d, [p.email for p in d_people], ns)
+                for p in d_people:
+                    p.smtp_status = statuses.get(p.email)
+        return people
+
+    people = asyncio.run(_go())
+    out_base = f"{args.out}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    users_path = f"{out_base}.users.csv"
+    json_path = f"{out_base}.users.json"
+    write_users_csv(people, users_path)
+    Path(json_path).write_text(json.dumps([p.to_dict() for p in people], indent=2, default=str))
+    log(f"[+] enum: {len(people)} company-affiliated email(s) -> {users_path}  {json_path}")
 
 
 if __name__ == "__main__":
