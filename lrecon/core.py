@@ -154,20 +154,51 @@ async def run(domains, args, keys) -> list:
         if per_source.get("crtsh", 0) == 0:
             log("[!] crt.sh returned 0 (down/rate-limited?) — other CT sources covering")
 
+        # ---- VirusTotal domain intelligence (opt-in --vt; needs VT key) ----
+        # Explicit flag even with a key configured — VT's free tier is
+        # rate-limited to 4 req/min and each domain costs two calls, so
+        # auto-running it would add real wall-clock time to every run.
+        # Passive: only queries VT's own API, never the target directly —
+        # same tier as --dork/--buckets, not gated behind --passive-only.
+        # Runs ahead of the WHOIS/RDAP phase below (rather than later,
+        # where it used to sit) because whois_lookup() uses VT's own
+        # cached WHOIS text as its third fallback tier and needs it in hand.
+        vt_intel = {}
+        if args.vt:
+            if keys.get("vt"):
+                vt_limiter = RateLimiter(per_second=4 / 60)
+                for d in domains:
+                    info = await vt_domain_intel(client, d, keys["vt"], vt_limiter)
+                    if info:
+                        vt_intel[d] = info
+                if vt_intel:
+                    n_hist = sum(len(v.get("ip_history") or []) for v in vt_intel.values())
+                    log(f"[+] VirusTotal: {len(vt_intel)} domain(s) enriched, "
+                        f"{n_hist} historical IP resolution(s)")
+            else:
+                log("[!] --vt set but --vt-key/VT_API_KEY not configured — skipping")
+
         # ---- Domain registration data (WHOIS via RDAP, falling back to
-        # classic WHOIS/port 43 for TLDs with no RDAP service at all —
-        # .io/.co/.me and others, confirmed against IANA's own bootstrap
-        # registry) ----
-        # Keyless, third-party-registry-only — runs even in --passive-only,
-        # same tier as the passive-enum sources above. Always records one
-        # entry per domain, even on a total lookup failure (unsupported
-        # TLD, network issue, domain not found) — a client running an
-        # engagement against N domains should see all N in the WHOIS
-        # section, not have the whole section vanish because one domain's
-        # lookup came back empty.
+        # classic WHOIS/port 43, then to --vt's cached WHOIS text, for
+        # TLDs/environments where the earlier tiers come back empty —
+        # .io/.co/.me and others have no RDAP at all (confirmed against
+        # IANA's own bootstrap registry), and raw TCP/port 43 is blocked
+        # outright in some sandboxed execution environments (including
+        # Claude Code's own remote containers — see /root/.ccr/README.md's
+        # "Not supported through the proxy: ... raw-TCP databases"), where
+        # VT's HTTPS-fetched mirror is the only one of the three that can
+        # actually reach the network) ----
+        # Keyless (RDAP/WHOIS43 tiers), third-party-registry-only — runs
+        # even in --passive-only, same tier as the passive-enum sources
+        # above. Always records one entry per domain, even on a total
+        # lookup failure (unsupported TLD, network issue, domain not
+        # found) — a client running an engagement against N domains
+        # should see all N in the WHOIS section, not have the whole
+        # section vanish because one domain's lookup came back empty.
         whois = {}
         for d in domains:
-            w = await whois_lookup(client, d)
+            vt_whois_text = vt_intel.get(d, {}).get("whois")
+            w = await whois_lookup(client, d, vt_whois_text)
             whois[d] = w
             if w.get("expires") and domain_expiring_soon(w["expires"]):
                 log(f"[!] {d}: domain registration expires {w['expires']} — flag to client")
@@ -413,27 +444,6 @@ async def run(domains, args, keys) -> list:
                     log(f"[+] google dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
             else:
                 log("[!] --dork set but --google-cse-key/--google-cse-cx not configured — skipping")
-
-        # ---- VirusTotal domain intelligence (opt-in --vt; needs VT key) ----
-        # Explicit flag even with a key configured — VT's free tier is
-        # rate-limited to 4 req/min and each domain costs two calls, so
-        # auto-running it would add real wall-clock time to every run.
-        # Passive: only queries VT's own API, never the target directly —
-        # same tier as --dork/--buckets, not gated behind --passive-only.
-        vt_intel = {}
-        if args.vt:
-            if keys.get("vt"):
-                vt_limiter = RateLimiter(per_second=4 / 60)
-                for d in domains:
-                    info = await vt_domain_intel(client, d, keys["vt"], vt_limiter)
-                    if info:
-                        vt_intel[d] = info
-                if vt_intel:
-                    n_hist = sum(len(v.get("ip_history") or []) for v in vt_intel.values())
-                    log(f"[+] VirusTotal: {len(vt_intel)} domain(s) enriched, "
-                        f"{n_hist} historical IP resolution(s)")
-            else:
-                log("[!] --vt set but --vt-key/VT_API_KEY not configured — skipping")
 
         breach = {}
         for d in domains:
