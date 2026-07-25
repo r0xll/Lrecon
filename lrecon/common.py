@@ -137,7 +137,10 @@ CF_FALLBACK = [
 def load_keys(args) -> dict:
     keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None,
             "hunter": None, "rocketreach": None, "google_cse": None, "google_cse_cx": None,
-            "vt": None}
+            "vt": None,
+            # LLM (dossier/news synthesis): cloud-provider keys + the resolved
+            # `llm` config section (provider/model/base_url/... from config.json).
+            "openai": None, "anthropic": None, "google_ai": None, "llm": None}
     cfg = Path(args.config) if args.config else CONFIG_PATH
     if cfg.exists():
         try:
@@ -151,6 +154,10 @@ def load_keys(args) -> dict:
             keys["google_cse"] = data.get("google_cse_key")
             keys["google_cse_cx"] = data.get("google_cse_cx")
             keys["vt"] = data.get("vt_api_key")
+            keys["openai"] = data.get("openai_api_key")
+            keys["anthropic"] = data.get("anthropic_api_key")
+            keys["google_ai"] = data.get("google_ai_api_key")
+            keys["llm"] = data.get("llm")            # {"provider":..., "model":..., ...}
         except Exception as e:
             log(f"[!] config read failed: {e}")
     keys["shodan"] = os.environ.get("SHODAN_API_KEY") or keys["shodan"]
@@ -162,6 +169,9 @@ def load_keys(args) -> dict:
     keys["google_cse"] = os.environ.get("GOOGLE_CSE_KEY") or keys["google_cse"]
     keys["google_cse_cx"] = os.environ.get("GOOGLE_CSE_CX") or keys["google_cse_cx"]
     keys["vt"] = os.environ.get("VT_API_KEY") or keys["vt"]
+    keys["openai"] = os.environ.get("OPENAI_API_KEY") or keys["openai"]
+    keys["anthropic"] = os.environ.get("ANTHROPIC_API_KEY") or keys["anthropic"]
+    keys["google_ai"] = os.environ.get("GOOGLE_AI_API_KEY") or keys["google_ai"]
     if args.shodan_key:
         keys["shodan"] = args.shodan_key
     if args.ipinfo_key:
@@ -176,6 +186,14 @@ def load_keys(args) -> dict:
         keys["google_cse_cx"] = args.google_cse_cx
     if args.vt_key:
         keys["vt"] = args.vt_key
+    # LLM CLI overrides layer on top of the config.json `llm` section.
+    llm_over = {k: v for k, v in (
+        ("provider", getattr(args, "llm_provider", None)),
+        ("model", getattr(args, "llm_model", None)),
+        ("base_url", getattr(args, "llm_base_url", None)),
+    ) if v}
+    if llm_over:
+        keys["llm"] = {**(keys["llm"] or {}), **llm_over}
     if args.ask_keys:
         import getpass
         if not keys["shodan"]:

@@ -552,8 +552,24 @@ async def run(domains, args, keys) -> list:
 
     host_list = sorted(hosts.values(), key=lambda h: h.subdomain)
 
+    # ---- Passive auth-surface mapping (OIDC/SSO discovery) ----
+    # One HTTPS GET of each live host's public OIDC discovery document —
+    # standards-defined metadata only, no login/credential probing. Touches
+    # target-owned hosts (same as the HTTP probe), so it's gated on
+    # not-passive-only and uses probe_client (self-signed certs common on
+    # auth endpoints). Feeds both entry_points and the dossier.
+    auth_surfaces = []
+    if not args.passive_only:
+        live = [h for h in host_list if h.http_status and not h.wildcard]
+        results = await asyncio.gather(*[auth_surface(probe_client, h.subdomain) for h in live])
+        auth_surfaces = [a for a in results if a]
+        if auth_surfaces:
+            idps = ", ".join(sorted({a.get("idp") or "unknown" for a in auth_surfaces}))
+            log(f"[+] auth-surface: {len(auth_surfaces)} host(s) expose OIDC/SSO discovery ({idps})")
+
     # ---- Entry-point summary (red-team signal: what to chase first) ----
-    entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings, nuclei, dorks)
+    entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings,
+                                          nuclei, dorks, auth_surfaces)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
@@ -572,6 +588,6 @@ async def run(domains, args, keys) -> list:
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
-            "vt": vt_intel}
+            "vt": vt_intel, "auth_surface": auth_surfaces}
 
 
