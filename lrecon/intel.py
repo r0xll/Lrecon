@@ -579,31 +579,51 @@ async def whois43_lookup(domain: str) -> dict:
     return out if any(out.get(k) for k in ("registrar", "created", "expires", "nameservers")) else {}
 
 
-async def whois_lookup(client, domain: str) -> dict:
+def _merge_whois(base: dict | None, extra: dict) -> dict:
+    merged = dict(base) if base else empty_whois_entry()
+    for k, v in extra.items():
+        if not merged.get(k):
+            merged[k] = v
+    return merged
+
+
+async def whois_lookup(client, domain: str, vt_whois_text: str | None = None) -> dict:
     """
-    RDAP first (structured, fast); if RDAP has no registrar at all —
-    either the domain's TLD has no RDAP service (.io/.co/.me and others,
-    per IANA's own bootstrap registry) or the lookup failed outright —
-    falls back to classic WHOIS (port 43) and merges in whatever fields
-    RDAP was missing, preferring RDAP's values wherever both have one.
-    Result always carries a "source" field ("rdap", "whois43",
-    "rdap+whois43", or None if both came back with nothing) so it's clear
-    which method actually supplied the data.
+    Three tiers, each only filling gaps the previous one left (RDAP's
+    values are never overwritten by a later tier):
+
+    1. RDAP — structured, fast.
+    2. Classic WHOIS (port 43), for TLDs with no RDAP service at all
+       (.io/.co/.me and others, per IANA's own bootstrap registry).
+    3. VirusTotal's own cached WHOIS text (pass the domain's `"whois"`
+       field from --vt's vt_domain_intel(), if available), parsed with
+       the same best-effort parser as tier 2. This tier exists because
+       raw TCP/port 43 is blocked outright in some sandboxed execution
+       environments (Claude Code's own remote containers included — see
+       /root/.ccr/README.md's "Not supported through the proxy: ...
+       raw-TCP databases"), where tier 2 silently comes back empty no
+       matter what the TLD is; VT's text was fetched over HTTPS, so it
+       isn't subject to that restriction.
+
+    Result always carries a "source" field listing which tier(s)
+    contributed a value, joined with "+" (e.g. "rdap+vt-whois"), or None
+    if none did.
     """
     w = await rdap_lookup(client, domain)
-    source = "rdap" if w else None
+    sources = ["rdap"] if w else []
     if not w or not w.get("registrar"):
         w43 = await whois43_lookup(domain)
         if w43:
-            merged = dict(w) if w else empty_whois_entry()
-            for k, v in w43.items():
-                if not merged.get(k):
-                    merged[k] = v
-            w = merged
-            source = "rdap+whois43" if source else "whois43"
+            w = _merge_whois(w, w43)
+            sources.append("whois43")
+    if (not w or not w.get("registrar")) and vt_whois_text:
+        w_vt = _parse_whois43(vt_whois_text)
+        if any(w_vt.get(k) for k in ("registrar", "created", "expires", "nameservers")):
+            w = _merge_whois(w, w_vt)
+            sources.append("vt-whois")
     if not w:
         w = empty_whois_entry()
-    w["source"] = source
+    w["source"] = "+".join(sources) or None
     return w
 
 

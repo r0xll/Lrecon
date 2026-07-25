@@ -769,6 +769,55 @@ async def test_whois_lookup_empty_entry_with_none_source_when_both_fail(monkeypa
     assert out["source"] is None
 
 
+async def test_whois_lookup_falls_back_to_vt_whois_when_rdap_and_whois43_both_empty(monkeypatch):
+    # The scenario that motivated this tier: raw TCP/port 43 is blocked
+    # outright in some sandboxed execution environments, so whois43_lookup
+    # comes back empty no matter the TLD — VT's own HTTPS-fetched mirror
+    # is the only remaining source that can actually reach the network.
+    async def fake_rdap(client, domain):
+        return {}
+
+    async def fake_whois43(domain):
+        return {}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    vt_text = "Domain Name: X.IO\r\nRegistrar: VT-Sourced Registrar\r\nCreation Date: 2015-05-05T00:00:00Z\r\n"
+    out = await intel.whois_lookup(None, "x.io", vt_whois_text=vt_text)
+    assert out["registrar"] == "VT-Sourced Registrar"
+    assert out["created"] == "2015-05-05T00:00:00Z"
+    assert out["source"] == "vt-whois"
+
+
+async def test_whois_lookup_vt_whois_not_consulted_when_whois43_already_found_registrar(monkeypatch):
+    async def fake_rdap(client, domain):
+        return {}
+
+    async def fake_whois43(domain):
+        return {**intel.empty_whois_entry(), "registrar": "WHOIS43 Registrar"}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    vt_text = "Registrar: Should Not Be Used\r\n"
+    out = await intel.whois_lookup(None, "x.io", vt_whois_text=vt_text)
+    assert out["registrar"] == "WHOIS43 Registrar"
+    assert out["source"] == "whois43"
+
+
+async def test_whois_lookup_vt_whois_ignored_when_it_parses_to_nothing_useful(monkeypatch):
+    async def fake_rdap(client, domain):
+        return {}
+
+    async def fake_whois43(domain):
+        return {}
+    monkeypatch.setattr(intel, "rdap_lookup", fake_rdap)
+    monkeypatch.setattr(intel, "whois43_lookup", fake_whois43)
+
+    out = await intel.whois_lookup(None, "x.zz", vt_whois_text="% no useful fields in here\r\n")
+    assert out["registrar"] is None
+    assert out["source"] is None
+
+
 def test_domain_expiring_soon():
     from datetime import datetime, timezone, timedelta
     soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat()
@@ -1769,6 +1818,17 @@ def test_write_html_whois_shows_source_and_vt_mirror_cross_reference():
         report.write_html(hosts, ["x.io"], res, str(path))
         content = path.read_text()
     assert "WHOIS (port 43)" in content
+
+
+def test_whois_source_label_handles_all_combinations():
+    assert report._whois_source_label(None) == "—"
+    assert report._whois_source_label("rdap") == "RDAP"
+    assert report._whois_source_label("whois43") == "WHOIS (port 43)"
+    assert report._whois_source_label("vt-whois") == "VT WHOIS mirror"
+    assert report._whois_source_label("rdap+whois43") == "RDAP + WHOIS (port 43)"
+    assert report._whois_source_label("rdap+vt-whois") == "RDAP + VT WHOIS mirror"
+    assert report._whois_source_label("rdap+whois43+vt-whois") == \
+        "RDAP + WHOIS (port 43) + VT WHOIS mirror"
 
 
 def test_write_html_whois_omits_vt_mirror_when_registrar_already_found():

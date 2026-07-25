@@ -110,9 +110,13 @@ def _whois_registrant_cell(w: dict) -> str:
     return "—"
 
 
+_WHOIS_SOURCE_LABELS = {"rdap": "RDAP", "whois43": "WHOIS (port 43)", "vt-whois": "VT WHOIS mirror"}
+
+
 def _whois_source_label(source: str | None) -> str:
-    return {"rdap": "RDAP", "whois43": "WHOIS (port 43)",
-           "rdap+whois43": "RDAP + WHOIS (port 43)"}.get(source, "—")
+    if not source:
+        return "—"
+    return " + ".join(_WHOIS_SOURCE_LABELS.get(s, s) for s in source.split("+"))
 
 
 def _tech_confirmed_label(h) -> str:

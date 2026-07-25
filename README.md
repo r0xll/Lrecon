@@ -84,7 +84,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | Expansion | ASN->netblock (RIPEstat) + reverse-DNS sweep, rDNS wire-back | DNS only |
 | Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
 | DNS records | apex A/AAAA/MX/NS/SOA snapshot + mail infrastructure ID (provider/ASN/org per MX host) | DNS only |
-| WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status; falls back to classic WHOIS (port 43) for TLDs with no RDAP service (always on) | none (third-party registry) |
+| WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status; falls back to classic WHOIS (port 43), then to `--vt`'s cached WHOIS text, for TLDs/environments where RDAP has nothing (always on) | none (third-party registry) |
 | People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
 | VirusTotal domain intel | historical IP/hosting resolutions, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
@@ -429,21 +429,36 @@ with the client.
 canonical RDAP bootstrap registry, several very common TLDs simply have no
 RDAP service published at all — **`.io`, `.co`, `.me`**, and others — RDAP
 just doesn't exist for them yet, at any registry. For those, lrecon falls
-back to the **classic WHOIS protocol** (port 43, RFC 3912): a pure-Python
-socket client (no external `whois` binary — the "no system binary" design
-holds) asks `whois.iana.org` which registry WHOIS server is authoritative
-for the TLD, then queries it directly and parses whatever fields it can out
-of the free-text reply (registrar, dates, nameservers, status, registrant
-disclosure). Free-text parsing is necessarily best-effort — format varies
-by registry, unlike RDAP's structured JSON — so treat it as a lead like
-everything else in the pipeline, not a certainty. Each domain's report row
-carries a **Source** column (`RDAP`, `WHOIS (port 43)`, or
-`RDAP + WHOIS (port 43)` when RDAP supplied some fields and WHOIS filled
-the rest) so it's clear which method actually produced the data. If
-`--vt` found VirusTotal's own cached WHOIS text for a domain that neither
-RDAP nor classic WHOIS could get a registrar for, that raw text is shown
-as an unparsed, collapsible cross-reference right in this section — read
-it yourself rather than lrecon guessing at yet another free-text format.
+back through up to two further tiers, each only filling in fields the
+previous tier didn't get, never overwriting a value an earlier tier already
+found:
+
+1. **Classic WHOIS** (port 43, RFC 3912) — a pure-Python socket client (no
+   external `whois` binary — the "no system binary" design holds) asks
+   `whois.iana.org` which registry WHOIS server is authoritative for the
+   TLD, then queries it directly.
+2. **VirusTotal's own cached WHOIS text**, if `--vt` is enabled and
+   configured — parsed with the same logic as tier 1. This tier exists
+   specifically because **raw TCP/port 43 is blocked outright in some
+   sandboxed execution environments** — Claude Code's own remote/cloud
+   containers included — regardless of the target TLD, so tier 1 silently
+   comes back empty there no matter what. VT's text was fetched over
+   HTTPS by an earlier phase, so it isn't subject to that restriction. If
+   you're running lrecon inside one of these environments and still see no
+   registrar for a domain with no RDAP, this is almost always why —
+   passing `--vt` with a working key is the fix, not a bug report.
+
+Both fallback tiers do free-text parsing, which is necessarily best-effort
+— format varies by registry, unlike RDAP's structured JSON — so treat it as
+a lead like everything else in the pipeline, not a certainty. Each domain's
+report row carries a **Source** column listing every tier that actually
+contributed a value (`RDAP`, `WHOIS (port 43)`, `VT WHOIS mirror`, or a
+combination like `RDAP + VT WHOIS mirror`) so it's clear which method(s)
+produced the data. If every tier came back empty for a domain but `--vt`
+still has cached WHOIS text for it (rare — usually means the text didn't
+match any of the parser's known field-label formats), that raw text is
+shown as an unparsed, collapsible cross-reference in this section so you
+can read it yourself.
 
 Every in-scope domain gets a row in the report's "Domain registration
 (WHOIS/RDAP)" section, even if every lookup came back empty (unsupported
