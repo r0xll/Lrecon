@@ -11,31 +11,30 @@ def write_csv(hosts, path) -> int:
     """
     Flat target list for client scope confirmation — one row per
     (subdomain, IP) pair, not one row per host: a host with multiple IPs
-    gets multiple rows (the subdomain repeats), each with its own ASN/org
+    gets multiple rows (the subdomain repeats), each with its own org
     column rather than cramming everything into one comma-joined cell, so
     every IP's org is directly visible without cross-referencing. This is
     "here's what we found in your scope, please confirm ownership," not a
-    vuln report. A host with no resolved IPs still gets one row (ip/asn/org
+    vuln report. A host with no resolved IPs still gets one row (ip/org
     blank) so it isn't silently dropped from the list. Falls back to the
-    scalar h.asn/h.org only for single-IP hosts, where there's no ambiguity
+    scalar h.org only for single-IP hosts, where there's no ambiguity
     about which IP they belong to — for a multi-IP host, an IP missing from
-    ip_asn/ip_org is left blank rather than guessing from the scalar, which
-    may have been last-set by a different one of the host's IPs.
+    ip_org is left blank rather than guessing from the scalar, which may
+    have been last-set by a different one of the host's IPs.
     """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["subdomain", "ip", "asn", "org"])
+        w.writerow(["subdomain", "ip", "org"])
         n = 0
         for h in hosts:
             if not h.ips:
-                w.writerow([h.subdomain, "", "", ""])
+                w.writerow([h.subdomain, "", ""])
                 n += 1
                 continue
             single = len(h.ips) == 1
             for ip in h.ips:
-                asn = h.ip_asn.get(ip) or (h.asn if single else "") or ""
                 org = h.ip_org.get(ip) or (h.org if single else "") or ""
-                w.writerow([h.subdomain, ip, asn, org])
+                w.writerow([h.subdomain, ip, org])
                 n += 1
     return n
 
