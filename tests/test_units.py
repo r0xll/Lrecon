@@ -2773,3 +2773,23 @@ def test_summarize_entry_points_whois_expired_ranks_above_registrant_exposed():
     eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None,
                                        whois={"a.com": expired, "b.com": exposed})
     assert [e["type"] for e in eps] == ["whois-domain-expired", "whois-registrant-exposed"]
+
+
+def test_days_to_expiry_handles_naive_timezoneless_date():
+    # Fallback WHOIS/VT tiers emit date-only strings like "2026-08-15"; these
+    # parse to a naive datetime and must not raise/return None (regression).
+    from datetime import datetime, timezone, timedelta
+    soon = (datetime.now(timezone.utc) + timedelta(days=10)).date().isoformat()
+    days = intel._days_to_expiry(soon)
+    assert days is not None
+    assert 8 <= days <= 10
+
+
+def test_summarize_entry_points_whois_finding_from_naive_date_only_expiry():
+    from datetime import datetime, timezone, timedelta
+    soon = (datetime.now(timezone.utc) + timedelta(days=5)).date().isoformat()  # no tz
+    w = intel.empty_whois_entry()
+    w.update({"expires": soon, "registrar": "Namecheap", "source": "whois43"})
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois={"acme.io": w})
+    assert len(eps) == 1
+    assert eps[0]["type"] == "whois-domain-expiring"

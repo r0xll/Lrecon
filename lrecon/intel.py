@@ -517,6 +517,13 @@ def _days_to_expiry(expires: str | None) -> int | None:
     try:
         from datetime import datetime, timezone
         exp = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+        # Fallback WHOIS/VT tiers hand back free-text, often timezone-less dates
+        # (e.g. "2026-08-15"), which fromisoformat parses to a *naive* datetime;
+        # subtracting the UTC-aware `now` would raise TypeError and silently drop
+        # the finding. Assume UTC for any naive value so those domains still get
+        # flagged.
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
         return (exp - datetime.now(timezone.utc)).days
     except Exception:
         return None
