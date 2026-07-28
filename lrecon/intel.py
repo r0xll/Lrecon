@@ -509,15 +509,29 @@ async def rdap_lookup(client, domain: str) -> dict:
     return {}
 
 
-def domain_expiring_soon(expires: str | None, within_days: int = 30) -> bool:
+def _days_to_expiry(expires: str | None) -> int | None:
+    """Whole days until the registration expires (negative if already lapsed),
+    or None if there's no parseable expiry date."""
     if not expires:
-        return False
+        return None
     try:
         from datetime import datetime, timezone
         exp = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-        return (exp - datetime.now(timezone.utc)).days <= within_days
+        # Fallback WHOIS/VT tiers hand back free-text, often timezone-less dates
+        # (e.g. "2026-08-15"), which fromisoformat parses to a *naive* datetime;
+        # subtracting the UTC-aware `now` would raise TypeError and silently drop
+        # the finding. Assume UTC for any naive value so those domains still get
+        # flagged.
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        return (exp - datetime.now(timezone.utc)).days
     except Exception:
-        return False
+        return None
+
+
+def domain_expiring_soon(expires: str | None, within_days: int = 30) -> bool:
+    days = _days_to_expiry(expires)
+    return days is not None and days <= within_days
 
 
 def empty_whois_entry() -> dict:
@@ -840,7 +854,7 @@ def _cve_severity(cvss, has_poc: bool = False) -> str:
 
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
-                           dorks=None, auth_surfaces=None) -> list:
+                           dorks=None, auth_surfaces=None, whois=None) -> list:
     """
     Pull the findings that represent a likely initial-access vector out of the
     full result set into one ranked list, so they're stated explicitly instead
@@ -972,6 +986,37 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                    "summary": f"{len(github_findings)} public code hit(s) referencing scope across "
                               f"{len(repos)} repo(s) — review for leaked credentials",
                    "attck": "T1593.003"})
+
+    # WHOIS / domain-registration checks — derived from data core.run() already
+    # collected (res["whois"]), no extra network calls. Two signals:
+    #   * a near-expiry or lapsed registration (operational risk to flag, and for
+    #     a lapsed domain a re-registration/takeover vector), and
+    #   * registrant PII disclosed with WHOIS privacy off (harvestable OSINT).
+    for d, w in (whois or {}).items():
+        if not w:
+            continue
+        days = _days_to_expiry(w.get("expires"))
+        if days is not None and days <= 30:
+            reg = f" (registrar: {w['registrar']})" if w.get("registrar") else ""
+            if days < 0:
+                out.append({"type": "whois-domain-expired", "target": d, "severity": "high",
+                           "summary": f"Domain registration lapsed {abs(days)} day(s) ago "
+                                      f"({w['expires']}){reg} — re-registration/takeover risk",
+                           "attck": "T1590.001"})
+            else:
+                sev = "high" if days <= 7 else "medium"
+                out.append({"type": "whois-domain-expiring", "target": d, "severity": sev,
+                           "summary": f"Domain registration expires in {days} day(s) "
+                                      f"({w['expires']}){reg} — flag to client",
+                           "attck": "T1590.001"})
+
+        if w.get("privacy_protected") is False:
+            registrant = w.get("registrant_name") or w.get("registrant_org")
+            if registrant:
+                out.append({"type": "whois-registrant-exposed", "target": d, "severity": "info",
+                           "summary": f"WHOIS privacy off — registrant disclosed ({registrant}); "
+                                      f"harvestable identity/org OSINT",
+                           "attck": "T1591"})
 
     out.sort(key=lambda e: ENTRY_SEVERITY_ORDER.get(e["severity"], 9))
     return out

@@ -569,7 +569,7 @@ async def run(domains, args, keys) -> list:
 
     # ---- Entry-point summary (red-team signal: what to chase first) ----
     entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings,
-                                          nuclei, dorks, auth_surfaces)
+                                          nuclei, dorks, auth_surfaces, whois=whois)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
