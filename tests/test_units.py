@@ -2694,3 +2694,82 @@ def test_summarize_entry_points_auth_surface_ranks_below_actionable():
     # critical takeover first, info auth-surface last
     assert eps[0]["type"] == "subdomain-takeover"
     assert eps[-1]["type"] == "auth-surface"
+
+
+def _whois_with_expiry(days_from_now):
+    from datetime import datetime, timezone, timedelta
+    exp = (datetime.now(timezone.utc) + timedelta(days=days_from_now)).isoformat()
+    w = intel.empty_whois_entry()
+    w.update({"expires": exp, "registrar": "Example Registrar"})
+    return w
+
+
+def test_summarize_entry_points_whois_expiring_within_30_days_is_medium():
+    whois = {"acme.com": _whois_with_expiry(20)}
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois=whois)
+    assert len(eps) == 1
+    assert eps[0]["type"] == "whois-domain-expiring"
+    assert eps[0]["severity"] == "medium"
+    assert eps[0]["target"] == "acme.com"
+    assert "Example Registrar" in eps[0]["summary"]
+    assert eps[0]["attck"] == "T1590.001"
+
+
+def test_summarize_entry_points_whois_expiring_within_7_days_is_high():
+    whois = {"acme.com": _whois_with_expiry(3)}
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois=whois)
+    assert len(eps) == 1
+    assert eps[0]["type"] == "whois-domain-expiring"
+    assert eps[0]["severity"] == "high"
+
+
+def test_summarize_entry_points_whois_already_expired_is_high():
+    whois = {"acme.com": _whois_with_expiry(-5)}
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois=whois)
+    assert len(eps) == 1
+    assert eps[0]["type"] == "whois-domain-expired"
+    assert eps[0]["severity"] == "high"
+    assert "takeover" in eps[0]["summary"].lower()
+
+
+def test_summarize_entry_points_whois_far_future_expiry_no_finding():
+    whois = {"acme.com": _whois_with_expiry(365)}
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois=whois)
+    assert eps == []
+
+
+def test_summarize_entry_points_whois_registrant_exposed_when_privacy_off():
+    w = intel.empty_whois_entry()
+    w.update({"privacy_protected": False, "registrant_name": "Jane Admin",
+              "registrant_org": "Acme Inc"})
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois={"acme.com": w})
+    assert len(eps) == 1
+    assert eps[0]["type"] == "whois-registrant-exposed"
+    assert eps[0]["severity"] == "info"
+    assert "Jane Admin" in eps[0]["summary"]
+    assert eps[0]["attck"] == "T1591"
+
+
+def test_summarize_entry_points_whois_no_registrant_finding_when_privacy_on_or_unknown():
+    private = intel.empty_whois_entry()
+    private.update({"privacy_protected": True, "registrant_org": "Privacy Service"})
+    unknown = intel.empty_whois_entry()
+    unknown.update({"privacy_protected": None, "registrant_name": "Someone"})
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None,
+                                       whois={"a.com": private, "b.com": unknown})
+    assert eps == []
+
+
+def test_summarize_entry_points_whois_defaults_to_none_backward_compatible():
+    # Pre-existing positional arity (no whois arg) must still work, no WHOIS finding.
+    assert intel.summarize_entry_points([], {"detected": False, "candidates": {}},
+                                        [], {}, [], []) == []
+
+
+def test_summarize_entry_points_whois_expired_ranks_above_registrant_exposed():
+    expired = _whois_with_expiry(-1)
+    exposed = intel.empty_whois_entry()
+    exposed.update({"privacy_protected": False, "registrant_name": "Jane Admin"})
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None,
+                                       whois={"a.com": expired, "b.com": exposed})
+    assert [e["type"] for e in eps] == ["whois-domain-expired", "whois-registrant-exposed"]

@@ -346,6 +346,17 @@ RPC/NetBIOS) rank **medium**; commonly-intentional exposures (SSH, mail,
 DNS) rank **low**. An unrecognized open port still gets flagged, at a
 conservative medium, even without a friendly name.
 
+**Domain-registration checks (T1590.001 / T1591).** The WHOIS/RDAP data every
+run already collects (see [Domain registration](#domain-registration-whoisrdap))
+is turned into ranked entry-points findings — no extra network calls:
+- **`whois-domain-expiring`** — registration expires within 30 days (**medium**,
+  or **high** within 7 days), an operational risk to flag to the client.
+- **`whois-domain-expired`** — registration has already lapsed (**high**): a
+  re-registration/takeover vector as well as an outage risk.
+- **`whois-registrant-exposed`** — WHOIS privacy is off and a real registrant
+  name/org is disclosed (**info**): harvestable identity/org OSINT for the
+  engagement. Privacy-protected or unknown-registrant domains produce nothing.
+
 **Live nuclei progress.** A `--nuclei` scan against many live hosts can run
 for minutes with the stock backend giving zero feedback until it finishes.
 lrecon runs nuclei with `-stats` and streams its periodic scan-status lines
@@ -509,8 +520,9 @@ structured-JSON successor to WHOIS), queried keylessly over HTTPS through
 `rdap.org`'s public bootstrap redirector to the authoritative registry. This
 always runs, including under `--passive-only`, since it only touches
 third-party registries/registrars, never the target's own infrastructure. A
-domain expiring within 30 days is flagged in the run log as worth raising
-with the client.
+domain expiring within 30 days — or already lapsed — is raised in the run log
+**and surfaced as a ranked entry-points finding** (see below) so it lands in
+the report and JSON, not just the console.
 
 **No RDAP for a domain's TLD isn't a bug.** Checked against IANA's own
 canonical RDAP bootstrap registry, several very common TLDs simply have no
