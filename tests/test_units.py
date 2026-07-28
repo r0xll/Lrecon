@@ -1048,6 +1048,179 @@ async def test_google_dork_terminal_status_stops_remaining_domains_in_core_loop(
 
 
 # --------------------------------------------------------------------------- #
+# Dork backend selection + Brave / Vertex providers
+# --------------------------------------------------------------------------- #
+def test_select_dork_provider_auto_prefers_google_then_brave_then_vertex():
+    vertex = {"access_token": "t", "project": "p", "engine": "e"}
+    both = {"google_cse": "k", "google_cse_cx": "cx", "brave": "b", "vertex": vertex}
+    assert dorking.select_dork_provider(both) == "google"
+    assert dorking.select_dork_provider({"brave": "b", "vertex": vertex}) == "brave"
+    assert dorking.select_dork_provider({"vertex": vertex}) == "vertex"
+    assert dorking.select_dork_provider({}) is None
+
+
+def test_select_dork_provider_explicit_only_when_configured():
+    keys = {"google_cse": "k", "google_cse_cx": "cx"}
+    assert dorking.select_dork_provider(keys, "google") == "google"
+    assert dorking.select_dork_provider(keys, "brave") is None      # not configured
+    assert dorking.select_dork_provider(keys, "vertex") is None
+
+
+def test_vertex_ready_needs_token_project_and_engine_or_datastore():
+    assert dorking._vertex_ready({"access_token": "t", "project": "p", "engine": "e"}) is True
+    assert dorking._vertex_ready({"access_token": "t", "project": "p", "datastore": "d"}) is True
+    assert dorking._vertex_ready({"access_token": "t", "project": "p"}) is False   # no target
+    assert dorking._vertex_ready({"project": "p", "engine": "e"}) is False         # no token
+    assert dorking._vertex_ready(None) is False
+
+
+def test_in_scope_matches_domain_and_subdomains_only():
+    assert dorking._in_scope("https://x.com/a", "x.com") is True
+    assert dorking._in_scope("https://sub.x.com/a", "x.com") is True
+    assert dorking._in_scope("https://evilx.com/a", "x.com") is False   # not a suffix boundary
+    assert dorking._in_scope("https://evil.com/a", "x.com") is False
+
+
+def test_parse_brave_response_extracts_and_skips_linkless():
+    data = {"web": {"results": [{"title": "Admin", "url": "https://x.com/admin", "description": "d"},
+                                {"title": "no url"}]}}
+    assert dorking._parse_brave_response(data) == [
+        {"title": "Admin", "link": "https://x.com/admin", "snippet": "d"}]
+    assert dorking._parse_brave_response({}) == []
+
+
+def test_parse_vertex_response_pulls_link_title_snippet():
+    data = {"results": [
+        {"document": {"derivedStructData": {"link": "https://x.com/a", "title": "T",
+                                            "snippets": [{"snippet": "s"}]}}},
+        {"document": {"derivedStructData": {"title": "no link"}}}]}
+    assert dorking._parse_vertex_response(data) == [
+        {"title": "T", "link": "https://x.com/a", "snippet": "s"}]
+
+
+async def test_brave_dork_tags_dedupes_scopes_and_sets_headers():
+    calls = []
+
+    async def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append({"url": url, "params": params, "headers": headers})
+        return _FakeResp(200, {"web": {"results": [
+            {"title": "Admin", "url": "https://x.com/admin", "description": "s"},
+            {"title": "Off-scope", "url": "https://other.com/x", "description": "s"}]}})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out, terminal = await dorking.brave_dork(client, "x.com", "bkey", limiter)
+    assert len(calls) == len(dorking.DORK_TEMPLATES)             # one query per template
+    assert len(out) == 1                                          # deduped + off-scope dropped
+    assert out[0]["link"] == "https://x.com/admin"
+    assert out[0]["category"] == dorking.DORK_TEMPLATES[0][0]
+    assert terminal is False
+    assert all(c["headers"]["X-Subscription-Token"] == "bkey" for c in calls)
+    assert all(c["params"]["q"].startswith("site:x.com ") for c in calls)
+
+
+async def test_brave_dork_stops_on_401_and_429():
+    for code in (401, 429):
+        async def fake_get(url, params=None, headers=None, timeout=None):
+            return _FakeResp(code)
+        client = type("C", (), {"get": staticmethod(fake_get)})()
+        limiter = enrich.RateLimiter(per_second=1000)
+        out, terminal = await dorking.brave_dork(client, "x.com", "bad", limiter)
+        assert out == []
+        assert terminal is True
+
+
+async def test_brave_dork_network_exception_not_terminal():
+    async def fake_get(url, params=None, headers=None, timeout=None):
+        raise Exception("boom")
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    out, terminal = await dorking.brave_dork(client, "x.com", "b", limiter)
+    assert out == []
+    assert terminal is False
+
+
+async def test_vertex_dork_posts_to_serving_config_with_bearer_and_scopes():
+    calls = []
+
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "json": json, "headers": headers})
+        return _FakeResp(200, {"results": [
+            {"document": {"derivedStructData": {"link": "https://x.com/admin", "title": "T",
+                                                "snippets": [{"snippet": "s"}]}}}]})
+    client = type("C", (), {"post": staticmethod(fake_post)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    creds = {"access_token": "tok", "project": "proj", "location": "global", "engine": "eng"}
+    out, terminal = await dorking.vertex_dork(client, "x.com", creds, limiter)
+    assert len(out) == 1 and out[0]["link"] == "https://x.com/admin"
+    assert terminal is False
+    assert all(c["headers"]["Authorization"] == "Bearer tok" for c in calls)
+    assert all("engines/eng/servingConfigs/default_search:search" in c["url"] for c in calls)
+    assert all(c["json"]["query"].startswith("site:x.com ") for c in calls)
+
+
+async def test_vertex_dork_terminal_when_config_incomplete():
+    client = type("C", (), {"post": staticmethod(lambda *a, **k: None)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    # missing engine/datastore -> no serving-config URL -> terminal, no requests
+    out, terminal = await dorking.vertex_dork(client, "x.com",
+                                              {"access_token": "t", "project": "p"}, limiter)
+    assert out == []
+    assert terminal is True
+
+
+async def test_vertex_dork_stops_on_403():
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        return _FakeResp(403)
+    client = type("C", (), {"post": staticmethod(fake_post)})()
+    limiter = enrich.RateLimiter(per_second=1000)
+    creds = {"access_token": "t", "project": "p", "datastore": "ds"}
+    out, terminal = await dorking.vertex_dork(client, "x.com", creds, limiter)
+    assert out == []
+    assert terminal is True
+
+
+async def test_dork_domain_dispatches_by_provider(monkeypatch):
+    seen = {}
+
+    async def fake_brave(client, domain, key, limiter):
+        seen["brave"] = (domain, key)
+        return [{"link": "https://x.com/a", "category": "c", "severity": "high"}], False
+    monkeypatch.setattr(dorking, "brave_dork", fake_brave)
+    keys = {"brave": "bk"}
+    out, terminal = await dorking.dork_domain(None, "x.com", "brave", keys, None)
+    assert seen["brave"] == ("x.com", "bk")
+    assert out and terminal is False
+
+
+def test_resolve_vertex_merges_config_env_cli_with_precedence(monkeypatch):
+    from lrecon import common
+    monkeypatch.delenv("VERTEX_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("GOOGLE_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("VERTEX_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.setenv("VERTEX_PROJECT", "env-proj")          # env overrides config
+    args = argparse.Namespace(vertex_access_token="cli-tok",   # CLI overrides env/config
+                              vertex_project=None, vertex_location=None,
+                              vertex_engine=None, vertex_datastore=None)
+    cfg = {"access_token": "cfg-tok", "project": "cfg-proj", "engine": "cfg-eng"}
+    out = common._resolve_vertex(cfg, args)
+    assert out["access_token"] == "cli-tok"
+    assert out["project"] == "env-proj"
+    assert out["engine"] == "cfg-eng"
+    assert out["location"] == "global"                        # defaulted
+
+
+def test_resolve_vertex_returns_none_when_nothing_configured(monkeypatch):
+    from lrecon import common
+    for v in ("VERTEX_ACCESS_TOKEN", "GOOGLE_ACCESS_TOKEN", "VERTEX_PROJECT",
+              "GOOGLE_CLOUD_PROJECT", "VERTEX_LOCATION", "VERTEX_ENGINE", "VERTEX_DATASTORE"):
+        monkeypatch.delenv(v, raising=False)
+    args = argparse.Namespace(vertex_access_token=None, vertex_project=None,
+                              vertex_location=None, vertex_engine=None, vertex_datastore=None)
+    assert common._resolve_vertex(None, args) is None
+
+
+# --------------------------------------------------------------------------- #
 # VirusTotal domain intelligence (historical IP resolutions, WHOIS mirror)
 # --------------------------------------------------------------------------- #
 _VT_DOMAIN_RESPONSE = {

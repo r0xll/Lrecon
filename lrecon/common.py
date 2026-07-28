@@ -18,6 +18,7 @@ Key precedence (each): --<svc>-key  >  $<SVC>_API_KEY / $IPINFO_TOKEN  >  config
 Config: ~/.config/lrecon/config.json  {"shodan_api_key":"...","ipinfo_token":"...",
   "github_token":"...", "hibp_api_key":"...", "hunter_api_key":"...",
   "rocketreach_api_key":"...", "google_cse_key":"...", "google_cse_cx":"...",
+  "brave_search_key":"...", "vertex":{"access_token":"...","project":"...","engine":"..."},
   "vt_api_key":"..."}
 
 ROE tiers: --passive-only | (default active) | --active-ports
@@ -134,9 +135,44 @@ CF_FALLBACK = [
 # --------------------------------------------------------------------------- #
 # Config / API keys
 # --------------------------------------------------------------------------- #
+def _resolve_vertex(cfg_base, args) -> dict | None:
+    """Merge Vertex AI Search settings from config.json (`cfg_base`), env vars,
+    and CLI flags — per field, precedence config < env < CLI. Returns None when
+    nothing at all is configured so callers can treat Vertex as absent."""
+    base = dict(cfg_base) if isinstance(cfg_base, dict) else {}
+    env = {
+        "access_token": os.environ.get("VERTEX_ACCESS_TOKEN") or os.environ.get("GOOGLE_ACCESS_TOKEN"),
+        "project": os.environ.get("VERTEX_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT"),
+        "location": os.environ.get("VERTEX_LOCATION"),
+        "engine": os.environ.get("VERTEX_ENGINE"),
+        "datastore": os.environ.get("VERTEX_DATASTORE"),
+    }
+    cli = {
+        "access_token": getattr(args, "vertex_access_token", None),
+        "project": getattr(args, "vertex_project", None),
+        "location": getattr(args, "vertex_location", None),
+        "engine": getattr(args, "vertex_engine", None),
+        "datastore": getattr(args, "vertex_datastore", None),
+    }
+    out = dict(base)
+    for field in ("access_token", "project", "location", "engine", "datastore"):
+        if env.get(field):
+            out[field] = env[field]
+        if cli.get(field):
+            out[field] = cli[field]
+    if not any(out.get(f) for f in ("access_token", "project", "engine", "datastore")):
+        return None
+    out.setdefault("location", "global")
+    return out
+
+
 def load_keys(args) -> dict:
     keys = {"shodan": None, "ipinfo": None, "github": None, "hibp": None,
             "hunter": None, "rocketreach": None, "google_cse": None, "google_cse_cx": None,
+            # Search-engine dork backends (Google CSE is closed to new
+            # customers; brave/vertex are the replacement backends). `vertex`
+            # is a dict: access_token/project/location/engine/datastore.
+            "brave": None, "vertex": None,
             "vt": None,
             # LLM (dossier/news synthesis): cloud-provider keys + the resolved
             # `llm` config section (provider/model/base_url/... from config.json).
@@ -153,6 +189,8 @@ def load_keys(args) -> dict:
             keys["rocketreach"] = data.get("rocketreach_api_key")
             keys["google_cse"] = data.get("google_cse_key")
             keys["google_cse_cx"] = data.get("google_cse_cx")
+            keys["brave"] = data.get("brave_search_key")
+            keys["vertex"] = data.get("vertex") if isinstance(data.get("vertex"), dict) else None
             keys["vt"] = data.get("vt_api_key")
             keys["openai"] = data.get("openai_api_key")
             keys["anthropic"] = data.get("anthropic_api_key")
@@ -168,6 +206,9 @@ def load_keys(args) -> dict:
     keys["rocketreach"] = os.environ.get("ROCKETREACH_API_KEY") or keys["rocketreach"]
     keys["google_cse"] = os.environ.get("GOOGLE_CSE_KEY") or keys["google_cse"]
     keys["google_cse_cx"] = os.environ.get("GOOGLE_CSE_CX") or keys["google_cse_cx"]
+    keys["brave"] = os.environ.get("BRAVE_SEARCH_API_KEY") or os.environ.get("BRAVE_API_KEY") \
+        or keys["brave"]
+    keys["vertex"] = _resolve_vertex(keys["vertex"], args)
     keys["vt"] = os.environ.get("VT_API_KEY") or keys["vt"]
     keys["openai"] = os.environ.get("OPENAI_API_KEY") or keys["openai"]
     keys["anthropic"] = os.environ.get("ANTHROPIC_API_KEY") or keys["anthropic"]
@@ -184,6 +225,8 @@ def load_keys(args) -> dict:
         keys["google_cse"] = args.google_cse_key
     if args.google_cse_cx:
         keys["google_cse_cx"] = args.google_cse_cx
+    if getattr(args, "brave_key", None):
+        keys["brave"] = args.brave_key
     if args.vt_key:
         keys["vt"] = args.vt_key
     # LLM CLI overrides layer on top of the config.json `llm` section.

@@ -22,7 +22,7 @@ lrecon/
   enrich.py      ipinfo/shodan/nvd/favicon  intel.py     cloudflare/email/github/buckets/breach/auth-surface
   active.py      http probe + tcp scan      backends.py  ProjectDiscovery wiring
   state.py       cache + diff               report.py    markdown / html / live / screenshots
-  people.py      company email/people OSINT dorking.py   Google CSE dork search
+  people.py      company email/people OSINT dorking.py   dork search (CSE/Brave/Vertex)
   llm.py         provider-neutral LLM layer news.py      factual company-intel (SEC EDGAR)
   dossier.py     dossier assembly + writers
 ```
@@ -145,7 +145,7 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 | HIBP | breach-by-domain (keyless list endpoint) | — | `HIBP_API_KEY` | keyless list |
 | Hunter.io | company email enumeration + naming-pattern detection | `--hunter-key` | `HUNTER_API_KEY` | limited |
 | RocketReach | company people search (name/title only — see below) | `--rocketreach-key` | `ROCKETREACH_API_KEY` | limited |
-| Google Custom Search | `--dork` entry-point search (admin/login/config/backup exposure) | `--google-cse-key` / `--google-cse-cx` | `GOOGLE_CSE_KEY` / `GOOGLE_CSE_CX` | 100 queries/day |
+| Search-engine dorking | `--dork` entry-point search (admin/login/config/backup exposure) via Google CSE / Brave Search / Vertex AI Search (`--dork-provider`) | `--google-cse-key`+`--google-cse-cx` / `--brave-key` / `--vertex-*` | `GOOGLE_CSE_KEY`+`GOOGLE_CSE_CX` / `BRAVE_SEARCH_API_KEY` / `VERTEX_*` | Google CSE 100/day, Brave 2k/mo |
 | VirusTotal | `--vt` domain intelligence — historical IP/hosting resolutions, WHOIS mirror, reputation | `--vt-key` | `VT_API_KEY` | 500/day, 4 req/min |
 
 ```fish
@@ -155,7 +155,7 @@ set -Ux IPINFO_TOKEN   "..."
 
 # or config file
 mkdir -p ~/.config/lrecon
-echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"...","google_cse_key":"...","google_cse_cx":"...","vt_api_key":"..."}' > ~/.config/lrecon/config.json
+echo '{"shodan_api_key":"...","ipinfo_token":"...","hunter_api_key":"...","rocketreach_api_key":"...","google_cse_key":"...","google_cse_cx":"...","brave_search_key":"...","vertex":{"access_token":"...","project":"...","engine":"..."},"vt_api_key":"..."}' > ~/.config/lrecon/config.json
 
 # or interactive (stays out of shell history)
 lrecon example.com --ask-keys
@@ -239,9 +239,11 @@ nuclei -l client.origin_ips.txt -o client_origin_nuclei.txt
 | `--nvd` | resolve CPEs to CVEs via NVD (slow, rate-limited, cached) |
 | `--company-name` | company name override for name-based people-enum sources (default: domain label) |
 | `--verify-emails` | SMTP RCPT-TO probe of discovered company emails (active, ROE-gated) |
-| `--dork` | search-engine dork for exposed admin/login/config/backup/`.git` paths (needs `--google-cse-key` + `--google-cse-cx`) |
-| `--google-cse-key` | Google Custom Search API key for `--dork` (else env/config) |
-| `--google-cse-cx` | Google Custom Search Engine ID for `--dork` (else env/config) |
+| `--dork` | search-engine dork for exposed admin/login/config/backup/`.git` paths (backend chosen by `--dork-provider`) |
+| `--dork-provider` | dork backend: `auto` (default), `google`, `brave`, or `vertex` — see [Search-engine dorking](#search-engine-dorking) |
+| `--google-cse-key` / `--google-cse-cx` | Google Custom Search API key + Engine ID (else env/config). Google CSE is closed to new customers |
+| `--brave-key` | Brave Search API key for `--dork` (else `BRAVE_SEARCH_API_KEY`/config) |
+| `--vertex-access-token` / `--vertex-project` / `--vertex-engine` / `--vertex-datastore` / `--vertex-location` | Vertex AI Search creds for `--dork` (else env/config) |
 | `--vt` | VirusTotal domain intelligence: IP/hosting history, WHOIS mirror, reputation (needs `--vt-key`) |
 | `--vt-key` | VirusTotal API key for `--vt` (else env/config) |
 | `--diff` | diff against previous run snapshot |
@@ -494,19 +496,37 @@ exposure, directory listing, backup/database files, exposed `.git`,
 API/swagger docs, debug/error pages). Findings feed the entry-points
 summary tagged **T1593.002** (Search Open Websites/Domains: Search Engines).
 
-Opt-in via **`--dork`**, and requires a **Google Custom Search JSON API**
-key + Custom Search Engine ID (`--google-cse-key`/`--google-cse-cx`, or
-`GOOGLE_CSE_KEY`/`GOOGLE_CSE_CX`, or config file). It's an explicit flag
-even when a key is configured — unlike the "presence of a key = opt-in"
-convention used for the People OSINT sources — because the free tier is
-only **100 queries/day total** and each domain burns ~7 of them; auto-running
-it could silently exhaust the day's quota on a run where you didn't need it.
+Opt-in via **`--dork`**. It's an explicit flag even when a key is configured
+— unlike the "presence of a key = opt-in" convention used for the People
+OSINT sources — because the free quotas are tight (Google CSE 100 queries/day,
+Brave 2k/month) and each domain burns ~7 queries; auto-running it could
+silently exhaust the allowance on a run where you didn't need it.
+
+**Three interchangeable backends.** Pick one with `--dork-provider`
+(`auto`/`google`/`brave`/`vertex`); `auto` uses whichever is configured,
+preferring Google CSE so existing key-holders keep their current behavior.
+
+| Backend | Flag / env | Credentials | Notes |
+|---|---|---|---|
+| **google** | `--google-cse-key` + `--google-cse-cx` (`GOOGLE_CSE_KEY`/`GOOGLE_CSE_CX`) | API key + Custom Search Engine ID | Google Custom Search JSON API. **Closed to new customers** (2025) — existing keys keep working, but new users can't sign up. |
+| **brave** | `--brave-key` (`BRAVE_SEARCH_API_KEY`/`BRAVE_API_KEY`) | one API key | **Brave Search API** — the easiest replacement to obtain: free self-serve signup, a single key, plain REST, native `site:` support. Recommended for new users. |
+| **vertex** | `--vertex-access-token` + `--vertex-project` + `--vertex-engine` *or* `--vertex-datastore` (+ optional `--vertex-location`, default `global`) | OAuth access token + GCP project + Search app/data store | **Vertex AI Search** (Discovery Engine) — Google's official CSE successor for site-restricted search (up to 50 domains per data store). Mint the token with `gcloud auth print-access-token` (`VERTEX_ACCESS_TOKEN`/`GOOGLE_ACCESS_TOKEN`); no service-account SDK is added. |
+
+All three take the same config-file/env/CLI precedence as every other key.
+For Vertex, config.json uses a `"vertex": { "access_token": …, "project": …,
+"engine": … }` object.
+
+**Result scoping.** Google CSE constrains results at the API level
+(`siteSearchFilter`); Brave and Vertex are additionally post-filtered by each
+hit's host, so a result only counts when its hostname is the target domain or
+a subdomain of it — regardless of how a search engine's query-operator
+precedence handles the `site:` in an `OR`-containing dork.
 
 **No raw search-engine scraping.** Like the [People OSINT](#people-osint-user-enumeration)
-LinkedIn decision above, lrecon does not scrape Google or DuckDuckGo HTML
-result pages directly — that means defeating anti-automation measures and
-violating those platforms' terms of service. Dorking uses Google's official,
-keyed, documented Custom Search API only. There is no DuckDuckGo fallback.
+LinkedIn decision above, lrecon does not scrape Google, Bing, or DuckDuckGo
+HTML result pages directly — that means defeating anti-automation measures and
+violating those platforms' terms of service. Every dork backend is an
+official, keyed, documented search API.
 
 A hit is a search-engine-indexed page matching a dork pattern, not a
 confirmed live exposure — verify each is actually reachable before

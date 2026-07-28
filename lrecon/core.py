@@ -429,21 +429,24 @@ async def run(domains, args, keys) -> list:
         # sources, none of which are passive-only-gated either).
         dorks = []
         if args.dork:
-            if keys.get("google_cse") and keys.get("google_cse_cx"):
+            provider = select_dork_provider(keys, getattr(args, "dork_provider", "auto"))
+            if provider:
                 dork_limiter = RateLimiter(per_second=1.0)
                 for d in domains:
-                    hits, terminal = await google_dork(client, d, keys["google_cse"],
-                                                        keys["google_cse_cx"], dork_limiter)
+                    hits, terminal = await dork_domain(client, d, provider, keys, dork_limiter)
                     dorks += hits
                     if terminal:
-                        log(f"[!] google dork: stopping after {d} — the error would repeat "
+                        log(f"[!] {provider} dork: stopping after {d} — the error would repeat "
                             f"identically for every remaining domain")
                         break
                 if dorks:
                     n_cat = len({d["category"] for d in dorks})
-                    log(f"[+] google dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
+                    log(f"[+] {provider} dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
+            elif getattr(args, "dork_provider", "auto") not in (None, "auto"):
+                log(f"[!] --dork set but --dork-provider {args.dork_provider} not configured — skipping")
             else:
-                log("[!] --dork set but --google-cse-key/--google-cse-cx not configured — skipping")
+                log("[!] --dork set but no search backend configured "
+                    "(google-cse / brave / vertex) — skipping")
 
         breach = {}
         for d in domains:

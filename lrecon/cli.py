@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
 from .core import run
+from .dorking import select_dork_provider
 from .report import (write_markdown, write_html, write_live_hosts, write_csv, write_users_csv,
                      write_origin_ips, screenshot_hosts)
 from .backends import available_backends
@@ -102,11 +103,26 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--bucket-keywords", help="extra comma-separated bucket keywords")
     ap.add_argument("--dork", action="store_true",
                     help="search-engine dork for exposed admin/login panels, config/env files, "
-                         "directory listings, .git/backup leaks, etc. via Google Custom Search "
-                         "(needs --google-cse-key + --google-cse-cx; free tier is 100 queries/day "
-                         "total, ~7 queries per domain — explicit flag even with a key configured)")
+                         "directory listings, .git/backup leaks, etc. (~7 queries per domain; "
+                         "explicit flag even with a key configured, since free quotas are tight). "
+                         "Backend auto-selected from configured creds — see --dork-provider")
+    ap.add_argument("--dork-provider", choices=["auto", "google", "brave", "vertex"],
+                    default="auto",
+                    help="dork search backend: google (Custom Search JSON API — closed to new "
+                         "customers), brave (Brave Search API — easiest free signup), vertex "
+                         "(Vertex AI Search / Discovery Engine). 'auto' picks the first configured, "
+                         "preferring google for existing key-holders")
     ap.add_argument("--google-cse-key", help="Google Custom Search API key (else env/config)")
     ap.add_argument("--google-cse-cx", help="Google Custom Search Engine ID (else env/config)")
+    ap.add_argument("--brave-key", help="Brave Search API key (else BRAVE_SEARCH_API_KEY/config)")
+    ap.add_argument("--vertex-access-token",
+                    help="Vertex AI Search OAuth access token, e.g. `gcloud auth "
+                         "print-access-token` (else VERTEX_ACCESS_TOKEN/GOOGLE_ACCESS_TOKEN/config)")
+    ap.add_argument("--vertex-project", help="Vertex AI Search GCP project (else env/config)")
+    ap.add_argument("--vertex-location", help="Vertex AI Search location (default 'global')")
+    ap.add_argument("--vertex-engine", help="Vertex AI Search engine/app ID (else env/config)")
+    ap.add_argument("--vertex-datastore",
+                    help="Vertex AI Search data-store ID (used if --vertex-engine unset)")
     ap.add_argument("--vt", action="store_true",
                     help="VirusTotal domain intelligence: historical IP resolutions "
                          "(hosting history), WHOIS mirror, DNS-record snapshot, reputation "
@@ -226,8 +242,14 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     log(f"[i] people-enum: {', '.join(people_sources) if people_sources else 'off (no hunter/rocketreach/github key)'}"
         f" | email verify: {'on (active)' if args.verify_emails else 'off'}")
     if args.dork:
-        dork_ready = bool(keys["google_cse"] and keys["google_cse_cx"])
-        log(f"[i] google dork: {'on' if dork_ready else 'requested but not configured — will skip'}")
+        provider = select_dork_provider(keys, args.dork_provider)
+        if provider:
+            log(f"[i] dork: on (backend: {provider})")
+        elif args.dork_provider != "auto":
+            log(f"[i] dork: requested backend '{args.dork_provider}' not configured — will skip")
+        else:
+            log("[i] dork: requested but no search backend configured "
+                "(google-cse / brave / vertex) — will skip")
     if args.vt:
         log(f"[i] VirusTotal domain intel: {'on' if keys['vt'] else 'requested but not configured — will skip'}")
     if args.no_pd:
@@ -359,6 +381,8 @@ def _cmd_enum(argv) -> None:
     ap.add_argument("--rocketreach-key")
     # load_keys reads several attributes that this subparser doesn't define.
     for attr in ("shodan_key", "ipinfo_key", "vt_key", "google_cse_key", "google_cse_cx",
+                 "brave_key", "vertex_access_token", "vertex_project", "vertex_location",
+                 "vertex_engine", "vertex_datastore",
                  "ask_keys", "llm_provider", "llm_model", "llm_base_url"):
         ap.set_defaults(**{attr: None})
     args = ap.parse_args(argv)
