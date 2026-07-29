@@ -25,6 +25,15 @@ def have(tool: str) -> bool:
     return shutil.which(tool) is not None
 
 
+# crt.sh direct-Postgres tier budgets. Short on purpose: this tier is a
+# best-effort accelerator whose whole value is being *faster* than the HTTP
+# frontend, and where raw TCP :5432 is firewalled the connect never refuses —
+# it just hangs — so a long timeout only delays the HTTP fallback.
+CRTSH_PSQL_CONNECT_TIMEOUT = 8        # seconds, psql's own TCP connect (PGCONNECT_TIMEOUT)
+CRTSH_PSQL_TIMEOUT = 12               # seconds, outer backstop on the whole psql run
+CRTSH_PSQL_STATEMENT_TIMEOUT_MS = 20000   # server-side cap on a slow certwatch query
+
+
 _HTTPX_NAMES = ("httpx", "httpx-pd", "pdhttpx")
 
 
@@ -80,15 +89,29 @@ def is_pd_httpx() -> bool:
     return pd_httpx_bin() is not None
 
 
-async def _run(cmd: list, stdin: bytes | None = None, timeout: int = 900) -> str:
+async def _run(cmd: list, stdin: bytes | None = None, timeout: int = 900,
+               env: dict | None = None) -> str:
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE if stdin is not None else None,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL)
+            stderr=asyncio.subprocess.DEVNULL,
+            env=env)
         out, _ = await asyncio.wait_for(proc.communicate(stdin), timeout=timeout)
         return out.decode(errors="ignore")
+    except asyncio.TimeoutError:
+        # Don't leave the child running (and holding its socket) after we've
+        # stopped waiting for it — a hung psql/naabu would otherwise linger
+        # for the rest of the process's life.
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        log(f"[!] backend {cmd[0]}: timed out after {timeout}s")
+        return ""
     except Exception as e:
         log(f"[!] backend {cmd[0]}: {e}")
         return ""
@@ -274,6 +297,18 @@ async def crtsh_psql(domain: str) -> list | None:
 
     The domain is passed via psql's :'var' substitution (psql handles the SQL
     quoting/escaping), never string-interpolated into the query text.
+
+    Timeouts are deliberately short. Raw TCP to port 5432 is blocked outright
+    in some sandboxed execution environments (Claude Code's own remote
+    containers included — see /root/.ccr/README.md's "Not supported through
+    the proxy: ... raw-TCP databases"), exactly as for classic WHOIS/port 43
+    in intel.whois_lookup(). There, a blocked connect doesn't fail fast: psql
+    sits in its connect until *our* timeout fires, so a generous timeout turns
+    into a per-domain stall with nothing to show for it. PGCONNECT_TIMEOUT
+    bounds psql's own connect attempt, and the outer timeout is a backstop —
+    together they keep the HTTP fallback quick instead of making crt.sh look
+    hung/broken. `blocked=True` is reported back so the caller can say which
+    tier was actually used.
     """
     if not have("psql"):
         return None
@@ -282,7 +317,11 @@ async def crtsh_psql(domain: str) -> list | None:
     cmd = ["psql", "-h", "crt.sh", "-p", "5432", "-U", "guest", "-d", "certwatch",
           "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-v", f"pattern=%.{domain}",
           "-c", query]
-    out = await _run(cmd, timeout=45)
+    # PGCONNECT_TIMEOUT caps psql's own TCP connect; statement_timeout caps a
+    # slow query server-side so a huge domain can't hang the run either.
+    env = {**os.environ, "PGCONNECT_TIMEOUT": str(CRTSH_PSQL_CONNECT_TIMEOUT),
+           "PGOPTIONS": f"-c statement_timeout={CRTSH_PSQL_STATEMENT_TIMEOUT_MS}"}
+    out = await _run(cmd, timeout=CRTSH_PSQL_TIMEOUT, env=env)
     rows = [line.strip() for line in out.splitlines() if line.strip()]
     return rows or None
 

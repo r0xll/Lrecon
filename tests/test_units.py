@@ -169,14 +169,28 @@ class _FakeResp:
         return self._data
 
 
+class _FakeRespText:
+    """Response whose body is text (bucket listing XML), not JSON."""
+    def __init__(self, status_code, text=""):
+        self.status_code = status_code
+        self.text = text
+        self.content = text.encode()
+
+    def json(self):
+        raise ValueError("not json")
+
+
 class _FlakyClient:
-    """Replays canned responses/exceptions in order; counts calls."""
+    """Replays canned responses/exceptions in order; counts calls and records
+    the URLs requested (callers assert on query-form alternation)."""
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = 0
+        self.urls = []
 
-    async def get(self, url, timeout=None):
+    async def get(self, url, timeout=None, **kwargs):
         self.calls += 1
+        self.urls.append(url)
         resp = self._responses.pop(0)
         if isinstance(resp, Exception):
             raise resp
@@ -200,10 +214,58 @@ async def test_enum_crtsh_gives_up_after_max_attempts(monkeypatch):
     async def no_sleep(*a, **kw):
         return None
     monkeypatch.setattr(sources.asyncio, "sleep", no_sleep)
-    client = _FlakyClient([_FakeResp(503)] * 4)
+    client = _FlakyClient([_FakeResp(503)] * 5)
     out = await sources.enum_crtsh(client, "x.com")
     assert out == set()
-    assert client.calls == 4
+    assert client.calls == 5
+    # Alternates the two query forms so a planner timeout on one form doesn't
+    # burn every attempt.
+    assert any("?q=" in u for u in client.urls)
+    assert any("identity=" in u for u in client.urls)
+
+
+async def test_enum_crtsh_stops_early_on_non_retryable_4xx(monkeypatch):
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(sources.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([_FakeResp(404)] * 5)
+    out = await sources.enum_crtsh(client, "x.com")
+    assert out == set()
+    assert client.calls == 1        # 404 won't fix itself — don't burn retries
+
+
+async def test_enum_crtsh_retries_200_with_non_list_body(monkeypatch):
+    """A 200 carrying an HTML error page / dict is a crt.sh failure mode, not an
+    empty result — it must be retried, not accepted as 'no certs'."""
+    async def no_sleep(*a, **kw):
+        return None
+    monkeypatch.setattr(sources.asyncio, "sleep", no_sleep)
+    client = _FlakyClient([
+        _FakeResp(200, {"error": "hosed"}),
+        _FakeResp(200, [{"name_value": "a.x.com", "common_name": None}]),
+    ])
+    out = await sources.enum_crtsh(client, "x.com")
+    assert out == {"a.x.com"}
+    assert client.calls == 2
+
+
+def test_crtsh_name_in_scope_enforces_label_boundary():
+    # A bare endswith() accepts testexample.com for example.com — confirmed
+    # live that crt.sh's %.example.com pattern returns such names.
+    assert sources._crtsh_name_in_scope("dev.example.com", "example.com") is True
+    assert sources._crtsh_name_in_scope("example.com", "example.com") is True
+    assert sources._crtsh_name_in_scope("m.testexample.com", "example.com") is False
+    assert sources._crtsh_name_in_scope("testexample.com", "example.com") is False
+    # rfc822Name subjects are not hosts to scan
+    assert sources._crtsh_name_in_scope("subjectname@example.com", "example.com") is False
+    assert sources._crtsh_name_in_scope("", "example.com") is False
+
+
+def test_parse_crtsh_rows_scopes_and_strips(monkeypatch):
+    rows = [{"name_value": "*.a.x.com\nb.x.com\nevil.notx.com\nuser@x.com",
+             "common_name": "c.x.com."},
+            "not-a-dict"]
+    assert sources._parse_crtsh_rows(rows, "x.com") == {"a.x.com", "b.x.com", "c.x.com"}
 
 
 # --------------------------------------------------------------------------- #
@@ -211,11 +273,19 @@ async def test_enum_crtsh_gives_up_after_max_attempts(monkeypatch):
 # --------------------------------------------------------------------------- #
 async def test_crtsh_psql_parses_rows(monkeypatch):
     monkeypatch.setattr(backends, "have", lambda t: True)
-    async def fake_run(cmd, stdin=None, timeout=900):
+    seen = {}
+    async def fake_run(cmd, stdin=None, timeout=900, env=None):
+        seen["timeout"] = timeout
+        seen["env"] = env or {}
         return "a.x.com\nb.x.com\n"
     monkeypatch.setattr(backends, "_run", fake_run)
     rows = await backends.crtsh_psql("x.com")
     assert rows == ["a.x.com", "b.x.com"]
+    # Short, bounded budgets: raw TCP :5432 hangs rather than refusing where it
+    # is firewalled, so an unbounded first tier would stall the whole run.
+    assert seen["timeout"] == backends.CRTSH_PSQL_TIMEOUT
+    assert seen["env"]["PGCONNECT_TIMEOUT"] == str(backends.CRTSH_PSQL_CONNECT_TIMEOUT)
+    assert "statement_timeout" in seen["env"]["PGOPTIONS"]
 
 
 async def test_crtsh_psql_not_on_path_returns_none(monkeypatch):
@@ -227,7 +297,7 @@ async def test_crtsh_psql_empty_output_returns_none(monkeypatch):
     # Covers both a genuinely empty result and a silent connection failure —
     # either way the caller falls back to the HTTP path as cheap insurance.
     monkeypatch.setattr(backends, "have", lambda t: True)
-    async def fake_run(cmd, stdin=None, timeout=900):
+    async def fake_run(cmd, stdin=None, timeout=900, env=None):
         return ""
     monkeypatch.setattr(backends, "_run", fake_run)
     assert await backends.crtsh_psql("x.com") is None
@@ -395,6 +465,106 @@ def test_bucket_candidates_permutation():
     c = intel.bucket_candidates(["acme"])
     assert "acme" in c and "acme-backups" in c
     assert all(" " not in name for name in c)          # valid bucket names
+
+
+_S3_LISTING = """<?xml version="1.0"?>
+<ListBucketResult><Name>acme</Name><IsTruncated>false</IsTruncated>
+<Contents><Key>logo.png</Key><Size>2048</Size></Contents>
+<Contents><Key>backups/db.sql</Key><Size>1048576</Size></Contents>
+<Contents><Key>.env</Key><Size>512</Size></Contents>
+<Contents><Key>assets/</Key><Size>0</Size></Contents>
+</ListBucketResult>"""
+
+_AZURE_LISTING = """<?xml version="1.0"?>
+<EnumerationResults><Blobs>
+<Blob><Name>report.pdf</Name><Properties><Content-Length>4096</Content-Length></Properties></Blob>
+<Blob><Name>id_rsa</Name><Properties><Content-Length>1675</Content-Length></Properties></Blob>
+</Blobs><NextMarker>abc</NextMarker></EnumerationResults>"""
+
+
+def test_parse_bucket_listing_s3_keys_sizes_and_interesting():
+    out = intel._parse_bucket_listing("s3", "acme", _S3_LISTING)
+    keys = [o["key"] for o in out["objects"]]
+    assert keys == ["logo.png", "backups/db.sql", ".env"]   # folder placeholder skipped
+    assert out["object_count"] == 3
+    assert out["bytes"] == 2048 + 1048576 + 512
+    assert out["truncated"] is False
+    # .sql dump and .env are sensitive; a logo is not
+    assert sorted(o["key"] for o in out["interesting"]) == [".env", "backups/db.sql"]
+
+
+def test_parse_bucket_listing_azure_shape_and_truncation():
+    out = intel._parse_bucket_listing("azure", "acme", _AZURE_LISTING)
+    assert [o["key"] for o in out["objects"]] == ["report.pdf", "id_rsa"]
+    assert out["truncated"] is True                        # NextMarker present
+    assert any(o["key"] == "id_rsa" for o in out["interesting"])
+    assert out["objects"][1]["size"] == 1675
+
+
+def test_interesting_object_matches_variant_suffix_forms_not_static_assets():
+    """The highest-value keys in the wild are variant forms (.env.production,
+    db.sql.gz, config.yml.bak) — anchoring strictly to end-of-string misses
+    exactly those. Static assets must not be flagged."""
+    sensitive = [".env", ".env.production", ".env.local", "db/prod.sql", "db.sql.gz",
+                 "config.yml.bak", "settings.ini.old", "id_rsa", "terraform.tfstate",
+                 ".git/config", "creds/password.txt", "backups/2024.zip",
+                 ".aws/credentials", "web.config", "users.csv"]
+    benign = ["img/logo.png", "css/main.css", "index.html", "fonts/roboto.woff2",
+              "video/intro.mp4", "README.md", "favicon.ico"]
+    for key in sensitive:
+        assert intel._INTERESTING_OBJECT_RE.search(key), f"{key} should be flagged"
+    for key in benign:
+        assert not intel._INTERESTING_OBJECT_RE.search(key), f"{key} should NOT be flagged"
+
+
+def test_parse_bucket_listing_malformed_body_is_empty_not_raising():
+    out = intel._parse_bucket_listing("s3", "acme", "<html>nope</html>")
+    assert out["object_count"] == 0 and out["objects"] == [] and out["interesting"] == []
+
+
+def test_bucket_object_url_per_provider_and_quoting():
+    assert intel._bucket_object_url("s3", "acme", "a/b.txt") == \
+        "https://acme.s3.amazonaws.com/a/b.txt"
+    assert intel._bucket_object_url("gcs", "acme", "a/b.txt") == \
+        "https://storage.googleapis.com/acme/a/b.txt"
+    assert intel._bucket_object_url("azure", "acme", "a/b.txt") == \
+        "https://acme.blob.core.windows.net/a/b.txt"
+    # spaces must be escaped so the link is usable
+    assert "%20" in intel._bucket_object_url("s3", "acme", "my file.txt")
+
+
+async def test_bucket_enum_attaches_objects_for_public_and_not_for_403():
+    async def fake_get(url, timeout=None):
+        if url.startswith("https://acme.s3.amazonaws.com"):
+            return _FakeRespText(200, _S3_LISTING)
+        return _FakeRespText(403, "denied")
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+    out = await intel.bucket_enum(client, ["acme"])
+    public = [b for b in out if b["public"]]
+    private = [b for b in out if not b["public"]]
+    assert public and public[0]["object_count"] == 3
+    assert any(o["key"] == ".env" for o in public[0]["interesting"])
+    # non-public entries keep the original shape — no object fields bolted on
+    assert private and "objects" not in private[0]
+
+
+def test_summarize_entry_points_public_bucket_lists_sensitive_objects():
+    buckets = [{"name": "acme", "provider": "s3", "url": "https://acme.s3.amazonaws.com",
+                "status": 200, "public": True, "object_count": 3, "truncated": False,
+                "interesting": [{"key": ".env", "url": "u", "size": 5, "interesting": True}],
+                "objects": []}]
+    eps = intel.summarize_entry_points([], {}, buckets, {}, [], [])
+    assert len(eps) == 1
+    ep = eps[0]
+    assert ep["type"] == "public-bucket"
+    assert ep["severity"] == "critical"          # sensitive objects present
+    assert "3 object(s)" in ep["summary"] and ".env" in ep["summary"]
+
+
+def test_summarize_entry_points_public_bucket_without_objects_stays_high():
+    buckets = [{"name": "acme", "provider": "s3", "url": "u", "status": 200, "public": True}]
+    eps = intel.summarize_entry_points([], {}, buckets, {}, [], [])
+    assert eps[0]["severity"] == "high"          # backward compatible, no object data
 
 
 def test_in_cf_range_membership():
@@ -902,6 +1072,151 @@ async def test_dns_lookup_missing_records_default_empty(monkeypatch):
     monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver({}))
     out = await intel.dns_lookup("nx.test", None)
     assert out == {"a": [], "aaaa": [], "mx": [], "ns": [], "txt": [], "soa": None}
+
+
+# --------------------------------------------------------------------------- #
+# Email security posture — full SPF/DKIM/DMARC records + parsed analysis
+# --------------------------------------------------------------------------- #
+def test_parse_spf_extracts_mechanisms_and_qualifier():
+    sp = intel.parse_spf("v=spf1 include:_spf.google.com ip4:1.2.3.0/24 a mx ~all")
+    assert sp["all_qualifier"] == "~"
+    assert sp["includes"] == ["_spf.google.com"]
+    assert sp["ip4"] == ["1.2.3.0/24"]
+    # include + a + mx each cost a DNS lookup; ip4 and all do not
+    assert sp["lookup_count"] == 3
+    assert sp["exceeds_lookup_limit"] is False
+
+
+def test_parse_spf_flags_lookup_limit_overflow_and_ptr():
+    rec = "v=spf1 " + " ".join(f"include:s{i}.test" for i in range(11)) + " ptr -all"
+    sp = intel.parse_spf(rec)
+    assert sp["lookup_count"] > intel.SPF_MAX_LOOKUPS
+    assert sp["exceeds_lookup_limit"] is True
+    assert sp["ptr"] is True
+    assert sp["all_qualifier"] == "-"
+
+
+def test_parse_spf_handles_none_and_redirect():
+    assert intel.parse_spf(None)["mechanisms"] == []
+    assert intel.parse_spf("v=spf1 redirect=_spf.other.test")["redirect"] == "_spf.other.test"
+
+
+def test_parse_dmarc_tag_values():
+    dp = intel.parse_dmarc("v=DMARC1; p=reject; sp=none; pct=50; "
+                           "rua=mailto:a@x.test,mailto:b@x.test; adkim=s")
+    assert dp["p"] == "reject" and dp["sp"] == "none"
+    assert dp["pct"] == 50
+    assert dp["rua"] == ["mailto:a@x.test", "mailto:b@x.test"]
+    assert dp["adkim"] == "s"
+    assert intel.parse_dmarc(None)["p"] is None
+
+
+async def test_email_security_keeps_full_records_and_dkim_selector(monkeypatch):
+    spf = "v=spf1 include:_spf.google.com ~all"
+    dmarc = "v=DMARC1; p=reject; rua=mailto:d@x.test"
+    dkim = "v=DKIM1; k=rsa; p=MIIBIjANBg"
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord(spf)],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord(dmarc)],
+        ("google._domainkey.x.test", "TXT"): [_FakeTXTRecord(dkim)],
+    }
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    # Verbatim records must survive to the report, not just a grade.
+    assert out["spf"] == spf
+    assert out["dmarc"] == dmarc
+    assert out["dkim"] is True
+    assert out["dkim_selector"] == "google"      # names which selector matched
+    assert out["dkim_record"] == dkim
+    assert out["spf_parsed"]["includes"] == ["_spf.google.com"]
+    assert out["dmarc_parsed"]["p"] == "reject"
+    assert out["grade"] == "PASS" and out["issues"] == []
+
+
+async def test_email_security_flags_pct_sp_and_missing_rua(monkeypatch):
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord("v=spf1 -all")],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord("v=DMARC1; p=reject; sp=none; pct=20")],
+        ("default._domainkey.x.test", "TXT"): [_FakeTXTRecord("v=DKIM1; p=k")],
+    }
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    joined = " | ".join(out["issues"])
+    assert "pct=20" in joined
+    assert "sp=none" in joined
+    assert "rua=" in joined
+
+
+class NXDOMAIN(Exception):
+    """Stands in for dns.resolver.NXDOMAIN — matched by class name."""
+
+
+class NoAnswer(Exception):
+    """Stands in for dns.resolver.NoAnswer — matched by class name."""
+
+
+class _AbsentRecordResolver:
+    """Every name resolves to a definitive 'nothing published' answer."""
+    async def resolve(self, name, rtype, **kwargs):
+        raise NoAnswer(f"no {rtype} for {name}")
+
+
+class _BrokenResolver:
+    """Every lookup fails with a transport error (timeout/servfail), counting
+    calls so the TCP retry can be observed."""
+    def __init__(self):
+        self.calls = []
+
+    async def resolve(self, name, rtype, **kwargs):
+        self.calls.append((name, rtype, kwargs.get("tcp", False)))
+        raise Exception("LifetimeTimeout")
+
+
+async def test_email_security_absent_records_fail_and_list_selectors(monkeypatch):
+    """A definitive NoAnswer means the records really aren't published — that is
+    a genuine FAIL, distinct from a lookup that errored out."""
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _AbsentRecordResolver())
+    out = await intel.email_security("x.test", None)
+    assert out["grade"] == "FAIL"
+    assert out["spf"] is None and out["dmarc"] is None and out["dkim"] is False
+    assert out["dkim_selector"] is None
+    assert out["lookup_errors"] == []                     # nothing failed, records absent
+    joined = " | ".join(out["issues"])
+    assert "No SPF record" in joined and "No DMARC record" in joined
+    # the selectors actually probed are recorded so "inconclusive" is explicit
+    assert out["dkim_selectors_checked"] == list(intel.DKIM_SELECTORS)
+
+
+async def test_email_security_failed_lookup_is_inconclusive_not_a_missing_record(monkeypatch):
+    """A DNS timeout must NOT be reported as 'No SPF record' — that would put a
+    false finding in a client deliverable. It is inconclusive instead."""
+    broken = _BrokenResolver()
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: broken)
+    out = await intel.email_security("x.test", None)
+    joined = " | ".join(out["issues"])
+    assert "SPF lookup failed (inconclusive" in joined
+    assert "DMARC lookup failed (inconclusive" in joined
+    assert "No SPF record" not in joined and "No DMARC record" not in joined
+    assert out["lookup_errors"]                           # the failure is recorded
+    assert out["grade"] != "FAIL"                         # not a confirmed failure
+    # Apex TXT is retried over TCP — a large real-world TXT set exceeds UDP's
+    # 512 bytes and SPF is exactly what goes missing on truncation.
+    assert ("x.test", "TXT", True) in broken.calls
+
+
+async def test_email_security_nxdomain_not_retried_over_tcp(monkeypatch):
+    """NXDOMAIN/NoAnswer are real answers — retrying them over TCP is wasted
+    queries against every DKIM selector."""
+    class _Counting(_AbsentRecordResolver):
+        def __init__(self):
+            self.calls = []
+        async def resolve(self, name, rtype, **kwargs):
+            self.calls.append(kwargs.get("tcp", False))
+            raise NXDOMAIN("nope")
+    r = _Counting()
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: r)
+    await intel.email_security("x.test", None)
+    assert all(tcp is False for tcp in r.calls)
 
 
 def test_classify_mail_provider_matches_known_hosts():

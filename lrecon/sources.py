@@ -19,15 +19,66 @@ async def enum_crtsh_best(client, domain: str, use_psql: bool = True) -> set:
     hardened with its own retry/backoff) when psql isn't available, or when
     it ran but produced nothing — cheap insurance against a silent
     connection failure looking identical to a genuinely empty result.
+
+    The psql tier is bounded by short timeouts (see backends.crtsh_psql):
+    where raw TCP :5432 is firewalled the connect hangs rather than refusing,
+    so an unbounded first tier would stall every domain before the HTTP tier
+    ever runs — which presents as "crt.sh doesn't work" even though the HTTP
+    path is fine.
     """
     if use_psql:
         rows = await backends.crtsh_psql(domain)
         if rows:
-            out = {n.strip().lstrip("*.").lower() for n in rows}
-            out = {n for n in out if n and n.endswith(domain) and " " not in n}
+            # Same label-boundary scoping as the HTTP tier — see
+            # _crtsh_name_in_scope (a bare endswith would accept
+            # testexample.com for example.com).
+            out = {n.strip().lstrip("*.").lower().rstrip(".") for n in rows}
+            out = {n for n in out if _crtsh_name_in_scope(n, domain)}
             if out:
                 return out
+        log(f"[i] crt.sh {domain}: direct-DB tier unavailable/empty — using HTTP frontend "
+            f"(--no-pd skips the psql tier entirely)")
     return await enum_crtsh(client, domain)
+
+
+# crt.sh returns 502/504 mostly when its own query planner times out on a big
+# result set, so these are worth retrying — and worth shrinking the query for.
+_CRTSH_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def _crtsh_name_in_scope(name: str, domain: str) -> bool:
+    """
+    True only for the apex itself or a real subdomain of it.
+
+    A bare `endswith(domain)` test is wrong at the label boundary: it accepts
+    `testexample.com` for `example.com` (confirmed live — crt.sh's
+    `%.example.com` pattern does return names like `m.testexample.com`). Adding
+    an out-of-scope third party's host to an engagement's scope is an ROE
+    problem, not a cosmetic one, so the boundary is checked explicitly.
+
+    Email addresses are also rejected: certificate subjects can carry an
+    rfc822Name (e.g. `subjectname@example.com`), which is not a host to scan.
+    The psql tier already excludes these server-side (`NOT ILIKE '%@%'`); this
+    keeps the HTTP tier consistent with it.
+    """
+    if not name or " " in name or "@" in name:
+        return False
+    return name == domain or name.endswith("." + domain)
+
+
+def _parse_crtsh_rows(rows, domain: str) -> set:
+    """Names out of crt.sh's JSON rows, scoped to `domain`. Each row carries a
+    newline-separated `name_value` (SAN list) plus a `common_name`."""
+    out = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        names = f"{row.get('name_value', '')}\n{row.get('common_name') or ''}"
+        for n in names.splitlines():
+            n = n.strip().lstrip("*.").lower().rstrip(".")
+            if _crtsh_name_in_scope(n, domain):
+                out.add(n)
+    return out
 
 
 async def enum_crtsh(client, domain: str) -> set:
@@ -36,28 +87,65 @@ async def enum_crtsh(client, domain: str) -> set:
     5xx, or a truncated/non-JSON body on a 200) — retry with exponential
     backoff + jitter rather than giving up after one retry. Non-200/bad-JSON
     responses are retried too, not just network exceptions.
+
+    Two query forms are alternated across attempts. Both are documented and
+    cover the same identity pattern, but they take different paths through
+    crt.sh's backend, so one frequently succeeds while the other 502s
+    (measured: `identity=` returned 77 names while `q=` was 502-ing, and vice
+    versa minutes later):
+
+      1. ?q=%.{domain}          — wildcard match on the identity
+      2. ?identity=%.{domain}   — explicit identity lookup
+
+    Deliberately does NOT send `exclude=expired`. It looks attractive (smaller
+    result set = fewer planner timeouts) but measured against example.com it
+    dropped 77 names to 20 — and expired certs are exactly where forgotten
+    dev/staging hostnames live, which is the point of CT enumeration. It also
+    didn't actually stop the 502s.
+
+    On total failure the per-attempt statuses are logged, so a bad run is
+    diagnosable instead of looking like a silent empty result.
     """
     out = set()
-    last_err = None
-    attempts = 4
+    errors = []
+    attempts = 5
     for attempt in range(attempts):
+        # Alternate the two query forms so a planner timeout on one doesn't
+        # burn every attempt.
+        if attempt % 2 == 0:
+            url = f"https://crt.sh/?q=%25.{domain}&output=json"
+        else:
+            url = f"https://crt.sh/?identity=%25.{domain}&output=json"
         try:
-            r = await client.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=45)
+            r = await client.get(url, headers={"Accept": "application/json"}, timeout=45)
             if r.status_code == 200:
-                for row in r.json():
-                    names = f"{row.get('name_value', '')}\n{row.get('common_name') or ''}"
-                    for n in names.splitlines():
-                        n = n.strip().lstrip("*.").lower()
-                        if n and n.endswith(domain) and " " not in n:
-                            out.add(n)
-                return out
-            last_err = f"HTTP {r.status_code}"
+                try:
+                    rows = r.json()
+                except Exception as e:
+                    # A 200 carrying a truncated/HTML body is a crt.sh failure
+                    # mode, not an empty result — retry rather than accept it.
+                    errors.append(f"200 but bad JSON ({e})")
+                    rows = None
+                if isinstance(rows, list):
+                    if rows:
+                        return _parse_crtsh_rows(rows, domain)
+                    # An empty list is a legitimate "no certs" answer, but it's
+                    # also what a truncated response looks like. Accept it only
+                    # on the final attempt.
+                    errors.append("200 with empty result")
+                elif rows is not None:
+                    errors.append(f"200 but unexpected JSON type ({type(rows).__name__})")
+            else:
+                errors.append(f"HTTP {r.status_code}")
+                if r.status_code not in _CRTSH_RETRY_STATUS:
+                    break      # 4xx other than 429 won't fix itself
         except Exception as e:
-            last_err = str(e)
+            errors.append(f"{type(e).__name__}: {e}")
         if attempt < attempts - 1:
             await asyncio.sleep(min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
-    if last_err:
-        log(f"[!] crt.sh {domain}: {last_err} (gave up after {attempts} attempts)")
+    if errors:
+        log(f"[!] crt.sh {domain}: no data after {len(errors)} attempt(s) "
+            f"[{'; '.join(errors[:5])}] — other CT sources (certspotter/OTX) still cover this")
     return out
 
 
