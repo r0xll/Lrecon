@@ -376,6 +376,18 @@ async def run(domains, args, keys) -> list:
             await _gather_with_progress((do_active(h) for h in active_hosts),
                                         "probing", use_prog)
 
+            # ---- GitHub Pages: is the lead actually claimable? ----
+            # *.github.io is wildcarded, so a dead Pages target never NXDOMAINs
+            # and the body signature is the only thing that fires — and it reads
+            # the same for a free username as for a live account with no site.
+            # One account lookup separates them; without it every stale Pages
+            # record from a working org reads as a takeover.
+            pages_hosts = [h for h in active_hosts
+                           if h.takeover and github_pages_account(h.cname)]
+            if pages_hosts:
+                await asyncio.gather(*(resolve_github_pages_claimability(
+                    probe_client, h, keys.get("github")) for h in pages_hosts))
+
             # ---- Tech-stack confirmation: does the live probe corroborate
             # Shodan/InternetDB's (possibly stale) reported software? ----
             for h in active_hosts:

@@ -1,0 +1,132 @@
+{
+  "cf": {
+    "detected": false,
+    "fronted": [],
+    "candidates": {}
+  },
+  "email": {},
+  "github": [],
+  "buckets": [],
+  "breach": {},
+  "asn": {},
+  "favicon_pivots": {},
+  "nuclei": [],
+  "diff": {},
+  "per_source": {
+    "crtsh": 0,
+    "certspotter": 2,
+    "otx": 0,
+    "anubis": 0,
+    "wayback": 0,
+    "subfinder": 0
+  },
+  "entry_points": [
+    {
+      "type": "whois-domain-expiring",
+      "target": "example.com",
+      "severity": "medium",
+      "summary": "Domain registration expires in 13 day(s) (2026-08-13T04:00:00Z) (registrar: RESERVED-Internet Assigned Numbers Authority) \u2014 flag to client",
+      "attck": "T1590.001"
+    }
+  ],
+  "whois": {
+    "example.com": {
+      "registrar": "RESERVED-Internet Assigned Numbers Authority",
+      "created": "1995-08-14T04:00:00Z",
+      "expires": "2026-08-13T04:00:00Z",
+      "last_changed": "2026-01-16T18:26:50Z",
+      "nameservers": [
+        "elliott.ns.cloudflare.com",
+        "hera.ns.cloudflare.com"
+      ],
+      "status": [
+        "client delete prohibited",
+        "client transfer prohibited",
+        "client update prohibited"
+      ],
+      "registrant_name": null,
+      "registrant_org": null,
+      "privacy_protected": null,
+      "privacy_provider": null,
+      "source": "rdap"
+    }
+  },
+  "dorks": [],
+  "dns": {},
+  "mail_infra": {},
+  "vt": {},
+  "auth_surface": [],
+  "certs": [],
+  "axfr": {},
+  "security_txt": [],
+  "hosts": [
+    {
+      "subdomain": "example.com",
+      "ips": [],
+      "cname": null,
+      "ports": [],
+      "vulns": [],
+      "cpes": [],
+      "org": null,
+      "isp": null,
+      "asn": null,
+      "ip_asn": {},
+      "ip_org": {},
+      "rdns": null,
+      "country": null,
+      "http_status": null,
+      "http_title": null,
+      "server": null,
+      "powered_by": null,
+      "tech": [],
+      "scheme": null,
+      "final_url": null,
+      "favicon_hash": null,
+      "nvd_cves": [],
+      "tech_confirmed": null,
+      "takeover": null,
+      "takeover_confidence": null,
+      "stale_dns": null,
+      "wildcard": false,
+      "enrich_src": [],
+      "source": [
+        "certspotter",
+        "seed"
+      ]
+    },
+    {
+      "subdomain": "www.example.com",
+      "ips": [],
+      "cname": null,
+      "ports": [],
+      "vulns": [],
+      "cpes": [],
+      "org": null,
+      "isp": null,
+      "asn": null,
+      "ip_asn": {},
+      "ip_org": {},
+      "rdns": null,
+      "country": null,
+      "http_status": null,
+      "http_title": null,
+      "server": null,
+      "powered_by": null,
+      "tech": [],
+      "scheme": null,
+      "final_url": null,
+      "favicon_hash": null,
+      "nvd_cves": [],
+      "tech_confirmed": null,
+      "takeover": null,
+      "takeover_confidence": null,
+      "stale_dns": null,
+      "wildcard": false,
+      "enrich_src": [],
+      "source": [
+        "certspotter"
+      ]
+    }
+  ],
+  "people": []
+}
