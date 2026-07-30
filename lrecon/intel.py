@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, ipaddress, json, re
+import asyncio, html, ipaddress, json, re
 import httpx
 from .common import *
 from .sources import get_resolver, resolve_full
@@ -176,7 +176,8 @@ def parse_spf(record: str | None) -> dict:
     design — a malformed record yields empty lists rather than raising."""
     out = {"all_qualifier": None, "includes": [], "redirect": None,
            "ip4": [], "ip6": [], "a": [], "mx": [], "ptr": False, "exists": [],
-           "lookup_count": 0, "mechanisms": [], "exceeds_lookup_limit": False}
+           "lookup_count": 0, "top_level_lookup_count": 0, "mechanisms": [],
+           "exceeds_lookup_limit": False, "lookup_count_complete": True}
     if not record:
         return out
     for token in record.split():
@@ -206,8 +207,76 @@ def parse_spf(record: str | None) -> dict:
     out["lookup_count"] = sum(
         1 for t in out["mechanisms"]
         if t.lower().startswith(_SPF_LOOKUP_MECHANISMS) or t.lower() in ("a", "mx", "ptr"))
+    out["top_level_lookup_count"] = out["lookup_count"]
+    # RFC 7208 §4.6.4's budget of 10 spans the *whole* evaluation, including the
+    # lookups made inside every `include:`/`redirect=` target. This function is
+    # deliberately I/O-free, so its count is complete only when the record
+    # delegates to nothing; otherwise it is a lower bound and the caller must
+    # run spf_lookup_count() to get the real figure. `exceeds_lookup_limit` is
+    # still sound either way — a top-level count already over 10 is definitely a
+    # permerror; expansion can only push a passing record over, never under.
+    out["lookup_count_complete"] = not (out["includes"] or out["redirect"])
     out["exceeds_lookup_limit"] = out["lookup_count"] > SPF_MAX_LOOKUPS
     return out
+
+
+async def spf_lookup_count(record: str | None, txt_lookup,
+                           max_lookups: int = SPF_MAX_LOOKUPS) -> tuple[int, bool, bool]:
+    """Total DNS lookups an SPF evaluation costs, expanding `include:`/`redirect=`.
+
+    RFC 7208 §4.6.4 caps a full evaluation at 10 lookups, counting those made
+    while evaluating referenced records. Counting only the apex record misses the
+    common real-world permerror: a handful of `include:`s that each pull in
+    several more lookups. Returns `(count, complete, exceeded)`.
+
+    `txt_lookup` is the caller's async TXT resolver returning `(records, failed)`
+    — reused rather than taking a resolver directly so this inherits the caller's
+    TCP-retry and NXDOMAIN handling, and so tests can stub it.
+
+    Termination without a visited-set: every queued target was reached through a
+    mechanism that itself cost a counted lookup, so the queue can never hold more
+    entries than `count`, and we stop the moment `count` exceeds the limit. An
+    `include:` cycle therefore ends after ~11 lookups instead of looping. Because
+    duplicate paths are counted rather than collapsed, the figure matches what a
+    receiver actually spends; a per-domain cache keeps the DNS traffic to one
+    query per distinct target.
+
+    Failure is reported, never guessed: if a TXT lookup inside the expansion
+    fails, `complete` comes back False so the caller can decline to claim
+    compliance. `exceeded=True` is definitive regardless of `complete` (the count
+    is a lower bound, so over-the-limit stays over the limit).
+    """
+    if not record:
+        return 0, True, False
+
+    count, complete = 0, True
+    cache: dict[str, str | None] = {}
+    queue = [parse_spf(record)]
+    while queue:
+        p = queue.pop(0)
+        count += p["lookup_count"]
+        if count > max_lookups:
+            # A lower bound above the cap is still a definitive permerror, so
+            # stop here rather than resolving the rest of the tree.
+            return count, False, True
+        targets = list(p["includes"]) + ([p["redirect"]] if p["redirect"] else [])
+        for target in targets:
+            norm = target.lower().rstrip(".")
+            if norm in cache:
+                sub = cache[norm]
+            else:
+                recs, failed = await txt_lookup(target)
+                if failed:
+                    complete = False
+                    cache[norm] = None
+                    continue
+                sub = next((t for t in recs if t.lower().startswith("v=spf1")), None)
+                cache[norm] = sub
+            # No SPF record at the target is itself a permerror, but the lookup
+            # that got us here is already counted and there is nothing to expand.
+            if sub:
+                queue.append(parse_spf(sub))
+    return count, complete, count > max_lookups
 
 
 def parse_dmarc(record: str | None) -> dict:
@@ -289,10 +358,26 @@ async def email_security(domain: str, resolver_ns) -> dict:
         out["issues"].append("SPF +all — permits any sender (critical)")
     elif "~all" not in spf and "-all" not in spf:
         out["issues"].append("SPF missing hard/soft fail (~all/-all)")
+    if spf:
+        # Expand include:/redirect= so the lookup budget is measured the way a
+        # receiver spends it. Without this the count is top-level only, and the
+        # usual real permerror — a few includes that each pull in several more
+        # lookups — goes unreported while the record looks compliant.
+        total, complete, exceeded = await spf_lookup_count(spf, txt)
+        out["spf_parsed"]["lookup_count"] = total
+        out["spf_parsed"]["lookup_count_complete"] = complete
+        out["spf_parsed"]["exceeds_lookup_limit"] = exceeded
     if out["spf_parsed"].get("exceeds_lookup_limit"):
         out["issues"].append(
             f"SPF exceeds {SPF_MAX_LOOKUPS}-DNS-lookup limit "
-            f"({out['spf_parsed']['lookup_count']}) — permerror, SPF may be ignored (risk)")
+            f"({'≥' if not out['spf_parsed']['lookup_count_complete'] else ''}"
+            f"{out['spf_parsed']['lookup_count']}, includes expanded) — permerror, "
+            f"SPF may be ignored (risk)")
+    elif not out["spf_parsed"].get("lookup_count_complete"):
+        out["issues"].append(
+            "SPF lookup count incomplete (a DNS lookup inside an include: failed) "
+            "— cannot confirm the record stays within "
+            f"{SPF_MAX_LOOKUPS} lookups")
     if out["spf_parsed"].get("ptr"):
         out["issues"].append("SPF uses deprecated ptr mechanism (RFC 7208 discourages)")
 
@@ -946,7 +1031,14 @@ def _parse_bucket_listing(provider: str, name: str, body: str) -> dict:
         km = re.search(key_re, blk, re.DOTALL)
         if not km:
             continue
-        key = km.group(1).strip()
+        # The listing is XML, so metacharacters in a real key arrive escaped:
+        # an object named `R&D.sql` comes back as `R&amp;D.sql`. Decode once here,
+        # before the placeholder test, the interesting-key regex and the URL
+        # build — otherwise the link is percent-encoded from the *escaped* text
+        # (`R%26amp%3BD.sql`, a 404) and an entity mid-name can hide a sensitive
+        # suffix from the regex. Strip before unescaping so that insignificant
+        # XML whitespace goes but a deliberately encoded space (`&#32;`) stays.
+        key = html.unescape(km.group(1).strip())
         if not key or key.endswith("/"):        # skip Azure/GCS folder placeholders
             continue
         sm = re.search(size_re, blk)

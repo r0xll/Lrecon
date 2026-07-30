@@ -359,6 +359,13 @@ raw text it reports a parsed breakdown:
   literals, `redirect=`, and the **DNS-lookup count against RFC 7208's limit of
   10**. Exceeding it is a `permerror` that can make receivers ignore SPF entirely —
   a real, commonly-missed finding — and the deprecated `ptr` mechanism is flagged.
+  The count **expands `include:`/`redirect=` targets**, because §4.6.4's budget
+  covers every lookup a receiver makes during the whole evaluation; counting only
+  the apex record would miss the usual cause of a real permerror (a few includes
+  that each pull in several more lookups). Expansion stops as soon as the limit is
+  passed, so a pathological record cannot fan out — an over-limit figure is
+  reported as "at least" that many. If a lookup inside an include fails, the count
+  is labelled incomplete rather than being presented as confirmed compliance.
 - **DMARC** — `p`, `sp`, `pct`, `rua`, `ruf`, `adkim`, `aspf`, `fo`, with issues
   raised for `pct<100` (partial enforcement), `sp=none` (subdomains unprotected
   despite an enforced `p=`), and a missing `rua=` (no aggregate reporting).

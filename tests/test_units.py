@@ -522,6 +522,59 @@ def test_parse_bucket_listing_malformed_body_is_empty_not_raising():
     assert out["object_count"] == 0 and out["objects"] == [] and out["interesting"] == []
 
 
+def test_parse_bucket_listing_decodes_xml_escaped_keys():
+    """The listing is XML, so `R&D.sql` arrives as `R&amp;D.sql`. Keeping the
+    escaped text would percent-encode the escape itself into the link
+    (`R%26amp%3BD.sql` — a 404), print the wrong key as evidence, and run the
+    interesting-key regex against text the bucket doesn't actually contain."""
+    body = ("<ListBucketResult>"
+            "<Contents><Key>R&amp;D.sql</Key><Size>10</Size></Contents>"
+            "</ListBucketResult>")
+    out = intel._parse_bucket_listing("s3", "acme", body)
+    obj = out["objects"][0]
+    assert obj["key"] == "R&D.sql"                       # decoded evidence
+    assert obj["url"] == "https://acme.s3.amazonaws.com/R%26D.sql"
+    assert "amp" not in obj["url"]                       # the escape is gone, not encoded
+    assert obj["interesting"] is True                    # .sql still classified
+
+
+def test_parse_bucket_listing_decodes_entities_without_double_decoding():
+    """All five XML entities plus numeric forms decode; an already-plain key is
+    untouched; and a key whose real name contains `&amp;` decodes exactly one
+    level (`&amp;amp;` -> `&amp;`), never two."""
+    body = ("<ListBucketResult>"
+            "<Contents><Key>a&lt;b&gt;c.env</Key></Contents>"
+            "<Contents><Key>say&quot;hi&quot;.bak</Key></Contents>"
+            "<Contents><Key>it&#39;s&#32;mine.sql</Key></Contents>"
+            "<Contents><Key>literal&amp;amp;entity.ini</Key></Contents>"
+            "<Contents><Key>plain-file.yml</Key></Contents>"
+            "</ListBucketResult>")
+    keys = [o["key"] for o in intel._parse_bucket_listing("s3", "acme", body)["objects"]]
+    assert keys == ["a<b>c.env", 'say"hi".bak', "it's mine.sql",
+                    "literal&amp;entity.ini", "plain-file.yml"]
+
+
+def test_parse_bucket_listing_decodes_azure_name_keys():
+    """Azure's <Name> path shares the decode — same escaping, same consequence."""
+    body = ("<EnumerationResults><Blobs><Blob><Name>Q&amp;A/id_rsa</Name>"
+            "<Properties><Content-Length>1675</Content-Length></Properties>"
+            "</Blob></Blobs></EnumerationResults>")
+    obj = intel._parse_bucket_listing("azure", "acme", body)["objects"][0]
+    assert obj["key"] == "Q&A/id_rsa"
+    assert obj["url"] == "https://acme.blob.core.windows.net/Q%26A/id_rsa"
+    assert obj["interesting"] is True
+
+
+def test_parse_bucket_listing_entity_can_hide_a_sensitive_suffix():
+    """Regression for the classification half of the bug: with the escape left in
+    place, `&#46;` masks the extension and the key reads as benign."""
+    body = ("<ListBucketResult><Contents><Key>prod&#46;sql</Key></Contents>"
+            "</ListBucketResult>")
+    out = intel._parse_bucket_listing("s3", "acme", body)
+    assert out["objects"][0]["key"] == "prod.sql"
+    assert [o["key"] for o in out["interesting"]] == ["prod.sql"]
+
+
 def test_bucket_object_url_per_provider_and_quoting():
     assert intel._bucket_object_url("s3", "acme", "a/b.txt") == \
         "https://acme.s3.amazonaws.com/a/b.txt"
@@ -1117,6 +1170,9 @@ async def test_email_security_keeps_full_records_and_dkim_selector(monkeypatch):
     dkim = "v=DKIM1; k=rsa; p=MIIBIjANBg"
     answers = {
         ("x.test", "TXT"): [_FakeTXTRecord(spf)],
+        # The include must resolve for the lookup budget to be a complete count;
+        # an unresolvable include is a separate case, covered by its own test.
+        ("_spf.google.com", "TXT"): [_FakeTXTRecord("v=spf1 ip4:1.2.3.0/24 -all")],
         ("_dmarc.x.test", "TXT"): [_FakeTXTRecord(dmarc)],
         ("google._domainkey.x.test", "TXT"): [_FakeTXTRecord(dkim)],
     }
@@ -1129,8 +1185,156 @@ async def test_email_security_keeps_full_records_and_dkim_selector(monkeypatch):
     assert out["dkim_selector"] == "google"      # names which selector matched
     assert out["dkim_record"] == dkim
     assert out["spf_parsed"]["includes"] == ["_spf.google.com"]
+    # 1 lookup for the include; the target adds none, so the budget is clean.
+    assert out["spf_parsed"]["lookup_count"] == 1
+    assert out["spf_parsed"]["lookup_count_complete"] is True
     assert out["dmarc_parsed"]["p"] == "reject"
     assert out["grade"] == "PASS" and out["issues"] == []
+
+
+def test_parse_spf_marks_its_lookup_count_incomplete_when_the_record_delegates():
+    """parse_spf is deliberately I/O-free, so its count covers only the apex
+    record. That is the complete figure when nothing delegates, and a lower bound
+    the moment an include:/redirect= appears — the flag says which."""
+    sp = intel.parse_spf("v=spf1 a mx ip4:1.2.3.4 -all")
+    assert sp["lookup_count"] == 2
+    assert sp["lookup_count_complete"] is True           # nothing to expand
+    sp = intel.parse_spf("v=spf1 include:x.test -all")
+    assert sp["top_level_lookup_count"] == 1
+    assert sp["lookup_count_complete"] is False          # include: not expanded
+    assert intel.parse_spf("v=spf1 redirect=y.test")["lookup_count_complete"] is False
+
+
+def _spf_zone_txt(zone, fail=(), calls=None):
+    """Stand-in for email_security's TXT helper: (records, failed) per name."""
+    async def txt(name):
+        norm = name.lower().rstrip(".")
+        if calls is not None:
+            calls.append(norm)
+        if norm in fail:
+            return [], True
+        rec = zone.get(norm)
+        return ([rec] if rec else []), False
+    return txt
+
+
+# Top-level costs 2 lookups; expansion costs 12 — the shape of a real permerror.
+_SPF_OVERFLOW_ZONE = {
+    "b.test": "v=spf1 a mx include:d.test -all",         # 3
+    "c.test": "v=spf1 a mx exists:e.test -all",          # 3
+    "d.test": "v=spf1 a mx a:m1.test a:m2.test -all",    # 4
+}
+_SPF_OVERFLOW_ROOT = "v=spf1 include:b.test include:c.test -all"
+
+
+async def test_spf_lookup_count_expands_includes_past_the_limit():
+    """The finding this exists for: a record that looks compliant at the top level
+    but blows RFC 7208 §4.6.4's budget once includes are evaluated."""
+    assert intel.parse_spf(_SPF_OVERFLOW_ROOT)["lookup_count"] == 2   # under 10 alone
+    count, complete, exceeded = await intel.spf_lookup_count(
+        _SPF_OVERFLOW_ROOT, _spf_zone_txt(_SPF_OVERFLOW_ZONE))
+    assert exceeded is True
+    assert count > intel.SPF_MAX_LOOKUPS
+
+
+async def test_spf_lookup_count_counts_a_compliant_tree_exactly():
+    zone = {"b.test": "v=spf1 a mx -all"}                # 2
+    count, complete, exceeded = await intel.spf_lookup_count(
+        "v=spf1 include:b.test ip4:1.2.3.4 -all", _spf_zone_txt(zone))
+    assert (count, complete, exceeded) == (3, True, False)   # 1 include + a + mx
+
+
+async def test_spf_lookup_count_terminates_on_an_include_cycle():
+    """A self-referential include must end, not loop: every hop costs a counted
+    lookup, so the budget check is what bounds the walk. The per-domain cache also
+    keeps it to a single DNS query."""
+    calls = []
+    zone = {"a.test": "v=spf1 include:a.test -all"}
+    count, complete, exceeded = await intel.spf_lookup_count(
+        zone["a.test"], _spf_zone_txt(zone, calls=calls))
+    assert exceeded is True
+    assert count <= intel.SPF_MAX_LOOKUPS + 1            # stopped as soon as it passed
+    assert calls == ["a.test"]                           # cached, queried once
+
+
+async def test_spf_lookup_count_stops_querying_once_over_the_limit():
+    """Expansion must not fan out through a pathological record: once the count
+    passes the cap the verdict is settled, so the walk stops."""
+    calls = []
+    zone = {f"s{i}.test": "v=spf1 " + " ".join(f"include:n{i}{j}.test" for j in range(9))
+            for i in range(9)}
+    zone.update({f"n{i}{j}.test": "v=spf1 a mx -all" for i in range(9) for j in range(9)})
+    root = "v=spf1 " + " ".join(f"include:s{i}.test" for i in range(9))
+    count, complete, exceeded = await intel.spf_lookup_count(root, _spf_zone_txt(zone, calls=calls))
+    assert exceeded is True
+    # Every queued target came from a counted lookup, so queries stay bounded by
+    # the budget rather than by the size of the tree (81+ records here).
+    assert len(calls) <= intel.SPF_MAX_LOOKUPS + 1
+
+
+async def test_spf_lookup_count_reports_incomplete_rather_than_guessing():
+    """A failed lookup inside an include must not be silently treated as zero
+    further lookups — that would claim compliance we cannot verify."""
+    zone = {"b.test": "v=spf1 a mx -all"}
+    count, complete, exceeded = await intel.spf_lookup_count(
+        "v=spf1 include:b.test include:gone.test -all",
+        _spf_zone_txt(zone, fail={"gone.test"}))
+    assert complete is False
+    assert exceeded is False                             # not confirmed over the limit
+    assert count == 4                                    # 2 includes + a + mx
+
+
+async def test_spf_lookup_count_handles_missing_target_record_and_no_spf():
+    """An include: pointing at a domain with no SPF is a permerror in its own
+    right, but the lookup still counted and there is nothing to expand."""
+    count, complete, exceeded = await intel.spf_lookup_count(
+        "v=spf1 include:empty.test -all", _spf_zone_txt({}))
+    assert (count, complete, exceeded) == (1, True, False)
+    assert await intel.spf_lookup_count(None, _spf_zone_txt({})) == (0, True, False)
+
+
+async def test_spf_lookup_count_follows_redirect():
+    zone = {"r.test": "v=spf1 a mx a:x.test -all"}        # 3, plus the redirect itself
+    count, complete, exceeded = await intel.spf_lookup_count(
+        "v=spf1 redirect=r.test", _spf_zone_txt(zone))
+    assert (count, complete, exceeded) == (4, True, False)
+
+
+async def test_email_security_expands_spf_includes_for_the_lookup_limit(monkeypatch):
+    """End-to-end: the report's count and verdict come from the expanded tree, so
+    a real permerror is reported instead of a compliant-looking 2/10."""
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord(_SPF_OVERFLOW_ROOT)],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord("v=DMARC1; p=reject; rua=mailto:d@x.test")],
+        ("default._domainkey.x.test", "TXT"): [_FakeTXTRecord("v=DKIM1; p=k")],
+    }
+    answers.update({(name, "TXT"): [_FakeTXTRecord(rec)]
+                    for name, rec in _SPF_OVERFLOW_ZONE.items()})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    sp = out["spf_parsed"]
+    assert sp["top_level_lookup_count"] == 2             # what the apex alone shows
+    assert sp["lookup_count"] > intel.SPF_MAX_LOOKUPS    # what a receiver spends
+    assert sp["exceeds_lookup_limit"] is True
+    joined = " | ".join(out["issues"])
+    assert "exceeds" in joined and "includes expanded" in joined
+    assert out["grade"] == "FAIL"                        # permerror is a risk
+
+
+async def test_email_security_does_not_claim_compliance_on_an_incomplete_count(monkeypatch):
+    """When an include's lookup fails the count is a lower bound; the report must
+    say so rather than presenting it as a clean n/10."""
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord("v=spf1 include:gone.test -all")],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord("v=DMARC1; p=reject; rua=mailto:d@x.test")],
+        ("default._domainkey.x.test", "TXT"): [_FakeTXTRecord("v=DKIM1; p=k")],
+    }
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    assert out["spf_parsed"]["lookup_count_complete"] is False
+    assert out["spf_parsed"]["exceeds_lookup_limit"] is False   # no false accusation
+    assert any("incomplete" in i for i in out["issues"])
+    assert out["grade"] != "PASS"
 
 
 async def test_email_security_flags_pct_sp_and_missing_rua(monkeypatch):
@@ -2270,6 +2474,65 @@ def test_write_markdown_vt_section_renders_history_table():
     assert "VirusTotal" in content
     assert "9.9.9.9" in content
     assert "2024-01-01T00:00:00+00:00" in content
+
+
+def _email_res(spf_parsed, spf="v=spf1 include:b.test -all"):
+    return {"email": {"x.com": {"domain": "x.com", "grade": "WARN", "spf": spf,
+                                "dmarc": None, "dkim": False, "dkim_selector": None,
+                                "dkim_record": None, "spf_parsed": spf_parsed,
+                                "dmarc_parsed": {}, "issues": []}}}
+
+
+def test_spf_lookups_labels_the_count_it_actually_measured():
+    """The budget spans include:/redirect= expansion, so a bare `n/10` would
+    overclaim. Each state gets its own label, and an over-limit count — which
+    stops early and is therefore a lower bound — is marked "at least"."""
+    base = {"includes": ["b.test"], "redirect": None}
+    # Clean, fully expanded count.
+    assert report._spf_lookups(
+        {**base, "lookup_count": 4, "lookup_count_complete": True,
+         "exceeds_lookup_limit": False}) == ("4/10", "includes expanded", "")
+    # Nothing delegates: no caveat needed at all.
+    assert report._spf_lookups(
+        {"includes": [], "redirect": None, "lookup_count": 2,
+         "lookup_count_complete": True, "exceeds_lookup_limit": False}) == ("2/10", "", "")
+    # Confirmed permerror, count cut short at the cap -> "≥", flagged bad.
+    count, caveat, level = report._spf_lookups(
+        {**base, "lookup_count": 12, "lookup_count_complete": False,
+         "exceeds_lookup_limit": True})
+    assert count == "≥12/10" and level == "bad" and "permerror" in caveat
+    # A nested lookup failed: not an accusation, but not a compliance claim.
+    count, caveat, level = report._spf_lookups(
+        {**base, "lookup_count": 4, "lookup_count_complete": False,
+         "exceeds_lookup_limit": False})
+    assert count == "4/10" and level == "warn" and "incomplete" in caveat
+
+
+def test_write_markdown_spf_lookup_count_carries_its_caveat():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = _email_res({"includes": ["b.test"], "redirect": None, "all_qualifier": "-",
+                      "lookup_count": 4, "lookup_count_complete": False,
+                      "exceeds_lookup_limit": False})
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert "SPF DNS lookups:** 4/10" in content
+    assert "incomplete" in content          # never a bare n/10 when unverified
+
+
+def test_write_html_spf_lookup_count_flags_a_confirmed_permerror():
+    hosts = [Host("a.x.com", ips=["1.2.3.4"])]
+    res = _email_res({"includes": ["b.test"], "redirect": None, "all_qualifier": "-",
+                      "lookup_count": 12, "lookup_count_complete": False,
+                      "exceeds_lookup_limit": True})
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(hosts, ["x.com"], res, str(path))
+        content = path.read_text()
+    assert 'class="bad"' in content
+    assert "&ge;12/10" in content or "≥12/10" in content
+    assert "permerror" in content
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():

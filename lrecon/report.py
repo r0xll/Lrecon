@@ -17,6 +17,31 @@ def _md_code(value) -> str:
     return "`" + str(value).replace("|", "\\|") + "`"
 
 
+def _spf_lookups(sp: dict) -> tuple[str, str, str]:
+    """`(count, caveat, level)` for the SPF DNS-lookup budget, where `level` is
+    `"bad"` for a confirmed permerror, `"warn"` for a caveat that blocks a
+    compliance claim, and `""` for a clean count.
+
+    RFC 7208 §4.6.4's limit of 10 covers the lookups made inside every
+    `include:`/`redirect=` target, so the figure is only meaningful with the
+    caveat attached: a bare `n/10` would claim a complete accounting even when a
+    nested lookup failed or expansion stopped early at the limit.
+    """
+    n = sp.get("lookup_count", 0)
+    complete = sp.get("lookup_count_complete", True)
+    exceeded = bool(sp.get("exceeds_lookup_limit"))
+    # Counting stops as soon as the cap is passed, so an over-limit figure is a
+    # lower bound — definitive as a verdict, but mark the number as "at least".
+    count = f"{'≥' if exceeded and not complete else ''}{n}/{SPF_MAX_LOOKUPS}"
+    if exceeded:
+        return count, "exceeds limit (permerror)", "bad"
+    if not complete:
+        return count, "incomplete — an include: lookup failed, compliance unconfirmed", "warn"
+    if sp.get("includes") or sp.get("redirect"):
+        return count, "includes expanded", ""
+    return count, "", ""
+
+
 
 def write_csv(hosts, path) -> int:
     """
@@ -427,10 +452,11 @@ def write_markdown(hosts, domains, res, path) -> None:
                 q = sp.get("all_qualifier")
                 qual = {"-": "-all (hard fail)", "~": "~all (soft fail)",
                         "?": "?all (neutral)", "+": "+all (pass-any!)"}.get(q, "no all mechanism")
-                lookups = sp.get("lookup_count", 0)
+                lk_count, lk_caveat, lk_level = _spf_lookups(sp)
                 lines += [f"- **SPF policy:** {qual}",
-                          f"- **SPF DNS lookups:** {lookups}/{SPF_MAX_LOOKUPS}"
-                          + ("  ⚠️ exceeds limit (permerror)" if sp.get("exceeds_lookup_limit") else ""),
+                          f"- **SPF DNS lookups:** {lk_count}"
+                          + (f"  ⚠️ {lk_caveat}" if lk_level
+                             else f" *({lk_caveat})*" if lk_caveat else ""),
                           f"- **SPF includes ({len(sp.get('includes') or [])}):** "
                           + (", ".join(f"`{i}`" for i in sp["includes"]) if sp.get("includes") else "none")]
                 if sp.get("ip4") or sp.get("ip6"):
@@ -876,10 +902,13 @@ def write_html(hosts, domains, res, path) -> None:
                 q = sp.get("all_qualifier")
                 qual = {"-": "-all (hard fail)", "~": "~all (soft fail)",
                         "?": "?all (neutral)", "+": "+all (pass-any!)"}.get(q, "no all mechanism")
-                lk = sp.get("lookup_count", 0)
-                lk_txt = f"{lk}/{SPF_MAX_LOOKUPS}"
-                if sp.get("exceeds_lookup_limit"):
-                    lk_txt = f'<strong class="bad">{lk_txt} — exceeds limit (permerror)</strong>'
+                lk_count, lk_caveat, lk_level = _spf_lookups(sp)
+                lk_txt = esc(lk_count)
+                if lk_level:
+                    lk_txt = (f'<strong class="{lk_level}">{lk_txt} — '
+                              f'{esc(lk_caveat)}</strong>')
+                elif lk_caveat:
+                    lk_txt = f'{lk_txt} <span class="note">({esc(lk_caveat)})</span>'
                 inc = sp.get("includes") or []
                 inc_txt = (f"SPF includes ({len(inc)}): "
                            + ", ".join(f"<code>{esc(i)}</code>" for i in inc)
