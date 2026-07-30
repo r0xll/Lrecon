@@ -63,8 +63,17 @@ except Exception:
 
 
 def log(msg: str) -> None:
+    """Print a log line verbatim.
+
+    `markup=False` is load-bearing, not a style choice: rich parses square
+    brackets as markup tags and *deletes* the ones it recognises. Every `[i]`
+    prefix in the codebase was being eaten as an italic tag, and the cert-pass
+    hint rendered as `pip install 'lrecon'` — an instruction that installs
+    nothing, because `[tls]` disappeared. lrecon builds its own `[+]`/`[i]`
+    prefixes and never uses rich markup here, so nothing is lost by disabling it.
+    """
     if _HAVE_RICH:
-        _console.print(msg)
+        _console.print(msg, markup=False, highlight=False)
     else:
         print(msg, file=sys.stderr)
 
@@ -73,6 +82,7 @@ def log(msg: str) -> None:
 __all__ = [
     "log", "Host", "Person", "RateLimiter", "load_keys",
     "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "WEB_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
+    "SELF_SERVE", "ACCOUNT_BOUND", "NOT_CLAIMABLE", "TAKEOVER_ERROR_STATUSES",
     "non_web_ports", "human_bytes",
     "_HAVE_DNS", "_HAVE_RICH", "_console",
     "Progress", "SpinnerColumn", "BarColumn", "TextColumn",
@@ -121,19 +131,51 @@ def non_web_ports(ports: list) -> list:
     since the HTTP probe pipeline never touches them."""
     return sorted(p for p in ports if p not in WEB_PORTS)
 
+# How a dangling target under each provider could actually be claimed. Broken and
+# claimable are different questions, and only the second one is a takeover: an
+# attacker who cannot recreate the name has nothing to take over, however dead
+# the record is.
+#
+#   SELF_SERVE    — the exact target name is re-registrable by anyone. Bucket
+#                   names, GitHub usernames, Heroku and Azure app names are all
+#                   customer-chosen and globally unique, so releasing one puts it
+#                   back in the pool. This is the classic takeover.
+#   ACCOUNT_BOUND — the hostname is provider-assigned and cannot be recreated,
+#                   but the *custom domain* pointed at it may be attachable to an
+#                   attacker's own service, subject to whatever domain
+#                   verification the provider does. A lead, never a confirmed
+#                   takeover from DNS alone.
+#   NOT_CLAIMABLE — the name carries a provider-generated random component and
+#                   can never be asked for again. Stale DNS to clean up, not a
+#                   takeover. Kept deliberately narrow: only names whose
+#                   generated component we can point at.
+SELF_SERVE, ACCOUNT_BOUND, NOT_CLAIMABLE = "self_serve", "account_bound", "not_claimable"
+
+# HTTP statuses that make an unrecognised body worth a weak lead. A provider that
+# has reworded its unclaimed-service page still errors; a 2xx serving ordinary
+# content is a working site and evidence of nothing.
+TAKEOVER_ERROR_STATUSES = {403, 404, 410, 503}
+
 TAKEOVER_SIGS = {
-    "s3.amazonaws.com":     ["nosuchbucket", "the specified bucket does not exist"],
-    "github.io":            ["there isn't a github pages site here"],
-    "herokuapp.com":        ["no such app", "herokucdn.com/error-pages/no-such-app"],
-    "azurewebsites.net":    ["404 web site not found", "error 404 - web app not found"],
-    "cloudapp.net":         ["404 web site not found"],
-    "trafficmanager.net":   ["404 web site not found"],
-    "wordpress.com":        ["do you want to register"],
-    "pantheonsite.io":      ["the gods are wise, but do not know of the site"],
-    "fastly.net":           ["fastly error: unknown domain"],
-    "ghost.io":             ["the thing you were looking for is no longer here"],
-    "readthedocs.io":       ["unknown domain"],
-    "surge.sh":             ["project not found"],
+    "s3.amazonaws.com":     (SELF_SERVE,    ["nosuchbucket", "the specified bucket does not exist"]),
+    "github.io":            (SELF_SERVE,    ["there isn't a github pages site here"]),
+    "herokuapp.com":        (SELF_SERVE,    ["no such app", "herokucdn.com/error-pages/no-such-app"]),
+    "azurewebsites.net":    (SELF_SERVE,    ["404 web site not found", "error 404 - web app not found"]),
+    "cloudapp.net":         (SELF_SERVE,    ["404 web site not found"]),
+    "trafficmanager.net":   (SELF_SERVE,    ["404 web site not found"]),
+    "wordpress.com":        (SELF_SERVE,    ["do you want to register"]),
+    "pantheonsite.io":      (SELF_SERVE,    ["the gods are wise, but do not know of the site"]),
+    "ghost.io":             (SELF_SERVE,    ["the thing you were looking for is no longer here"]),
+    "readthedocs.io":       (SELF_SERVE,    ["unknown domain"]),
+    "surge.sh":             (SELF_SERVE,    ["project not found"]),
+    # d.sni.global.fastly.net is a shared endpoint every Fastly customer points
+    # at — it is never per-customer and never disappears. Claiming means adding
+    # the domain to your own Fastly service, which their verification governs.
+    "fastly.net":           (ACCOUNT_BOUND, ["fastly error: unknown domain"]),
+    # k8s-...-d961a91db8-1411441002.us-east-1.elb.amazonaws.com — the hash and
+    # ID are AWS-assigned. Deleting the load balancer retires the name for good;
+    # no one, including the account that owned it, can ask for it back.
+    "elb.amazonaws.com":    (NOT_CLAIMABLE, []),
 }
 
 # Cloudflare published ranges (fallback if live fetch fails)
@@ -316,6 +358,11 @@ class Host:
     # takeover-prone provider, nothing corroborated). Drives entry-point
     # severity — a phrase-match on `takeover` used to stand in for this.
     takeover_confidence: str | None = None
+    # A dead CNAME whose target provably cannot be reclaimed (see NOT_CLAIMABLE).
+    # Deliberately not a takeover: the remedy is deleting the record, not racing
+    # an attacker, and filing it as a takeover lead sends someone chasing a name
+    # that cannot be registered.
+    stale_dns: str | None = None
     wildcard: bool = False
     enrich_src: set = field(default_factory=set)
     source: set = field(default_factory=set)

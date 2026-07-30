@@ -2076,11 +2076,145 @@ def test_mark_dangling_cname_does_not_overwrite_a_signature_finding():
 
 def test_check_takeover_sets_confidence_for_both_signature_paths():
     body_hit = Host("a.x.com", cname="a.x.com.s3.amazonaws.com")
-    active._check_takeover(body_hit, "<html>nosuchbucket</html>")
+    active._check_takeover(body_hit, "<html>nosuchbucket</html>", 404)
     assert body_hit.takeover_confidence == "likely"
+    # Errored, but the provider's wording isn't one we know — still a lead.
     no_body = Host("b.x.com", cname="b.x.com.s3.amazonaws.com")
-    active._check_takeover(no_body, "<html>a normal page</html>")
+    active._check_takeover(no_body, "<html>something else</html>", 404)
     assert no_body.takeover_confidence == "possible"
+
+
+def test_check_takeover_ignores_a_healthy_site_on_a_takeover_prone_provider():
+    """The false positive that put a takeover row on every working CDN-hosted
+    host: a CNAME into a signatured provider is not evidence of anything, and a
+    2xx serving ordinary content is a site that is very much claimed."""
+    for cname in ("zeroabstraction.github.io", "d.sni.global.fastly.net"):
+        h = Host("www.x.com", cname=cname)
+        active._check_takeover(h, "<html>welcome to my site</html>", 200)
+        assert h.takeover is None and h.takeover_confidence is None
+
+
+def test_check_takeover_without_a_status_does_not_invent_a_lead():
+    """No status means the caller couldn't tell us how the fetch went; that is
+    not the same as an error, and must not become a finding."""
+    h = Host("www.x.com", cname="www.x.com.s3.amazonaws.com")
+    active._check_takeover(h, "<html>a normal page</html>")
+    assert h.takeover is None
+
+
+def test_log_does_not_let_rich_eat_square_brackets(capsys):
+    """rich parses `[...]` as markup and deletes what it recognises, which turned
+    the cert hint into `pip install 'lrecon'` — an instruction that installs
+    nothing — and stripped the `[i]` prefix off 17 other lines."""
+    from lrecon.common import log
+    log("[i] TLS cert inspection: cryptography not installed — skipping "
+        "(pip install 'lrecon[tls]')")
+    out = capsys.readouterr()
+    text = (out.err + out.out).replace("\n", "")
+    assert "[tls]" in text
+    assert "[i]" in text
+
+
+def test_provider_assigned_name_is_stale_dns_not_a_takeover():
+    """An AWS load-balancer name carries an AWS-generated hash and ID. Deleting
+    the balancer retires the name permanently — nobody can ask for it back, so
+    calling it a takeover lead sends an operator chasing something unclaimable."""
+    h = Host("app.x.com",
+             cname="k8s-kubesyst-albingre-d961a91db8-1411441002.us-east-1.elb.amazonaws.com")
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="us-east-1.elb.amazonaws.com")
+    assert h.takeover is None and h.takeover_confidence is None
+    assert "cannot be re-created" in h.stale_dns and "not a takeover" in h.stale_dns
+    # And specifically none of the hedged claimability language.
+    assert "registrable" not in h.stale_dns and "claimable" not in h.stale_dns
+
+
+def test_account_bound_provider_is_never_confirmed_from_dns_alone():
+    """A Fastly hostname is not per-customer and can't be re-registered; the
+    question is whether the *domain* can be attached elsewhere, which only the
+    provider's verification answers."""
+    h = Host("cdn.x.com", cname="d.sni.global.fastly.net")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "possible"
+    assert "domain verification" in h.takeover
+
+
+def test_self_serve_provider_stays_confirmed():
+    """The downgrades must not soften the case that is genuinely claimable."""
+    h = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "confirmed"
+
+
+def test_github_pages_account_only_matches_a_real_pages_host():
+    assert active.github_pages_account("zeroabstraction.github.io") == "zeroabstraction"
+    assert active.github_pages_account("ZeroAbstraction.GitHub.io.") == "zeroabstraction"
+    # Pages does not serve deeper names, so there is no account to reason about.
+    assert active.github_pages_account("a.b.github.io") is None
+    assert active.github_pages_account("github.io") is None
+    assert active.github_pages_account("example.com") is None
+    assert active.github_pages_account(None) is None
+
+
+class _FakeGitHubAPI:
+    """Stands in for api.github.com/users/<name>."""
+    def __init__(self, status):
+        self.status, self.calls = status, []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self.status is None:
+            raise Exception("network down")
+        return _FakeRespText(self.status, "")
+
+
+async def test_github_pages_free_username_is_a_confirmed_takeover():
+    h = Host("blog.x.com", cname="ghost-org.github.io",
+             takeover="Dangling CNAME -> ghost-org.github.io (github.io); "
+                      "unclaimed-service signature matched",
+             takeover_confidence="likely")
+    api = _FakeGitHubAPI(404)
+    await active.resolve_github_pages_claimability(api, h)
+    assert api.calls == ["https://api.github.com/users/ghost-org"]
+    assert h.takeover_confidence == "confirmed"
+    assert "does not exist" in h.takeover and "registering the username" in h.takeover
+
+
+async def test_github_pages_taken_username_is_not_a_takeover():
+    """GitHub serves the same 'Site not found' page whether the account is free
+    or simply has no site, so the signature alone reads a working org's stale
+    record as a takeover. The account lookup is what separates them."""
+    h = Host("blog.x.com", cname="zeroabstraction.github.io",
+             takeover="Dangling CNAME -> zeroabstraction.github.io (github.io); "
+                      "unclaimed-service signature matched",
+             takeover_confidence="likely")
+    await active.resolve_github_pages_claimability(_FakeGitHubAPI(200), h)
+    assert h.takeover is None and h.takeover_confidence is None
+    assert "exists, so no one else can claim it" in h.stale_dns
+
+
+async def test_github_pages_check_leaves_the_finding_alone_when_it_cannot_tell():
+    """A rate limit or a network failure is not evidence in either direction —
+    downgrading on one would hide real takeovers."""
+    for api in (_FakeGitHubAPI(403), _FakeGitHubAPI(None)):
+        h = Host("blog.x.com", cname="ghost-org.github.io",
+                 takeover="signature matched", takeover_confidence="likely")
+        await active.resolve_github_pages_claimability(api, h)
+        assert h.takeover_confidence == "likely"
+        assert h.stale_dns is None
+
+
+async def test_github_pages_check_sends_the_token_when_there_is_one():
+    seen = {}
+
+    class _Api(_FakeGitHubAPI):
+        async def get(self, url, **kwargs):
+            seen.update(kwargs.get("headers") or {})
+            return await super().get(url, **kwargs)
+
+    h = Host("blog.x.com", cname="ghost-org.github.io",
+             takeover="signature matched", takeover_confidence="likely")
+    await active.resolve_github_pages_claimability(_Api(404), h, token="tok")
+    assert seen.get("Authorization") == "Bearer tok"
 
 
 def test_entry_point_takeover_severity_comes_from_confidence_not_text():
@@ -3696,6 +3830,44 @@ def test_takeover_report_tolerates_a_lead_with_no_confidence_set():
         report.write_html(hosts, ["x.com"], {}, str(html))
         assert "old.x.com" in md.read_text()
         assert "old.x.com" in html.read_text()
+
+
+def _stale_hosts():
+    return [
+        Host("app.x.com", cname="k8s-a-d961a91db8-1411441002.us-east-1.elb.amazonaws.com",
+             stale_dns="CNAME -> k8s-a-d961a91db8-1411441002.us-east-1.elb.amazonaws.com "
+                       "(elb.amazonaws.com); target no longer exists (NXDOMAIN). The name "
+                       "is provider-assigned and cannot be re-created, so this is not a "
+                       "takeover — remove the record"),
+    ]
+
+
+def test_stale_dns_renders_separately_from_takeover_leads():
+    """A record nobody can claim is a hygiene finding. Mixing it into the
+    takeover list is what made the AWS case read as an attack path."""
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown(_stale_hosts(), ["x.com"], {}, str(md))
+        report.write_html(_stale_hosts(), ["x.com"], {}, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    assert "Stale DNS records — broken, not claimable" in md_text
+    assert "app.x.com" in md_text and "cannot be re-created" in md_text
+    assert "Subdomain takeover leads" not in md_text
+    assert "Stale DNS records" in html_text and "app.x.com" in html_text
+    assert "Subdomain takeover leads" not in html_text
+
+
+def test_a_host_with_both_findings_is_reported_only_as_a_takeover():
+    """Belt and braces: the takeover list is the more serious one, so a host that
+    somehow carries both must not be listed twice or demoted."""
+    h = Host("app.x.com", cname="c", takeover="real lead",
+             takeover_confidence="confirmed", stale_dns="also stale")
+    with tempfile.TemporaryDirectory() as d:
+        md = Path(d) / "r.md"
+        report.write_markdown([h], ["x.com"], {}, str(md))
+        content = md.read_text()
+    assert "real lead" in content
+    assert "Stale DNS records" not in content
 
 
 def _cert_res():

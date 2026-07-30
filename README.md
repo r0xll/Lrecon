@@ -468,9 +468,9 @@ the report lists the strongest leads first:
 
 | Confidence | Signal |
 |---|---|
-| **confirmed** | the target is NXDOMAIN *and* sits under a known takeover-prone provider, where re-registration is the service on offer |
+| **confirmed** | the target is NXDOMAIN *and* sits under a provider where re-registering that exact name is the service on offer (or, for GitHub Pages, the account is verifiably unregistered) |
 | **likely** | the provider's unclaimed-service signature matched in the response body |
-| **possible** | the target is NXDOMAIN but claimability is unverified — reported with the closest still-existing zone as evidence |
+| **possible** | the target is broken but claimability is unverified — reported with the closest still-existing zone as evidence |
 
 Confidence turns on **claimability, not brokenness**. NXDOMAIN proves the target
 doesn't exist; it does not prove an attacker could create it. A broken CNAME to a
@@ -490,6 +490,38 @@ The NXDOMAIN path is DNS-only and needs no HTTP response, so it covers the case
 the signature checks structurally cannot: a dangling CNAME usually has *no* A
 record, so the host never reaches the HTTP probe at all. An inconclusive lookup
 (timeout/SERVFAIL) is never reported as a finding.
+
+**How each provider is actually claimed.** "Dangling" and "claimable" are
+different questions, and only the second one is a takeover:
+
+| Class | Meaning | Examples |
+|---|---|---|
+| **self-serve** | the exact target name is re-registrable by anyone — the classic takeover | S3 buckets, `github.io` usernames, Heroku and Azure app names, `surge.sh`, `pantheonsite.io` |
+| **account-bound** | the hostname is provider-assigned, but the *domain* pointed at it may be attachable to another account, subject to the provider's domain verification | `fastly.net` (`d.sni.global.fastly.net` is a shared endpoint every customer points at) |
+| **not claimable** | the name carries a provider-generated component and can never be issued again | `*.elb.amazonaws.com` — `k8s-…-d961a91db8-1411441002.us-east-1.elb.amazonaws.com` |
+
+Not-claimable targets are reported under **Stale DNS records** instead of as
+takeover leads. The record should still be removed, but there is nothing to
+claim, and filing it as a takeover sends someone chasing a name AWS will never
+issue again.
+
+**GitHub Pages gets a definitive answer.** `*.github.io` is wildcarded, so a dead
+Pages target never returns NXDOMAIN and only the body signature fires — and
+GitHub serves the same *Site not found* page whether the account is unregistered
+or merely has no site published. One `api.github.com/users/<account>` lookup
+separates them: a 404 means the username is free and registering it claims the
+hostname (**confirmed**), while a 200 means nobody else can claim it and the
+record is stale rather than dangerous. A rate-limited or failed lookup leaves the
+finding untouched — a lookup that didn't happen is not evidence either way. Set
+`GITHUB_TOKEN` for the authenticated rate limit. This reasoning is CNAME-specific;
+a domain pointed at the Pages A records names no account, and lrecon's
+CNAME-keyed takeover path never sees that shape.
+
+**A CNAME into a takeover-prone provider is not itself a finding.** Every healthy
+site on GitHub Pages, Fastly, Heroku or S3 has one. lrecon reports a lead only
+when the provider's unclaimed-service signature matches, or the host errors
+(403/404/410/503) with wording lrecon doesn't recognise. A 2xx serving ordinary
+content produces nothing.
 
 **Live TLS certificate inspection.** Every other certificate signal in lrecon is
 second-hand — CT logs (crt.sh/certspotter) and Shodan's `ssl.cert.subject.CN`

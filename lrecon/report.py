@@ -317,6 +317,7 @@ def write_markdown(hosts, domains, res, path) -> None:
     live = [h for h in hosts if h.ips or h.http_status]
     vulns = [h for h in hosts if h.vulns]
     takeovers = [h for h in hosts if h.takeover]
+    stale = [h for h in hosts if getattr(h, "stale_dns", None) and not h.takeover]
     wildcards = [h for h in hosts if h.wildcard]
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -444,6 +445,15 @@ def write_markdown(hosts, domains, res, path) -> None:
                          + (f"  *[{label}]*" if label else ""))
         lines += ["", "> Validate by attempting to claim the dangling resource in a "
                   "controlled manner per ROE before reporting as confirmed.", ""]
+
+    if stale:
+        lines += ["## Stale DNS records — broken, not claimable", ""]
+        for h in sorted(stale, key=lambda x: x.subdomain):
+            lines.append(f"- **{h.subdomain}** — {h.stale_dns}")
+        lines += ["", "> Separated from the takeover leads on purpose: the target of each "
+                  "record cannot be re-created by anyone, so there is nothing to claim. "
+                  "These are hygiene findings — the record should be removed, but it is "
+                  "not an attack path.", ""]
 
     if cf and cf.get("detected"):
         conf = {ip: v for ip, v in cf["candidates"].items() if v["confirmed"]}
@@ -810,6 +820,7 @@ def write_html(hosts, domains, res, path) -> None:
     vt = res.get("vt") or {}
 
     takeovers = [h for h in hosts if h.takeover]
+    stale = [h for h in hosts if getattr(h, "stale_dns", None) and not h.takeover]
     vulns = [h for h in hosts if h.vulns]
     n_live = sum(1 for h in hosts if h.http_status)
     sev_class = {"critical": "sev-critical", "high": "sev-high", "medium": "sev-medium",
@@ -955,6 +966,19 @@ def write_html(hosts, domains, res, path) -> None:
                 f'controlled manner per ROE before reporting as confirmed.</p>')
         sections.append(_html_section("takeover", "Subdomain takeover leads (T1584.001)",
                                       len(takeovers), body))
+
+    # ---- Stale DNS: broken, but provably not claimable ----
+    if stale:
+        rows = "".join(f"<tr><td>{esc(h.subdomain)}</td><td>{esc(h.stale_dns)}</td></tr>"
+                       for h in sorted(stale, key=lambda x: x.subdomain))
+        body = (f'{_html_export_button("t-stale", "stale_dns.csv")}'
+                f'<table id="t-stale"><tr><th>Subdomain</th><th>Detail</th></tr>'
+                f'{rows}</table>'
+                f'<p class="note">Kept out of the takeover leads deliberately: the target of '
+                f'each record cannot be re-created by anyone, so there is nothing to claim. '
+                f'The record should be removed, but it is not an attack path.</p>')
+        sections.append(_html_section("staledns", "Stale DNS records — broken, not claimable",
+                                      len(stale), body))
 
     # ---- Cloudflare origin exposure ----
     if cf.get("detected"):
