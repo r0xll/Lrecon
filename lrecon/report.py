@@ -17,6 +17,21 @@ def _md_code(value) -> str:
     return "`" + str(value).replace("|", "\\|") + "`"
 
 
+TAKEOVER_CONFIDENCE_LABELS = {
+    "confirmed": "confirmed — CNAME target does not exist",
+    "likely": "likely — unclaimed-service signature matched",
+    "possible": "possible — takeover-prone provider, unverified",
+}
+_TAKEOVER_CONFIDENCE_RANK = {"confirmed": 0, "likely": 1, "possible": 2}
+
+
+def _by_takeover_confidence(hosts: list) -> list:
+    """Highest-confidence takeover leads first — that's the order an operator
+    works the list in. Unlabelled leads sort last but are never dropped."""
+    return sorted(hosts, key=lambda h: (_TAKEOVER_CONFIDENCE_RANK.get(
+        h.takeover_confidence, 3), h.subdomain))
+
+
 def _spf_lookups(sp: dict) -> tuple[str, str, str]:
     """`(count, caveat, level)` for the SPF DNS-lookup budget, where `level` is
     `"bad"` for a confirmed permerror, `"warn"` for a caveat that blocks a
@@ -307,8 +322,10 @@ def write_markdown(hosts, domains, res, path) -> None:
 
     if takeovers:
         lines += ["## Subdomain takeover leads (T1584.001) — priority", ""]
-        for h in takeovers:
-            lines.append(f"- **{h.subdomain}** — {h.takeover}")
+        for h in _by_takeover_confidence(takeovers):
+            label = TAKEOVER_CONFIDENCE_LABELS.get(h.takeover_confidence)
+            lines.append(f"- **{h.subdomain}** — {h.takeover}"
+                         + (f"  *[{label}]*" if label else ""))
         lines += ["", "> Validate by attempting to claim the dangling resource in a "
                   "controlled manner per ROE before reporting as confirmed.", ""]
 
@@ -725,10 +742,19 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- Subdomain takeover leads ----
     if takeovers:
-        rows = "".join(f"<tr><td>{esc(h.subdomain)}</td><td>{esc(h.takeover)}</td></tr>"
-                       for h in takeovers)
+        def _conf_cell(h) -> str:
+            label = TAKEOVER_CONFIDENCE_LABELS.get(h.takeover_confidence)
+            if not label:
+                return '<td class="note">unlabelled</td>'
+            cls = "bad" if h.takeover_confidence in ("confirmed", "likely") else "warn"
+            return f'<td><strong class="{cls}">{esc(label)}</strong></td>'
+
+        rows = "".join(f"<tr><td>{esc(h.subdomain)}</td>{_conf_cell(h)}"
+                       f"<td>{esc(h.takeover)}</td></tr>"
+                       for h in _by_takeover_confidence(takeovers))
         body = (f'{_html_export_button("t-takeover", "takeover_leads.csv")}'
-                f'<table id="t-takeover"><tr><th>Subdomain</th><th>Detail</th></tr>{rows}</table>'
+                f'<table id="t-takeover"><tr><th>Subdomain</th><th>Confidence</th>'
+                f'<th>Detail</th></tr>{rows}</table>'
                 f'<p class="note">Validate by attempting to claim the dangling resource in a '
                 f'controlled manner per ROE before reporting as confirmed.</p>')
         sections.append(_html_section("takeover", "Subdomain takeover leads (T1584.001)",

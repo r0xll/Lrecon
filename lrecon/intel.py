@@ -1158,9 +1158,16 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
 
     for h in hosts:
         if h.takeover:
-            sev = "critical" if "unclaimed-service signature matched" in h.takeover else "high"
+            # Severity comes from the structured confidence rather than a phrase
+            # match on the summary text. Every detection path sets the field, so
+            # the "high" default is only reached by a hand-built Host — mid-scale
+            # rather than critical, since an unlabelled lead carries no evidence
+            # about how strong it is.
+            sev = {"confirmed": "critical", "likely": "critical",
+                   "possible": "high"}.get(h.takeover_confidence, "high")
             out.append({"type": "subdomain-takeover", "target": h.subdomain, "severity": sev,
-                       "summary": h.takeover, "attck": "T1584.001"})
+                       "summary": h.takeover, "attck": "T1584.001",
+                       "confidence": h.takeover_confidence})
 
     if cf.get("detected"):
         for ip, v in cf.get("candidates", {}).items():

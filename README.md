@@ -380,8 +380,21 @@ and wall time dramatically, and respects Shodan's ~1 req/s limit.
 then drops phantom subdomains so they never reach your report.
 
 **Subdomain-takeover leads (T1584.001).** Dangling CNAMEs to unclaimed
-S3/GitHub Pages/Heroku/Azure/etc. are flagged, distinguishing a matched
-unclaimed-service signature (high confidence) from a takeover-prone CNAME (lead).
+S3/GitHub Pages/Heroku/Azure/etc. are flagged with an explicit confidence, and
+the report lists the strongest leads first:
+
+| Confidence | Signal |
+|---|---|
+| **confirmed** | the CNAME target's name does not exist (NXDOMAIN) |
+| **likely** | the provider's unclaimed-service signature matched in the response body |
+| **possible** | the CNAME points at a takeover-prone provider, nothing corroborated |
+
+The **confirmed** check is DNS-only and provider-agnostic — it needs no HTTP
+response and no per-provider signature, so it catches providers nobody has
+written a signature for. It also covers the case the other two structurally
+cannot: a dangling CNAME usually has *no* A record, so the host never reaches
+the HTTP probe at all. An inconclusive lookup (timeout/SERVFAIL) is never
+reported as a finding.
 
 **Cloudflare origin discovery.** When Cloudflare fronts a host, lrecon collects
 origin-IP candidates passively — unproxied in-scope subdomains, SPF `ip4:`/`ip6:`
@@ -578,6 +591,16 @@ silently exhaust the allowance on a run where you didn't need it.
 **Three interchangeable backends.** Pick one with `--dork-provider`
 (`auto`/`google`/`brave`/`vertex`); `auto` uses whichever is configured,
 preferring Google CSE so existing key-holders keep their current behavior.
+
+**Automatic failover.** With more than one backend configured, `auto` falls
+through to the next one when a backend fails *terminally* — a revoked key, an
+exhausted quota, a rejected request. Since Google CSE is closed to new customers,
+a stale CSE key sitting beside a working Brave key is a realistic setup, and it
+would otherwise produce zero hits for the whole run. Failover resumes at the
+domain that failed (earlier domains were already swept), hits are deduped by URL
+across backends, and the startup line names the fallback chain. Quota use is
+unchanged when the first backend works, since nothing else is queried. Pinning a
+backend explicitly with `--dork-provider` never falls back.
 
 | Backend | Flag / env | Credentials | Notes |
 |---|---|---|---|

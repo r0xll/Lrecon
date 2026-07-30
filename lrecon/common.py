@@ -311,6 +311,11 @@ class Host:
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None
+    # "confirmed" (CNAME target is NXDOMAIN), "likely" (provider's unclaimed
+    # signature matched in the body) or "possible" (CNAME points at a known
+    # takeover-prone provider, nothing corroborated). Drives entry-point
+    # severity — a phrase-match on `takeover` used to stand in for this.
+    takeover_confidence: str | None = None
     wildcard: bool = False
     enrich_src: set = field(default_factory=set)
     source: set = field(default_factory=set)

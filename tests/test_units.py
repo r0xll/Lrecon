@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import (enrich, intel, state, backends, sources, report, people, cli, core,
-                    dorking, vt, llm, news, dossier)
+from lrecon import (active, enrich, intel, state, backends, sources, report, people, cli,
+                    core, dorking, vt, llm, news, dossier)
 from lrecon.common import Host, Person, CF_FALLBACK, WEB_PORTS, non_web_ports
 
 
@@ -1359,6 +1359,95 @@ class NoAnswer(Exception):
     """Stands in for dns.resolver.NoAnswer — matched by class name."""
 
 
+class _CnameTargetResolver:
+    """Resolver for cname_target_status: names in `live` answer, names in
+    `missing` raise NXDOMAIN, names in `noanswer` exist without an address, and
+    anything else fails with a transport error (inconclusive)."""
+    def __init__(self, live=(), missing=(), noanswer=()):
+        self.live, self.missing, self.noanswer = set(live), set(missing), set(noanswer)
+
+    async def resolve(self, name, rtype, **kwargs):
+        if name in self.missing:
+            raise NXDOMAIN(name)
+        if name in self.noanswer:
+            raise NoAnswer(name)
+        if name in self.live:
+            return ["1.2.3.4"] if rtype == "A" else ["::1"]
+        raise Exception(f"timeout for {name} {rtype}")
+
+
+async def test_cname_target_status_distinguishes_missing_live_and_inconclusive(monkeypatch):
+    """NXDOMAIN on the target is the takeover signal; a resolvable target is not
+    a finding; and a timeout must stay inconclusive rather than being reported."""
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _CnameTargetResolver(
+        live=["ok.example.net"], missing=["gone.example.net"],
+        noanswer=["exists.example.net"]))
+    assert await sources.cname_target_status("gone.example.net", None) == "nxdomain"
+    assert await sources.cname_target_status("ok.example.net", None) == "resolves"
+    # The name exists, just carries no address — not a dangling target.
+    assert await sources.cname_target_status("exists.example.net", None) == "resolves"
+    assert await sources.cname_target_status("slow.example.net", None) == "unknown"
+    assert await sources.cname_target_status("", None) == "unknown"
+
+
+def test_mark_dangling_cname_flags_only_nxdomain():
+    """"resolves" and "unknown" must never become client-facing findings."""
+    for status in ("resolves", "unknown"):
+        h = Host("dev.x.com", cname="gone.example.net")
+        active.mark_dangling_cname(h, status)
+        assert h.takeover is None and h.takeover_confidence is None
+    h = Host("dev.x.com", cname="gone.example.net")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "confirmed"
+    assert "NXDOMAIN" in h.takeover
+
+
+def test_mark_dangling_cname_works_for_providers_with_no_signature():
+    """The whole point of the NXDOMAIN path: it doesn't need TAKEOVER_SIGS, so it
+    catches providers nobody has written a signature for."""
+    unknown = "abandoned.some-saas-nobody-signatured.io"
+    assert not any(sig in unknown for sig in intel.TAKEOVER_SIGS)
+    h = Host("dev.x.com", cname=unknown)
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "confirmed"
+    assert unknown in h.takeover
+    # A recognized provider is still named when one matches.
+    h2 = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
+    active.mark_dangling_cname(h2, "nxdomain")
+    assert "s3.amazonaws.com" in h2.takeover
+
+
+def test_mark_dangling_cname_does_not_overwrite_a_signature_finding():
+    """A body-signature hit already carries corroborating evidence."""
+    h = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com",
+             takeover="Dangling CNAME -> ... unclaimed-service signature matched",
+             takeover_confidence="likely")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "likely"
+
+
+def test_check_takeover_sets_confidence_for_both_signature_paths():
+    body_hit = Host("a.x.com", cname="a.x.com.s3.amazonaws.com")
+    active._check_takeover(body_hit, "<html>nosuchbucket</html>")
+    assert body_hit.takeover_confidence == "likely"
+    no_body = Host("b.x.com", cname="b.x.com.s3.amazonaws.com")
+    active._check_takeover(no_body, "<html>a normal page</html>")
+    assert no_body.takeover_confidence == "possible"
+
+
+def test_entry_point_takeover_severity_comes_from_confidence_not_text():
+    """Regression for the old phrase-match on the summary string."""
+    cf = {"detected": False, "candidates": {}}
+    sev = {}
+    for conf in ("confirmed", "likely", "possible"):
+        h = Host("a.x.com", cname="c", takeover="wording that says nothing",
+                 takeover_confidence=conf)
+        eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+        sev[conf] = eps[0]["severity"]
+        assert eps[0]["confidence"] == conf
+    assert sev == {"confirmed": "critical", "likely": "critical", "possible": "high"}
+
+
 class _AbsentRecordResolver:
     """Every name resolves to a definitive 'nothing published' answer."""
     async def resolve(self, name, rtype, **kwargs):
@@ -1544,26 +1633,114 @@ async def test_google_dork_network_exception_not_terminal():
     assert terminal is False
 
 
-async def test_google_dork_terminal_status_stops_remaining_domains_in_core_loop():
-    """
-    Mirrors core.py's `for d in domains: ... if terminal: break` wiring —
-    the second domain must never be queried once the first returns terminal.
-    """
-    queried_domains = []
+def _fake_dork_domain(monkeypatch, behavior, calls):
+    """Patch core.dork_domain with a per-(provider, domain) script.
 
-    async def fake_dork(client, domain, key, cx, limiter):
-        queried_domains.append(domain)
-        return [], True   # simulate a terminal 403 on the very first domain
+    `behavior(provider, domain)` returns (hits, terminal); `calls` records
+    (provider, domain) in order so failover and resume points are observable.
+    """
+    async def fake(client, domain, provider, keys, limiter):
+        calls.append((provider, domain))
+        return behavior(provider, domain)
+    monkeypatch.setattr(core, "dork_domain", fake)
 
-    domains = ["a.com", "b.com", "c.com"]
-    dorks = []
-    for d in domains:
-        hits, terminal = await fake_dork(None, d, "key", "cx", None)
-        dorks += hits
-        if terminal:
-            break
-    assert queried_domains == ["a.com"]
-    assert dorks == []
+
+def _hit(domain, n=1):
+    return [{"link": f"https://{domain}/{n}", "category": "admin-panel",
+             "severity": "medium"}]
+
+
+async def test_run_dorks_falls_back_to_next_backend_on_terminal_failure(monkeypatch):
+    """A dead first backend must not sink the sweep. Google CSE is closed to new
+    customers, so a stale CSE key beside a working Brave key is realistic — it
+    used to yield zero hits."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: (
+        ([], True) if p == "google" else (_hit(d), False)), calls)
+    hits, used = await core._run_dorks(None, ["a.com", "b.com"],
+                                       ["google", "brave"], {}, None)
+    assert used == ["brave"]
+    assert sorted(h["link"] for h in hits) == ["https://a.com/1", "https://b.com/1"]
+    assert ("brave", "a.com") in calls and ("brave", "b.com") in calls
+
+
+async def test_run_dorks_resumes_at_the_failing_domain_not_from_the_start(monkeypatch):
+    """Earlier domains were fully swept, but the failing one aborted partway
+    through its categories — so the fallback re-sweeps that one and continues,
+    without re-burning quota on the domains already done."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: (
+        ([], True) if (p == "google" and d == "b.com")
+        else (_hit(d), False)), calls)
+    hits, used = await core._run_dorks(None, ["a.com", "b.com", "c.com"],
+                                       ["google", "brave"], {}, None)
+    assert [d for p, d in calls if p == "google"] == ["a.com", "b.com"]
+    assert [d for p, d in calls if p == "brave"] == ["b.com", "c.com"]
+    assert used == ["google", "brave"]
+    assert len(hits) == 3                       # a from google, b+c from brave
+
+
+async def test_run_dorks_dedupes_hits_across_backends(monkeypatch):
+    """_run_templates only dedupes within one domain; two engines routinely
+    index the same URL, so the cross-backend dedupe has to live here."""
+    calls = []
+    shared = [{"link": "https://a.com/same", "category": "git-exposure",
+               "severity": "high"}]
+
+    def behavior(provider, domain):
+        if provider == "google":
+            return (shared, False) if domain == "a.com" else ([], True)
+        return shared + _hit("b.com"), False
+
+    _fake_dork_domain(monkeypatch, behavior, calls)
+    hits, _ = await core._run_dorks(None, ["a.com", "b.com"],
+                                    ["google", "brave"], {}, None)
+    assert [h["link"] for h in hits] == ["https://a.com/same", "https://b.com/1"]
+
+
+async def test_run_dorks_non_terminal_result_does_not_switch_backends(monkeypatch):
+    """Only a terminal failure justifies failover — an empty-but-healthy sweep
+    must not burn a second backend's quota."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: ([], False), calls)
+    hits, used = await core._run_dorks(None, ["a.com"], ["google", "brave"], {}, None)
+    assert hits == [] and used == []
+    assert [p for p, _ in calls] == ["google"]          # brave never touched
+
+
+async def test_run_dorks_gives_up_after_every_backend_fails_terminally(monkeypatch):
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: ([], True), calls)
+    hits, used = await core._run_dorks(None, ["a.com"],
+                                       ["google", "brave", "vertex"], {}, None)
+    assert hits == [] and used == []
+    assert [p for p, _ in calls] == ["google", "brave", "vertex"]
+
+
+async def test_run_dorks_single_backend_behaves_like_the_old_loop(monkeypatch):
+    """Regression: with one configured backend, a terminal failure still stops
+    the remaining domains rather than retrying them."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: ([], True), calls)
+    hits, used = await core._run_dorks(None, ["a.com", "b.com"], ["brave"], {}, None)
+    assert hits == [] and used == []
+    assert calls == [("brave", "a.com")]               # b.com never queried
+
+
+def test_configured_dork_providers_lists_every_ready_backend_in_order():
+    vertex = {"access_token": "t", "project": "p", "engine": "e"}
+    keys = {"google_cse": "k", "google_cse_cx": "cx", "brave": "b", "vertex": vertex}
+    assert dorking.configured_dork_providers(keys) == ["google", "brave", "vertex"]
+    assert dorking.configured_dork_providers({"brave": "b", "vertex": vertex}) \
+        == ["brave", "vertex"]
+    assert dorking.configured_dork_providers({}) == []
+
+
+def test_configured_dork_providers_explicit_choice_never_falls_back():
+    """Pinning a backend must not silently use a different one."""
+    keys = {"google_cse": "k", "google_cse_cx": "cx", "brave": "b"}
+    assert dorking.configured_dork_providers(keys, "brave") == ["brave"]
+    assert dorking.configured_dork_providers(keys, "vertex") == []   # not configured
 
 
 # --------------------------------------------------------------------------- #
@@ -1876,7 +2053,8 @@ def test_summarize_entry_points_ranks_critical_first():
     hosts = [
         Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com",
              takeover="Dangling CNAME -> dev.x.com.s3.amazonaws.com (s3.amazonaws.com); "
-                      "unclaimed-service signature matched"),
+                      "unclaimed-service signature matched",
+             takeover_confidence="likely"),
         Host("legacy.x.com", vulns=["CVE-2026-1"]),
     ]
     cf = {"detected": True, "candidates": {"1.2.3.4": {"confirmed": True, "evidence": "e"}}}
@@ -2533,6 +2711,49 @@ def test_write_html_spf_lookup_count_flags_a_confirmed_permerror():
     assert 'class="bad"' in content
     assert "&ge;12/10" in content or "≥12/10" in content
     assert "permerror" in content
+
+
+def _takeover_hosts():
+    return [
+        Host("weak.x.com", ips=["1.2.3.4"], cname="w.s3.amazonaws.com",
+             takeover="CNAME -> w.s3.amazonaws.com (s3.amazonaws.com); verify",
+             takeover_confidence="possible"),
+        Host("gone.x.com", cname="g.example.net",
+             takeover="Dangling CNAME -> g.example.net; target name does not exist (NXDOMAIN)",
+             takeover_confidence="confirmed"),
+    ]
+
+
+def test_write_markdown_takeover_shows_confidence_confirmed_first():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown(_takeover_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "confirmed — CNAME target does not exist" in content
+    assert "possible — takeover-prone provider" in content
+    # Highest confidence first: that's the order the leads get worked in.
+    assert content.index("gone.x.com") < content.index("weak.x.com")
+
+
+def test_write_html_takeover_has_confidence_column():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(_takeover_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "<th>Confidence</th>" in content
+    assert 'class="bad"' in content and 'class="warn"' in content
+    assert content.index("gone.x.com") < content.index("weak.x.com")
+
+
+def test_takeover_report_tolerates_a_lead_with_no_confidence_set():
+    """An unlabelled lead must still render, not vanish or raise."""
+    hosts = [Host("old.x.com", cname="c", takeover="found some other way")]
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown(hosts, ["x.com"], {}, str(md))
+        report.write_html(hosts, ["x.com"], {}, str(html))
+        assert "old.x.com" in md.read_text()
+        assert "old.x.com" in html.read_text()
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():

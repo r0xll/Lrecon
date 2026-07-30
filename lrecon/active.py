@@ -43,6 +43,33 @@ async def takeover_check_host(client, host: Host) -> None:
             continue
 
 
+def mark_dangling_cname(host: Host, status: str) -> None:
+    """Record a takeover lead from the CNAME target's DNS status.
+
+    Only "nxdomain" is a finding — the target's name does not exist, so the
+    hostname points at nothing and whoever can claim that name at the provider
+    serves content here. "resolves" and "unknown" (timeout/SERVFAIL) are not
+    reported: an inconclusive lookup must not become a client-facing finding.
+
+    This is the one takeover signal needing neither an HTTP response nor a
+    per-provider signature, and it covers exactly what _check_takeover() cannot
+    see: a host with no A record never reaches the HTTP probe, which is the
+    normal shape of a dangling CNAME. A known provider is named when the target
+    matches one, but detection does not depend on it.
+
+    An existing signature-based finding is left in place — it already carries
+    corroborating body evidence.
+    """
+    if status != "nxdomain" or host.takeover:
+        return
+    provider = next((sig for sig in TAKEOVER_SIGS if host.cname and sig in host.cname), None)
+    host.takeover = (f"Dangling CNAME -> {host.cname}"
+                     + (f" ({provider})" if provider else "")
+                     + "; target name does not exist (NXDOMAIN) — claimable if the "
+                       "provider allows re-registration")
+    host.takeover_confidence = "confirmed"
+
+
 def _check_takeover(host: Host, body_lower: str) -> None:
     if not host.cname:
         return
@@ -52,8 +79,10 @@ def _check_takeover(host: Host, body_lower: str) -> None:
                 if bsig in body_lower:
                     host.takeover = (f"Dangling CNAME -> {host.cname} "
                                      f"({cname_sig}); unclaimed-service signature matched")
+                    host.takeover_confidence = "likely"
                     return
             host.takeover = (f"CNAME -> {host.cname} ({cname_sig}); verify service ownership")
+            host.takeover_confidence = "possible"
             return
 
 

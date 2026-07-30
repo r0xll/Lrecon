@@ -126,6 +126,50 @@ async def verify_keys(client, keys: dict) -> None:
         log("[i] HIBP: key configured but not required — domain-breach lookup uses HIBP's keyless endpoint")
 
 
+async def _run_dorks(client, domains, providers, keys, limiter) -> tuple:
+    """Sweep every domain, falling back to the next configured search backend on
+    a terminal failure. Returns (hits, providers_used).
+
+    A terminal failure (revoked key, exhausted quota, malformed request) will
+    recur identically for every remaining domain, so continuing with that
+    backend is pointless — but giving up entirely wastes any other configured
+    backend. Google CSE is closed to new customers, so a stale CSE key sitting
+    alongside a working Brave key is a realistic setup, and it used to yield
+    zero hits.
+
+    Fallback resumes at the domain that failed rather than restarting: earlier
+    domains completed, while the failing one aborted partway through its
+    categories and still needs a full sweep. Hits are deduped by link across
+    backends — _run_templates() only dedupes within a single domain, and two
+    engines routinely index the same URL.
+    """
+    hits, used, seen = [], [], set()
+    remaining = list(domains)
+    for i, provider in enumerate(providers):
+        exhausted = False
+        while remaining:
+            d = remaining[0]
+            found, terminal = await dork_domain(client, d, provider, keys, limiter)
+            for hit in found:
+                if hit["link"] in seen:
+                    continue
+                seen.add(hit["link"])
+                hits.append(hit)
+                if provider not in used:
+                    used.append(provider)
+            if terminal:
+                nxt = providers[i + 1] if i + 1 < len(providers) else None
+                log(f"[!] {provider} dork: terminal failure on {d} — "
+                    + (f"falling back to {nxt}" if nxt else
+                       "no other search backend configured, giving up"))
+                exhausted = True
+                break
+            remaining.pop(0)                  # this domain is fully swept
+        if not exhausted:                     # every domain swept, nothing to fall back for
+            break
+    return hits, used
+
+
 async def run(domains, args, keys) -> list:
     ns = args.resolvers.split(",") if args.resolvers else DEFAULT_RESOLVERS
     use_prog = _HAVE_RICH and not args.no_progress
@@ -235,6 +279,23 @@ async def run(domains, args, keys) -> list:
                                             "resolving", use_prog)
             log(f"[+] {sum(1 for h in hosts.values() if h.ips and not h.wildcard)} "
                 f"resolving (non-wildcard) hosts")
+
+            # ---- Dangling-CNAME takeover leads ----
+            # A CNAME whose target doesn't resolve has no A record, so Phase 4
+            # filters the host out (`h.ips` gate) and the HTTP-body signature
+            # check can never run — this is the only place the classic takeover
+            # case is visible. DNS-only, same touch tier as the resolution above.
+            dangling = [h for h in hosts.values()
+                        if h.cname and not h.ips and not h.wildcard]
+            if dangling:
+                statuses = await asyncio.gather(
+                    *(cname_target_status(h.cname, ns) for h in dangling))
+                for h, status in zip(dangling, statuses):
+                    mark_dangling_cname(h, status)
+                n_dangling = sum(1 for h in dangling if h.takeover)
+                if n_dangling:
+                    log(f"[!] {n_dangling} dangling CNAME(s) — subdomain-takeover "
+                        f"candidate(s) with a non-existent target")
 
         # ---- Phase 3: enrichment on UNIQUE IPs ----
         ip_to_hosts = defaultdict(list)
@@ -432,19 +493,14 @@ async def run(domains, args, keys) -> list:
         # sources, none of which are passive-only-gated either).
         dorks = []
         if args.dork:
-            provider = select_dork_provider(keys, getattr(args, "dork_provider", "auto"))
-            if provider:
+            providers = configured_dork_providers(keys, getattr(args, "dork_provider", "auto"))
+            if providers:
                 dork_limiter = RateLimiter(per_second=1.0)
-                for d in domains:
-                    hits, terminal = await dork_domain(client, d, provider, keys, dork_limiter)
-                    dorks += hits
-                    if terminal:
-                        log(f"[!] {provider} dork: stopping after {d} — the error would repeat "
-                            f"identically for every remaining domain")
-                        break
+                dorks, used = await _run_dorks(client, domains, providers, keys, dork_limiter)
                 if dorks:
                     n_cat = len({d["category"] for d in dorks})
-                    log(f"[+] {provider} dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
+                    log(f"[+] {'/'.join(used)} dork: {len(dorks)} hit(s) across "
+                        f"{n_cat} categor{'y' if n_cat == 1 else 'ies'}")
             elif getattr(args, "dork_provider", "auto") not in (None, "auto"):
                 log(f"[!] --dork set but --dork-provider {args.dork_provider} not configured — skipping")
             else:

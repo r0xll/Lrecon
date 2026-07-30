@@ -317,6 +317,41 @@ async def resolve_full(subdomain: str, nameservers) -> tuple:
     return ips, cname
 
 
+async def cname_target_status(cname: str, nameservers) -> str:
+    """Whether a CNAME's target actually exists — the dangling-CNAME test.
+
+    Returns "nxdomain" (the target's name does not exist: the highest-confidence
+    subdomain-takeover signal there is), "resolves" (the target exists), or
+    "unknown" (timeout/SERVFAIL — inconclusive, and must never be reported as a
+    finding).
+
+    This is what catches the takeovers TAKEOVER_SIGS cannot. The classic
+    dangling CNAME has no A/AAAA record at all, so the host is filtered out
+    before the HTTP probe and no body signature can ever match; NXDOMAIN on the
+    target needs no HTTP request and no per-provider signature, so it works for
+    providers nobody has written a signature for yet.
+
+    A query for A/AAAA follows the CNAME chain, so a chain ending at a
+    non-existent name reports NXDOMAIN here even when intermediate links exist.
+    """
+    if not _HAVE_DNS or not cname:
+        return "unknown"
+    res = get_resolver(nameservers)
+    nxdomain = False
+    for rtype in ("A", "AAAA"):
+        try:
+            if await res.resolve(cname, rtype):
+                return "resolves"
+        except Exception as e:
+            kind = type(e).__name__
+            if kind == "NXDOMAIN":
+                nxdomain = True
+            elif kind == "NoAnswer":
+                return "resolves"     # the name exists, just not with this type
+            # anything else (timeout, SERVFAIL, ...) stays inconclusive
+    return "nxdomain" if nxdomain else "unknown"
+
+
 async def detect_wildcard(domain: str, nameservers) -> set:
     if not _HAVE_DNS:
         return set()
