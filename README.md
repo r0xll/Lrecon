@@ -396,10 +396,40 @@ cannot: a dangling CNAME usually has *no* A record, so the host never reaches
 the HTTP probe at all. An inconclusive lookup (timeout/SERVFAIL) is never
 reported as a finding.
 
+**Live TLS certificate inspection.** Every other certificate signal in lrecon is
+second-hand — CT logs (crt.sh/certspotter) and Shodan's `ssl.cert.subject.CN`
+search. Reading the certificate a host *actually serves* adds what those can't:
+
+- **SAN mining** — in-scope names on the live cert become hosts tagged
+  `tls-san`, including names that never reached a CT log. Wildcards are dropped
+  (not resolvable hosts), and so is anything outside scope: a shared or CDN
+  certificate routinely carries other tenants' domains, which are not the
+  client's assets.
+- **Non-web TLS ports** — certs are read from the open TLS ports lrecon already
+  discovers (`8443`, `993`, `995`, `465`, `587`, `636`, …), not just `443`.
+  Forgotten internal hostnames sit on mail and admin endpoints nobody submits
+  to CT.
+- **Origin confirmation** — see below.
+- **Hygiene facts** — expired, not-yet-valid, self-signed, near-expiry, issuer.
+
+Certificates are read **without verification**, for the same reason lrecon keeps
+an unverified probe client: targets routinely serve self-signed, expired or
+mismatched certs, and those are exactly the ones worth reporting. Reading a cert
+is not trusting it, and nothing is sent beyond the handshake.
+
+This needs the optional `cryptography` dependency — `pip install 'lrecon[tls]'`.
+Without it the cert pass logs once and skips, like any other optional backend.
+
 **Cloudflare origin discovery.** When Cloudflare fronts a host, lrecon collects
 origin-IP candidates passively — unproxied in-scope subdomains, SPF `ip4:`/`ip6:`
 literals, MX host IPs, and a Shodan `ssl.cert.subject.CN` search — then (active
-mode only) confirms a candidate by sending it a spoofed `Host` header. Every
+mode only) confirms a candidate from **the certificate it serves**, falling back
+to a spoofed `Host` header. The cert is tried first because it is much stronger
+evidence: an IP presenting a certificate that names the target *is* serving the
+target, whereas the header test only says "answered without looking like
+Cloudflare", which a shared host or default vhost can do by accident. A cert
+match also settles it without sending a request past the handshake, so the
+confirmed case touches the target less than it used to. Every
 candidate IP is enriched with ASN/org (via IPinfo, if configured) so you can
 immediately see whether a leaked origin sits on the client's own infrastructure
 or a third party's. A confirmed origin is an **origin IP disclosure / WAF-bypass**

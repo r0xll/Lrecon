@@ -32,6 +32,35 @@ def _by_takeover_confidence(hosts: list) -> list:
         h.takeover_confidence, 3), h.subdomain))
 
 
+CERT_EXPIRY_SOON_DAYS = 30
+
+
+def _cert_flags(c: dict) -> list:
+    """Certificate conditions worth an operator's attention, worst first."""
+    flags = []
+    if c.get("expired"):
+        flags.append("expired")
+    if c.get("not_yet_valid"):
+        flags.append("not yet valid")
+    if c.get("self_signed"):
+        flags.append("self-signed")
+    days = c.get("days_to_expiry")
+    if not c.get("expired") and isinstance(days, int) and days <= CERT_EXPIRY_SOON_DAYS:
+        flags.append(f"expires in {days}d")
+    return flags
+
+
+def _cert_flags_md(c: dict) -> str:
+    return ", ".join(f"**{f}**" for f in _cert_flags(c))
+
+
+def _certs_by_risk(certs: list) -> list:
+    """Flagged certificates first, then by endpoint — the table is read top-down
+    and an expired or self-signed cert is the row that matters."""
+    return sorted(certs, key=lambda c: (not _cert_flags(c), c.get("host") or "",
+                                        c.get("port") or 0))
+
+
 def _spf_lookups(sp: dict) -> tuple[str, str, str]:
     """`(count, caveat, level)` for the SPF DNS-lookup budget, where `level` is
     `"bad"` for a confirmed permerror, `"warn"` for a caveat that blocks a
@@ -510,6 +539,26 @@ def write_markdown(hosts, domains, res, path) -> None:
         lines += ["> SPF/DKIM/DMARC gaps enable email spoofing and strengthen "
                   "phishing pretext (relevant if the SOW covers social engineering).", ""]
 
+    certs = res.get("certs") or []
+    if certs:
+        lines += ["## TLS certificates (as served)", "",
+                  "| Endpoint | Subject CN | SANs | Issuer | Expires | Flags |",
+                  "|---|---|---|---|---|---|"]
+        for c in _certs_by_risk(certs):
+            sans = c.get("sans") or []
+            san_cell = ", ".join(f"`{s}`" for s in sans[:6]) or "—"
+            if len(sans) > 6:
+                san_cell += f" +{len(sans) - 6} more"
+            lines.append(f"| `{c['host']}:{c['port']}` | `{c.get('cn') or '—'}` "
+                         f"| {san_cell} | {c.get('issuer') or '—'} "
+                         f"| {(c.get('not_after') or '—')[:10]} "
+                         f"| {_cert_flags_md(c) or '—'} |")
+        lines += ["", "> Read from the live handshake, so these are the certificates "
+                  "actually presented — including ones never submitted to a CT log. "
+                  "SAN entries inside scope are added to the host list as `tls-san`; "
+                  "names belonging to other tenants on a shared certificate are "
+                  "deliberately excluded.", ""]
+
     fp = res.get("favicon_pivots") or {}
     if fp:
         lines += ["## Favicon pivots (shadow assets sharing favicon)", ""]
@@ -827,6 +876,35 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<th>Accounts</th><th>Data classes</th></tr>{rows}</table>'
                 f'<p class="note">Feeds password-spray candidate lists (T1110.003).</p>')
         sections.append(_html_section("breach", "Credential / breach exposure", n_breach, body))
+
+    # ---- TLS certificates ----
+    certs = res.get("certs") or []
+    if certs:
+        def _cert_row(c):
+            sans = c.get("sans") or []
+            shown = ", ".join(f"<code>{esc(s)}</code>" for s in sans[:6]) or "—"
+            if len(sans) > 6:
+                shown += f' <span class="note">+{len(sans) - 6} more</span>'
+            flags = _cert_flags(c)
+            flag_cell = ("—" if not flags else
+                         f'<strong class="bad">{esc(", ".join(flags))}</strong>')
+            return (f'<tr><td>{esc(c["host"])}:{c["port"]}</td>'
+                    f'<td>{esc(c.get("cn") or "—")}</td><td>{shown}</td>'
+                    f'<td>{esc(c.get("issuer") or "—")}</td>'
+                    f'<td>{esc((c.get("not_after") or "—")[:10])}</td>'
+                    f'<td>{flag_cell}</td></tr>')
+
+        rows = "".join(_cert_row(c) for c in _certs_by_risk(certs))
+        body = (f'{_html_export_button("t-certs", "tls_certificates.csv")}'
+                f'<div style="overflow-x:auto"><table id="t-certs">'
+                f'<tr><th>Endpoint</th><th>Subject CN</th><th>SANs</th><th>Issuer</th>'
+                f'<th>Expires</th><th>Flags</th></tr>{rows}</table></div>'
+                f'<p class="note">Read from the live handshake — the certificates '
+                f'actually presented, including ones never submitted to a CT log. '
+                f'In-scope SAN entries are added to the host list as <code>tls-san</code>; '
+                f'other tenants\' names on a shared certificate are excluded.</p>')
+        sections.append(_html_section("certs", "TLS certificates (as served)",
+                                      len(certs), body))
 
     # ---- GitHub code exposure ----
     if gh:

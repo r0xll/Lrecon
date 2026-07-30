@@ -14,6 +14,8 @@ from .people import *
 from .dorking import *
 from .vt import *
 from . import backends
+from . import tlsinfo
+from .tlsinfo import TLS_PORTS, fetch_cert, in_scope_cert_names
 
 # --------------------------------------------------------------------------- #
 # Orchestration
@@ -327,6 +329,7 @@ async def run(domains, args, keys) -> list:
                     apply_ipinfo(h, info, ip)
 
         # ---- Phase 4: active probe / port scan / favicon ----
+        certs = []
         if not args.passive_only:
             port_sem = asyncio.Semaphore(300)
             active_hosts = [h for h in hosts.values() if h.ips and not h.wildcard]
@@ -383,6 +386,37 @@ async def run(domains, args, keys) -> list:
                 log(f"[+] tech-stack confirmation: {n_confirmed} host(s) corroborated live, "
                     f"{n_unconfirmed} unconfirmed (Shodan/InternetDB banner only — verify before triaging)")
 
+            # ---- TLS certificates on live hosts ----
+            # The cert a host actually serves — which CT logs and Shodan cannot
+            # give us: names that never reached a log, and the mail/admin TLS
+            # ports nobody submits to CT. Read without verification (see
+            # tlsinfo) because expired/self-signed/mismatched certs are exactly
+            # the ones worth reporting. Also the input for the SAN wire-back.
+            if tlsinfo.HAVE_CRYPTO:
+                targets = []
+                for h in active_hosts:
+                    open_tls = [p for p in (h.ports or []) if p in TLS_PORTS]
+                    for port in (open_tls or [443])[:4]:      # cap per host
+                        targets.append((h.subdomain, port))
+                cert_sem = asyncio.Semaphore(args.concurrency)
+
+                async def read_cert(name, port):
+                    async with cert_sem:
+                        c = await fetch_cert(name, port)
+                    return {"host": name, "port": port, **c} if c else None
+
+                got = await _gather_with_progress(
+                    (read_cert(n, p) for n, p in targets),
+                    f"reading TLS certs ({len(targets)} endpoint(s))", use_prog)
+                certs = [c for c in got if c]
+                if certs:
+                    n_bad = sum(1 for c in certs if c["expired"] or c["self_signed"])
+                    log(f"[+] TLS certs: {len(certs)} read"
+                        + (f" ({n_bad} expired or self-signed)" if n_bad else ""))
+            else:
+                log("[i] TLS cert inspection: cryptography not installed — skipping "
+                    "(pip install 'lrecon[tls]')")
+
         # ---- Cloudflare origin discovery ----
         cf = {"detected": False, "fronted": [], "candidates": {}}
         cf_nets = []
@@ -414,6 +448,24 @@ async def run(domains, args, keys) -> list:
                 if not args.passive_only:
                     nh.ips, nh.cname = await resolve_full(h.rdns, ns)
                 hosts[h.rdns] = nh
+
+        # ---- TLS SAN wire-back: add in-scope names found on live certs ----
+        # Same shape as the rDNS wire-back above. in_scope_cert_names() drops
+        # wildcards (not resolvable hosts) and anything outside scope — a shared
+        # or CDN cert routinely carries other tenants' domains, which are not the
+        # client's assets and must never enter the report.
+        san_added = 0
+        for cert in certs:
+            for name in in_scope_cert_names(cert, domains):
+                if name in hosts:
+                    continue
+                nh = Host(subdomain=name, source={"tls-san"})
+                if not args.passive_only:
+                    nh.ips, nh.cname = await resolve_full(name, ns)
+                hosts[name] = nh
+                san_added += 1
+        if san_added:
+            log(f"[+] tls-san: {san_added} new in-scope host(s) from certificate SANs")
 
         # ---- ASN / netblock expansion (opt-in) ----
         asn_info = {}
@@ -650,6 +702,6 @@ async def run(domains, args, keys) -> list:
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
-            "vt": vt_intel, "auth_surface": auth_surfaces}
+            "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs}
 
 

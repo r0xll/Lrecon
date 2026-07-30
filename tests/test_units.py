@@ -1565,6 +1565,196 @@ async def test_mail_infra_lookup_keyless_still_enriches_asn_org(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Live TLS certificate inspection
+# --------------------------------------------------------------------------- #
+from lrecon import tlsinfo
+
+crypto = pytest.importorskip("cryptography", reason="optional [tls] extra")
+
+
+def _make_cert(cn="www.x.com", sans=("www.x.com", "api.x.com"), days=30,
+               issuer_cn=None, not_before_days=1):
+    """A DER certificate to parse — no network, no fixtures on disk."""
+    import datetime
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = _make_cert._key
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]) if cn \
+        else x509.Name([])
+    issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)]) \
+        if issuer_cn else subject
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+               .public_key(key.public_key()).serial_number(x509.random_serial_number())
+               .not_valid_before(now - datetime.timedelta(days=not_before_days))
+               .not_valid_after(now + datetime.timedelta(days=days)))
+    if sans:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]), False)
+    cert = builder.sign(key, hashes.SHA256())
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+def _cert_key():
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+
+_make_cert._key = _cert_key()          # generated once; RSA keygen is slow
+
+
+def test_parse_cert_extracts_names_issuer_and_validity():
+    c = tlsinfo.parse_cert(_make_cert(cn="www.x.com",
+                                      sans=("www.x.com", "api.x.com", "*.dev.x.com"),
+                                      issuer_cn="Some CA"))
+    assert c["cn"] == "www.x.com"
+    assert c["sans"] == ["*.dev.x.com", "api.x.com", "www.x.com"]   # sorted, lowercased
+    assert c["issuer"] == "some ca"
+    assert c["expired"] is False and c["not_yet_valid"] is False
+    assert c["self_signed"] is False
+    assert 25 <= c["days_to_expiry"] <= 30
+
+
+def test_parse_cert_flags_self_signed_and_expired():
+    self_signed = tlsinfo.parse_cert(_make_cert(issuer_cn=None))
+    assert self_signed["self_signed"] is True
+    # not_valid_after in the past: negative `days` puts expiry before now.
+    expired = tlsinfo.parse_cert(_make_cert(days=-5, not_before_days=30))
+    assert expired["expired"] is True
+    assert expired["days_to_expiry"] < 0
+
+
+def test_parse_cert_tolerates_no_san_and_no_cn():
+    no_san = tlsinfo.parse_cert(_make_cert(sans=()))
+    assert no_san["sans"] == [] and no_san["cn"] == "www.x.com"
+    no_cn = tlsinfo.parse_cert(_make_cert(cn=None, sans=("only.x.com",)))
+    assert no_cn["cn"] is None and no_cn["sans"] == ["only.x.com"]
+
+
+def test_parse_cert_malformed_returns_none_not_raises():
+    assert tlsinfo.parse_cert(b"not a certificate") is None
+    assert tlsinfo.parse_cert(b"") is None
+
+
+def test_cert_names_folds_in_the_cn():
+    """Older/internal CAs still put the only name in the CN."""
+    assert tlsinfo.cert_names({"cn": "only.x.com", "sans": []}) == ["only.x.com"]
+    both = tlsinfo.cert_names({"cn": "a.x.com", "sans": ["b.x.com"]})
+    assert set(both) == {"a.x.com", "b.x.com"}
+    assert tlsinfo.cert_names(None) == []
+
+
+def test_cert_matches_scope_accepts_apex_subdomain_and_wildcard():
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["x.com"]}, ["x.com"]) == "x.com"
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["a.x.com"]}, ["x.com"]) == "a.x.com"
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["*.x.com"]}, ["x.com"]) == "*.x.com"
+    # A lookalike domain must not count as in scope.
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["notx.com"]}, ["x.com"]) is None
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["x.com.evil.net"]},
+                                      ["x.com"]) is None
+
+
+def test_in_scope_cert_names_drops_wildcards_and_other_tenants():
+    """A shared/CDN cert carries other tenants' domains — those are not the
+    client's assets. Wildcards aren't resolvable hosts, so they're dropped too."""
+    cert = {"cn": "www.x.com",
+            "sans": ["www.x.com", "api.x.com", "*.dev.x.com", "other-tenant.net"]}
+    assert tlsinfo.in_scope_cert_names(cert, ["x.com"]) == ["api.x.com", "www.x.com"]
+
+
+async def test_fetch_cert_returns_none_when_unreachable():
+    """An unreachable or non-TLS peer must not raise into the scan."""
+    assert await tlsinfo.fetch_cert("127.0.0.1", port=1, timeout=0.5) is None
+
+
+async def test_fetch_cert_skips_cleanly_without_cryptography(monkeypatch):
+    monkeypatch.setattr(tlsinfo, "HAVE_CRYPTO", False)
+    assert await tlsinfo.fetch_cert("example.com") is None
+    assert tlsinfo.parse_cert(_make_cert()) is None
+
+
+def test_tls_sni_omitted_for_bare_ip():
+    """SNI carries a hostname; sending an IP literal is invalid. Origin discovery
+    depends on seeing the default cert an IP serves."""
+    assert tlsinfo._is_ip("192.0.2.1") is True
+    assert tlsinfo._is_ip("2001:db8::1") is True
+    assert tlsinfo._is_ip("example.com") is False
+
+
+async def test_cloudflare_origin_confirmed_by_cert_without_http_probe(monkeypatch):
+    """A cert naming the target is stronger evidence than the Server header, and
+    settles it without sending a request past the handshake."""
+    monkeypatch.setattr(intel, "fetch_cert", _fake_fetch_cert(
+        {"9.9.9.9": {"cn": "www.x.com", "sans": ["www.x.com"], "issuer": "Some CA"}}))
+    probe = _RecordingProbeClient()
+    hosts = {"a.x.com": Host("a.x.com", ips=["9.9.9.9"]),
+             "cf.x.com": Host("cf.x.com", ips=["104.16.0.1"])}
+    cf_nets = [ipaddress.ip_network("104.16.0.0/13")]
+    monkeypatch.setattr(intel, "enrich_ipinfo", _no_ipinfo)
+    # No apex SPF/MX candidates: keeps the test off the network, so the only
+    # candidate is the unproxied in-scope host.
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _AbsentRecordResolver())
+    out = await intel.cloudflare_origin_analysis(
+        None, probe, ["x.com"], hosts, {}, cf_nets, active=True, resolver_ns=None)
+    cand = out["candidates"]["9.9.9.9"]
+    assert cand["confirmed"] is True
+    assert "TLS cert" in cand["evidence"] and "www.x.com" in cand["evidence"]
+    assert cand["cert"]["cn"] == "www.x.com"
+    assert probe.calls == []                 # no HTTP request needed
+
+
+async def test_cloudflare_origin_falls_back_to_host_header_when_cert_unhelpful(monkeypatch):
+    """An out-of-scope or absent cert must not confirm, and must not stop the
+    existing header probe from doing its job."""
+    monkeypatch.setattr(intel, "fetch_cert", _fake_fetch_cert(
+        {"9.9.9.9": {"cn": "shared-host.example", "sans": [], "issuer": "CA"}}))
+    probe = _RecordingProbeClient(status=200, server="nginx")
+    hosts = {"a.x.com": Host("a.x.com", ips=["9.9.9.9"]),
+             "cf.x.com": Host("cf.x.com", ips=["104.16.0.1"])}
+    monkeypatch.setattr(intel, "enrich_ipinfo", _no_ipinfo)
+    # No apex SPF/MX candidates: keeps the test off the network, so the only
+    # candidate is the unproxied in-scope host.
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _AbsentRecordResolver())
+    out = await intel.cloudflare_origin_analysis(
+        None, probe, ["x.com"], hosts, {}, [ipaddress.ip_network("104.16.0.0/13")],
+        active=True, resolver_ns=None)
+    cand = out["candidates"]["9.9.9.9"]
+    assert cand["confirmed"] is True
+    assert cand["evidence"].startswith("Host: x.com")
+    assert probe.calls                        # the header probe still ran
+
+
+def _fake_fetch_cert(by_ip):
+    async def fake(host, port=443, sni=None, timeout=6.0):
+        return by_ip.get(host)
+    return fake
+
+
+async def _no_ipinfo(client, ip, token):
+    return {}
+
+
+class _RecordingProbeClient:
+    """Records every request so 'no HTTP touch' can be asserted."""
+    def __init__(self, status=None, server=""):
+        self.calls = []
+        self._status, self._server = status, server
+
+    class _Resp:
+        def __init__(self, status_code, headers):
+            self.status_code, self.headers = status_code, headers
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self._status is None:
+            raise Exception("connection refused")
+        return self._Resp(self._status, {"server": self._server})
+
+
+# --------------------------------------------------------------------------- #
 # Search-engine dorking (Google Custom Search API)
 # --------------------------------------------------------------------------- #
 def test_parse_cse_response_extracts_hits():
@@ -2754,6 +2944,69 @@ def test_takeover_report_tolerates_a_lead_with_no_confidence_set():
         report.write_html(hosts, ["x.com"], {}, str(html))
         assert "old.x.com" in md.read_text()
         assert "old.x.com" in html.read_text()
+
+
+def _cert_res():
+    return {"certs": [
+        {"host": "www.x.com", "port": 443, "cn": "www.x.com",
+         "sans": ["www.x.com", "api.x.com"], "issuer": "Real CA",
+         "not_after": "2027-01-01T00:00:00+00:00", "not_before": "2026-01-01T00:00:00+00:00",
+         "expired": False, "not_yet_valid": False, "days_to_expiry": 400,
+         "self_signed": False},
+        {"host": "mail.x.com", "port": 993, "cn": "mail.x.com", "sans": [],
+         "issuer": "mail.x.com", "not_after": "2020-01-01T00:00:00+00:00",
+         "not_before": "2019-01-01T00:00:00+00:00", "expired": True,
+         "not_yet_valid": False, "days_to_expiry": -2000, "self_signed": True},
+    ]}
+
+
+def test_cert_flags_names_every_condition_worth_attention():
+    good = {"expired": False, "not_yet_valid": False, "self_signed": False,
+            "days_to_expiry": 400}
+    assert report._cert_flags(good) == []
+    soon = {**good, "days_to_expiry": 5}
+    assert report._cert_flags(soon) == ["expires in 5d"]
+    bad = {"expired": True, "not_yet_valid": False, "self_signed": True,
+           "days_to_expiry": -10}
+    flags = report._cert_flags(bad)
+    assert "expired" in flags and "self-signed" in flags
+    # An already-expired cert shouldn't also claim it "expires in -10d".
+    assert not any("expires in" in f for f in flags)
+
+
+def test_write_markdown_cert_section_lists_endpoints_flagged_first():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("www.x.com", ips=["1.2.3.4"])], ["x.com"],
+                              _cert_res(), str(path))
+        content = path.read_text()
+    assert "TLS certificates (as served)" in content
+    assert "`mail.x.com:993`" in content and "`www.x.com:443`" in content
+    assert "expired" in content and "self-signed" in content
+    # The flagged cert is the row that matters, so it sorts first.
+    assert content.index("mail.x.com:993") < content.index("www.x.com:443")
+
+
+def test_write_html_cert_section_flags_bad_certs():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("www.x.com", ips=["1.2.3.4"])], ["x.com"],
+                          _cert_res(), str(path))
+        content = path.read_text()
+    assert "TLS certificates (as served)" in content
+    assert "<th>SANs</th>" in content
+    assert 'class="bad"' in content
+    assert content.index("mail.x.com") < content.index("www.x.com:443")
+
+
+def test_cert_section_absent_when_no_certs_read():
+    """A run without the [tls] extra must not emit an empty section."""
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("a.x.com")], ["x.com"], {}, str(md))
+        report.write_html([Host("a.x.com")], ["x.com"], {}, str(html))
+        assert "TLS certificates" not in md.read_text()
+        assert "TLS certificates" not in html.read_text()
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():

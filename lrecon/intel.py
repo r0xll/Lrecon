@@ -4,6 +4,7 @@ import httpx
 from .common import *
 from .sources import get_resolver, resolve_full
 from .enrich import enrich_ipinfo
+from .tlsinfo import cert_matches_scope, fetch_cert, in_scope_cert_names
 
 # --------------------------------------------------------------------------- #
 # Cloudflare origin discovery (origin IP disclosure -> WAF bypass)
@@ -113,10 +114,26 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
             except Exception:
                 pass
 
-    # 4. active confirmation: spoofed Host header to candidate IP
+    # 4. active confirmation: the cert the candidate serves, then a spoofed Host
+    # header. The cert is tried first because it is much stronger evidence — an
+    # IP presenting a certificate that names the target is serving the target,
+    # whereas the header test only says "answered without looking like
+    # Cloudflare", which a shared host or a default vhost can do by accident.
+    # A cert match also settles it without sending a request beyond the
+    # handshake, so the confirmed case touches the target less than before.
     if active and cands:
         primary = domains[0]
         for ip in list(cands):
+            cert = await fetch_cert(ip)
+            if cert:
+                cands[ip]["cert"] = cert
+                match = cert_matches_scope(cert, domains)
+                if match:
+                    cands[ip]["confirmed"] = True
+                    cands[ip]["evidence"] = (
+                        f"TLS cert on {ip}:443 names {match}"
+                        + (f" (issuer: {cert['issuer']})" if cert.get("issuer") else ""))
+                    continue
             for scheme in ("https", "http"):
                 try:
                     r = await probe_client.get(f"{scheme}://{ip}", headers={"Host": primary},
@@ -152,7 +169,8 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
 
     result["candidates"] = {ip: {"sources": sorted(v["sources"]),
                                  "confirmed": v["confirmed"], "evidence": v["evidence"],
-                                 "asn": v.get("asn"), "org": v.get("org")}
+                                 "asn": v.get("asn"), "org": v.get("org"),
+                                 "cert": v.get("cert")}
                             for ip, v in cands.items()}
     return result
 
