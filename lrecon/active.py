@@ -43,31 +43,45 @@ async def takeover_check_host(client, host: Host) -> None:
             continue
 
 
-def mark_dangling_cname(host: Host, status: str) -> None:
+def mark_dangling_cname(host: Host, status: str, closest_zone: str | None = None) -> None:
     """Record a takeover lead from the CNAME target's DNS status.
 
-    Only "nxdomain" is a finding — the target's name does not exist, so the
-    hostname points at nothing and whoever can claim that name at the provider
-    serves content here. "resolves" and "unknown" (timeout/SERVFAIL) are not
-    reported: an inconclusive lookup must not become a client-facing finding.
+    Only "nxdomain" is a finding. "resolves" and "unknown" (timeout/SERVFAIL) are
+    not reported: an inconclusive lookup must not become a client-facing finding.
 
-    This is the one takeover signal needing neither an HTTP response nor a
-    per-provider signature, and it covers exactly what _check_takeover() cannot
-    see: a host with no A record never reaches the HTTP probe, which is the
-    normal shape of a dangling CNAME. A known provider is named when the target
-    matches one, but detection does not depend on it.
+    Confidence turns on *claimability*, not on brokenness. NXDOMAIN proves the
+    target does not exist; it does not prove an attacker could create it. A
+    broken CNAME to a typo under a partner's domain is NXDOMAIN too, yet nobody
+    outside that partner can register the name — calling that a confirmed
+    takeover would be a critical-severity false positive.
 
-    An existing signature-based finding is left in place — it already carries
-    corroborating body evidence.
+    So "confirmed" is reserved for a target under a known takeover-prone provider,
+    where re-registration is exactly the service on offer. Everything else is
+    "possible", carrying the closest still-existing zone as the evidence an
+    operator needs to judge: a zone of `com` means the whole domain is
+    unregistered and can simply be bought, while `partner-company.com` means only
+    a label is missing inside someone else's live zone.
+
+    This still covers what _check_takeover() structurally cannot see: a host with
+    no A record never reaches the HTTP probe, which is the normal shape of a
+    dangling CNAME. An existing signature-based finding is left in place — it
+    already carries corroborating body evidence.
     """
     if status != "nxdomain" or host.takeover:
         return
     provider = next((sig for sig in TAKEOVER_SIGS if host.cname and sig in host.cname), None)
-    host.takeover = (f"Dangling CNAME -> {host.cname}"
-                     + (f" ({provider})" if provider else "")
-                     + "; target name does not exist (NXDOMAIN) — claimable if the "
-                       "provider allows re-registration")
-    host.takeover_confidence = "confirmed"
+    if provider:
+        host.takeover = (f"Dangling CNAME -> {host.cname} ({provider}); target name does "
+                         f"not exist (NXDOMAIN) and the provider allows re-registration "
+                         f"— claimable")
+        host.takeover_confidence = "confirmed"
+        return
+    host.takeover = (f"Dangling CNAME -> {host.cname}; target name does not exist "
+                     f"(NXDOMAIN)"
+                     + (f", closest existing zone is {closest_zone}" if closest_zone else "")
+                     + ". Broken, but claimability is unverified — confirm whether the "
+                       "target is registrable before treating this as a takeover")
+    host.takeover_confidence = "possible"
 
 
 def _check_takeover(host: Host, body_lower: str) -> None:

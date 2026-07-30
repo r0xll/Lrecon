@@ -3,7 +3,7 @@ import asyncio, ipaddress, random, shutil, string
 from .common import *
 from . import backends
 try:
-    import dns.asyncresolver
+    import dns.asyncresolver, dns.rdatatype
 except Exception:
     pass
 
@@ -317,13 +317,48 @@ async def resolve_full(subdomain: str, nameservers) -> tuple:
     return ips, cname
 
 
-async def cname_target_status(cname: str, nameservers) -> str:
-    """Whether a CNAME's target actually exists — the dangling-CNAME test.
+def _closest_zone_from_nxdomain(exc) -> str | None:
+    """The deepest zone that *does* exist above a non-existent name.
 
-    Returns "nxdomain" (the target's name does not exist: the highest-confidence
-    subdomain-takeover signal there is), "resolves" (the target exists), or
-    "unknown" (timeout/SERVFAIL — inconclusive, and must never be reported as a
-    finding).
+    An NXDOMAIN answer carries the SOA of the closest enclosing zone, and that
+    single fact separates the two very different situations behind an identical
+    rcode:
+
+      * `typo.partner-company.com` -> SOA owner `partner-company.com` — a live
+        zone is merely missing one label, so an attacker cannot create the name.
+      * `gone.no-such-domain.com`  -> SOA owner `com` — nothing below the TLD
+        exists, so the domain itself is unregistered and can simply be bought.
+
+    Best-effort: returns None when the resolver surfaced no authority section.
+    """
+    try:
+        responses = exc.responses() or {}
+        best = None
+        for resp in responses.values():
+            for rrset in getattr(resp, "authority", None) or []:
+                if getattr(rrset, "rdtype", None) != dns.rdatatype.SOA:
+                    continue
+                zone = str(rrset.name).rstrip(".").lower()
+                # If responses disagree, the deepest zone is the tightest bound.
+                if zone and (best is None or zone.count(".") > best.count(".")):
+                    best = zone
+        return best
+    except Exception:
+        return None
+
+
+async def cname_target_status(cname: str, nameservers) -> tuple:
+    """Whether a CNAME's target exists — the dangling-CNAME test.
+
+    Returns `(status, closest_zone)` where status is "nxdomain" (the target's
+    name does not exist), "resolves" (it does), or "unknown" (timeout/SERVFAIL —
+    inconclusive, and never to be reported as a finding).
+
+    `closest_zone` accompanies an "nxdomain" result: the deepest zone that still
+    exists above the target. NXDOMAIN proves the target is *broken*, not that it
+    is *claimable* — an attacker can only take it over if they can create the
+    name, which depends on whether the enclosing domain is theirs to register.
+    Callers use the zone to tell those apart instead of assuming the worst.
 
     This is what catches the takeovers TAKEOVER_SIGS cannot. The classic
     dangling CNAME has no A/AAAA record at all, so the host is filtered out
@@ -335,21 +370,23 @@ async def cname_target_status(cname: str, nameservers) -> str:
     non-existent name reports NXDOMAIN here even when intermediate links exist.
     """
     if not _HAVE_DNS or not cname:
-        return "unknown"
+        return "unknown", None
     res = get_resolver(nameservers)
     nxdomain = False
+    closest_zone = None
     for rtype in ("A", "AAAA"):
         try:
             if await res.resolve(cname, rtype):
-                return "resolves"
+                return "resolves", None
         except Exception as e:
             kind = type(e).__name__
             if kind == "NXDOMAIN":
                 nxdomain = True
+                closest_zone = closest_zone or _closest_zone_from_nxdomain(e)
             elif kind == "NoAnswer":
-                return "resolves"     # the name exists, just not with this type
+                return "resolves", None   # the name exists, just not with this type
             # anything else (timeout, SERVFAIL, ...) stays inconclusive
-    return "nxdomain" if nxdomain else "unknown"
+    return ("nxdomain", closest_zone) if nxdomain else ("unknown", None)
 
 
 async def detect_wildcard(domain: str, nameservers) -> set:

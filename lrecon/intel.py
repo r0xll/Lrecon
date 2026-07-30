@@ -320,10 +320,22 @@ def parse_dmarc(record: str | None) -> dict:
     return out
 
 
+# The only modes RFC 8461 §3.2 defines. Anything else — including a policy file
+# that never states one — leaves the policy unenforceable, so the mode is what
+# decides whether a published MTA-STS record actually protects anything.
+_MTA_STS_MODES = ("enforce", "testing", "none")
+
+
 async def _fetch_mta_sts_policy(client, domain: str) -> dict | None:
     """Fetch and parse the MTA-STS policy file. RFC 8461 fixes its location at
     `https://mta-sts.{domain}/.well-known/mta-sts.txt`, so this is a single GET
-    of a standards-defined endpoint the domain publishes on purpose."""
+    of a standards-defined endpoint the domain publishes on purpose.
+
+    Returns None only when the file could not be retrieved. A retrieved file is
+    returned as parsed, valid or not — judging it belongs at the decision point
+    in email_security(), which has to tell "unreachable" and "published but
+    unusable" apart because the remedies differ.
+    """
     try:
         r = await client.get(f"https://mta-sts.{domain}/.well-known/mta-sts.txt",
                              timeout=10, follow_redirects=True)
@@ -343,7 +355,9 @@ async def _fetch_mta_sts_policy(client, domain: str) -> dict | None:
             policy["mx"].append(val.lower())
         elif key in ("version", "max_age"):
             policy[key] = val
-    return policy or None
+    # Note: `policy` is always truthy (it is seeded with a key), so returning it
+    # here says only "the file was fetched", never "the file is usable".
+    return policy
 
 
 async def email_security(domain: str, resolver_ns, client=None) -> dict:
@@ -478,11 +492,22 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
     if out["mta_sts"] and client is not None:
         policy = await _fetch_mta_sts_policy(client, domain)
         out["mta_sts_policy"] = policy
-        out["mta_sts_mode"] = (policy or {}).get("mode")
-        if not policy:
+        mode = (policy or {}).get("mode")
+        # Only record a mode the RFC defines: a garbage value (or a catch-all
+        # page that parsed into nothing) must not reach the report looking like
+        # a real policy setting.
+        out["mta_sts_mode"] = mode if mode in _MTA_STS_MODES else None
+        if policy is None:
             out["issues"].append(
                 "MTA-STS record published but the policy file is unreachable — "
                 "senders fall back to opportunistic (strippable) TLS")
+        elif out["mta_sts_mode"] is None:
+            # Fetched but unusable — e.g. a catch-all 200 serving the app's index
+            # page. Distinct from unreachable: the endpoint answers, so the
+            # operator has to fix the file's content, not its availability.
+            out["issues"].append(
+                "MTA-STS policy file served but invalid (no usable mode=) — "
+                "the published record is not enforceable")
         elif out["mta_sts_mode"] == "testing":
             out["issues"].append(
                 "MTA-STS mode=testing — TLS failures are reported, not enforced")

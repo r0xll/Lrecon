@@ -17,10 +17,12 @@ def _md_code(value) -> str:
     return "`" + str(value).replace("|", "\\|") + "`"
 
 
+# Kept generic: several signals now feed each level, so the label states the
+# strength of the evidence and the per-host detail says which signal produced it.
 TAKEOVER_CONFIDENCE_LABELS = {
-    "confirmed": "confirmed — CNAME target does not exist",
+    "confirmed": "confirmed — claimable at a known provider",
     "likely": "likely — unclaimed-service signature matched",
-    "possible": "possible — takeover-prone provider, unverified",
+    "possible": "possible — unverified, see detail",
 }
 _TAKEOVER_CONFIDENCE_RANK = {"confirmed": 0, "likely": 1, "possible": 2}
 
@@ -64,14 +66,17 @@ def _mta_sts_text(e: dict) -> str:
     if not e.get("mta_sts"):
         return "not published — SMTP TLS is downgradeable (STARTTLS stripping)"
     mode = e.get("mta_sts_mode")
-    if not e.get("mta_sts_policy"):
+    if e.get("mta_sts_policy") is None:
         return "record published but **policy file unreachable** — senders fall back to " \
                "opportunistic TLS"
     if mode == "enforce":
         return "`mode=enforce` — senders must use validated TLS"
     if mode in ("testing", "none"):
         return f"**`mode={mode}`** — published but not enforcing"
-    return f"policy published (`mode={mode or 'unspecified'}`)"
+    # Fetched but with no usable mode — a catch-all page, or a malformed file.
+    # Must not read as though a policy is in effect.
+    return "policy file served but **invalid** (no usable `mode=`) — the published " \
+           "record is not enforceable"
 
 
 CERT_EXPIRY_SOON_DAYS = 30

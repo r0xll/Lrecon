@@ -292,8 +292,8 @@ async def run(domains, args, keys) -> list:
             if dangling:
                 statuses = await asyncio.gather(
                     *(cname_target_status(h.cname, ns) for h in dangling))
-                for h, status in zip(dangling, statuses):
-                    mark_dangling_cname(h, status)
+                for h, (status, closest_zone) in zip(dangling, statuses):
+                    mark_dangling_cname(h, status, closest_zone)
                 n_dangling = sum(1 for h in dangling if h.takeover)
                 if n_dangling:
                     log(f"[!] {n_dangling} dangling CNAME(s) — subdomain-takeover "

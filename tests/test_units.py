@@ -1415,6 +1415,46 @@ async def test_email_security_flags_published_but_broken_mta_sts(monkeypatch):
     assert out["grade"] == "WARN"
 
 
+async def test_email_security_flags_a_served_but_invalid_mta_sts_policy(monkeypatch):
+    """A 200 that isn't a policy file — a catch-all page, or an empty body — used
+    to be recorded as a published policy with no issue raised, because the parser
+    seeded a truthy dict. The record is not enforceable and must say so, and this
+    is distinct from unreachable: the endpoint answers, so the content is what
+    needs fixing."""
+    for body in ("<html><body>Not found</body></html>", "", "garbage: value\n"):
+        answers = _email_zone(extra={
+            ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+        monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+        out = await intel.email_security("x.test", None, _PolicyClient(body))
+        assert out["mta_sts_mode"] is None, body
+        assert any("invalid (no usable mode=)" in i for i in out["issues"]), body
+        assert not any("unreachable" in i for i in out["issues"]), body
+        assert out["grade"] == "WARN", body
+
+
+async def test_email_security_ignores_an_unrecognised_mta_sts_mode(monkeypatch):
+    """A mode outside RFC 8461's three must not reach the report looking real."""
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security(
+        "x.test", None, _PolicyClient("version: STSv1\nmode: banana\n"))
+    assert out["mta_sts_mode"] is None
+    assert any("invalid (no usable mode=)" in i for i in out["issues"])
+
+
+def test_mta_sts_report_wording_distinguishes_invalid_from_unreachable():
+    unreachable = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": None,
+                                        "mta_sts_mode": None})
+    assert "unreachable" in unreachable
+    invalid = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": {"mx": []},
+                                    "mta_sts_mode": None})
+    assert "invalid" in invalid and "not enforceable" in invalid
+    assert "unreachable" not in invalid
+    # And it must never read as though a policy is in effect.
+    assert "unspecified" not in invalid
+
+
 async def test_email_security_flags_non_enforcing_mta_sts_modes(monkeypatch):
     for mode, phrase in (("testing", "mode=testing"), ("none", "mode=none")):
         answers = _email_zone(extra={
@@ -1665,7 +1705,21 @@ async def test_security_txt_absent_returns_empty():
 
 
 class NXDOMAIN(Exception):
-    """Stands in for dns.resolver.NXDOMAIN — matched by class name."""
+    """Stands in for dns.resolver.NXDOMAIN — matched by class name, so the class
+    must be named exactly this (a subclass under another name would not match).
+
+    Pass `zone` to include an authority section, the way a real resolver returns
+    the SOA of the closest enclosing zone alongside an NXDOMAIN.
+    """
+    def __init__(self, *args, zone=None):
+        super().__init__(*args)
+        self.zone = zone
+
+    def responses(self):
+        if not self.zone:
+            return {}
+        import dns.rdatatype
+        return {"q": _NXResponse([_SOARRset(f"{self.zone}.", dns.rdatatype.SOA)])}
 
 
 class NoAnswer(Exception):
@@ -1689,18 +1743,52 @@ class _CnameTargetResolver:
         raise Exception(f"timeout for {name} {rtype}")
 
 
+class _SOARRset:
+    def __init__(self, name, rdtype):
+        self.name, self.rdtype = name, rdtype
+
+
+class _NXResponse:
+    def __init__(self, authority):
+        self.authority = authority
+
+
 async def test_cname_target_status_distinguishes_missing_live_and_inconclusive(monkeypatch):
     """NXDOMAIN on the target is the takeover signal; a resolvable target is not
     a finding; and a timeout must stay inconclusive rather than being reported."""
     monkeypatch.setattr(sources, "get_resolver", lambda ns: _CnameTargetResolver(
         live=["ok.example.net"], missing=["gone.example.net"],
         noanswer=["exists.example.net"]))
-    assert await sources.cname_target_status("gone.example.net", None) == "nxdomain"
-    assert await sources.cname_target_status("ok.example.net", None) == "resolves"
+    assert await sources.cname_target_status("gone.example.net", None) == ("nxdomain", None)
+    assert await sources.cname_target_status("ok.example.net", None) == ("resolves", None)
     # The name exists, just carries no address — not a dangling target.
-    assert await sources.cname_target_status("exists.example.net", None) == "resolves"
-    assert await sources.cname_target_status("slow.example.net", None) == "unknown"
-    assert await sources.cname_target_status("", None) == "unknown"
+    assert await sources.cname_target_status("exists.example.net", None) == ("resolves", None)
+    assert await sources.cname_target_status("slow.example.net", None) == ("unknown", None)
+    assert await sources.cname_target_status("", None) == ("unknown", None)
+
+
+async def test_cname_target_status_reports_the_closest_existing_zone(monkeypatch):
+    """The SOA in an NXDOMAIN answer is what separates "the domain itself doesn't
+    exist" from "a label is missing inside someone else's live zone"."""
+    class _R:
+        async def resolve(self, name, rtype, **kwargs):
+            raise NXDOMAIN(name, zone="com" if "no-such-domain" in name
+                           else "partner-company.com")
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    assert await sources.cname_target_status("a.no-such-domain.com", None) == \
+        ("nxdomain", "com")
+    assert await sources.cname_target_status("typo.partner-company.com", None) == \
+        ("nxdomain", "partner-company.com")
+
+
+async def test_cname_target_status_tolerates_nxdomain_without_authority(monkeypatch):
+    """A resolver that surfaces no authority section must degrade to no zone, not
+    raise — the status is still usable."""
+    class _R:
+        async def resolve(self, name, rtype, **kwargs):
+            raise NXDOMAIN(name)          # plain, no .responses()
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    assert await sources.cname_target_status("gone.example.net", None) == ("nxdomain", None)
 
 
 def test_mark_dangling_cname_flags_only_nxdomain():
@@ -1711,23 +1799,52 @@ def test_mark_dangling_cname_flags_only_nxdomain():
         assert h.takeover is None and h.takeover_confidence is None
     h = Host("dev.x.com", cname="gone.example.net")
     active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover is not None and "NXDOMAIN" in h.takeover
+
+
+def test_mark_dangling_cname_confirms_only_a_claimable_provider():
+    """NXDOMAIN proves the target is broken, not that an attacker could create
+    it. Only a known takeover-prone provider — where re-registration is the
+    service on offer — justifies "confirmed" and its critical severity."""
+    h = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
+    active.mark_dangling_cname(h, "nxdomain")
     assert h.takeover_confidence == "confirmed"
-    assert "NXDOMAIN" in h.takeover
+    assert "s3.amazonaws.com" in h.takeover and "claimable" in h.takeover
 
 
-def test_mark_dangling_cname_works_for_providers_with_no_signature():
-    """The whole point of the NXDOMAIN path: it doesn't need TAKEOVER_SIGS, so it
-    catches providers nobody has written a signature for."""
+def test_mark_dangling_cname_does_not_claim_an_unknown_target_is_takeable():
+    """Regression for the critical-severity false positive: a broken CNAME to a
+    typo under a partner's domain is NXDOMAIN, but nobody outside that partner
+    can register the name."""
+    h = Host("dev.x.com", cname="typo.partner-company.com")
+    assert not any(sig in h.cname for sig in intel.TAKEOVER_SIGS)
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="partner-company.com")
+    assert h.takeover_confidence == "possible"
+    # The evidence an operator needs to judge, and no assertion of claimability.
+    assert "closest existing zone is partner-company.com" in h.takeover
+    assert "claimability is unverified" in h.takeover
+
+
+def test_mark_dangling_cname_still_reports_an_unsignatured_provider():
+    """Downgrading confidence must not mean dropping the lead: a service nobody
+    has written a signature for is still surfaced, just not as confirmed."""
     unknown = "abandoned.some-saas-nobody-signatured.io"
     assert not any(sig in unknown for sig in intel.TAKEOVER_SIGS)
     h = Host("dev.x.com", cname=unknown)
-    active.mark_dangling_cname(h, "nxdomain")
-    assert h.takeover_confidence == "confirmed"
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="com")
+    assert h.takeover_confidence == "possible"
     assert unknown in h.takeover
-    # A recognized provider is still named when one matches.
-    h2 = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
-    active.mark_dangling_cname(h2, "nxdomain")
-    assert "s3.amazonaws.com" in h2.takeover
+
+
+def test_unclaimable_nxdomain_is_high_not_critical():
+    """The severity consequence of the downgrade, end to end."""
+    cf = {"detected": False, "candidates": {}}
+    h = Host("dev.x.com", cname="typo.partner-company.com")
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="partner-company.com")
+    assert intel.summarize_entry_points([h], cf, [], {}, [], [])[0]["severity"] == "high"
+    p = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
+    active.mark_dangling_cname(p, "nxdomain")
+    assert intel.summarize_entry_points([p], cf, [], {}, [], [])[0]["severity"] == "critical"
 
 
 def test_mark_dangling_cname_does_not_overwrite_a_signature_finding():
@@ -3245,8 +3362,8 @@ def test_write_markdown_takeover_shows_confidence_confirmed_first():
         path = Path(d) / "r.md"
         report.write_markdown(_takeover_hosts(), ["x.com"], {}, str(path))
         content = path.read_text()
-    assert "confirmed — CNAME target does not exist" in content
-    assert "possible — takeover-prone provider" in content
+    assert "confirmed — claimable at a known provider" in content
+    assert "possible — unverified, see detail" in content
     # Highest confidence first: that's the order the leads get worked in.
     assert content.index("gone.x.com") < content.index("weak.x.com")
 

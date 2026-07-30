@@ -379,8 +379,11 @@ raw text it reports a parsed breakdown:
   actual `mode`. Plain absence is reported as a field, **not** raised as an
   issue — most domains publish no MTA-STS, and treating that as a finding would
   push nearly every domain to WARN and make the grade useless. A published but
-  *broken* policy is a real defect and does raise one: an unreachable policy
-  file, `mode=testing`, or `mode=none`.
+  *broken* policy is a real defect and does raise one, in three distinguishable
+  states: the policy file is **unreachable**, it is **served but invalid** (a 200
+  with no usable `mode=` — a catch-all page or a malformed file, so the published
+  record isn't enforceable), or it is valid but not enforcing (`mode=testing` /
+  `mode=none`). The remedies differ, so the report doesn't collapse them.
 
 **DNS zone transfer (AXFR).** One query per authoritative nameserver, reusing
 the NS list the DNS snapshot already collected. A server that answers hands over
@@ -414,16 +417,28 @@ the report lists the strongest leads first:
 
 | Confidence | Signal |
 |---|---|
-| **confirmed** | the CNAME target's name does not exist (NXDOMAIN) |
+| **confirmed** | the target is NXDOMAIN *and* sits under a known takeover-prone provider, where re-registration is the service on offer |
 | **likely** | the provider's unclaimed-service signature matched in the response body |
-| **possible** | the CNAME points at a takeover-prone provider, nothing corroborated |
+| **possible** | the target is NXDOMAIN but claimability is unverified — reported with the closest still-existing zone as evidence |
 
-The **confirmed** check is DNS-only and provider-agnostic — it needs no HTTP
-response and no per-provider signature, so it catches providers nobody has
-written a signature for. It also covers the case the other two structurally
-cannot: a dangling CNAME usually has *no* A record, so the host never reaches
-the HTTP probe at all. An inconclusive lookup (timeout/SERVFAIL) is never
-reported as a finding.
+Confidence turns on **claimability, not brokenness**. NXDOMAIN proves the target
+doesn't exist; it does not prove an attacker could create it. A broken CNAME to a
+typo under a partner's domain is NXDOMAIN too, yet nobody outside that partner
+can register the name — calling that confirmed would be a critical-severity false
+positive.
+
+To let you judge the rest, lrecon reports the **closest still-existing zone**,
+read from the SOA that an NXDOMAIN answer already carries. That one fact
+separates the two cases behind an identical rcode: a closest zone of `com` means
+the domain itself is unregistered and can simply be bought (a serious takeover),
+while `partner-company.com` means only a label is missing inside someone else's
+live zone. Deciding that automatically would need a full public-suffix list, so
+the fact is surfaced rather than guessed at.
+
+The NXDOMAIN path is DNS-only and needs no HTTP response, so it covers the case
+the signature checks structurally cannot: a dangling CNAME usually has *no* A
+record, so the host never reaches the HTTP probe at all. An inconclusive lookup
+(timeout/SERVFAIL) is never reported as a finding.
 
 **Live TLS certificate inspection.** Every other certificate signal in lrecon is
 second-hand — CT logs (crt.sh/certspotter) and Shodan's `ssl.cert.subject.CN`
