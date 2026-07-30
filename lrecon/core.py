@@ -517,6 +517,16 @@ async def run(domains, args, keys) -> list:
                     else:
                         log(f"[!] mail infra {d}: no managed provider recognized — possible self-hosted MTA")
 
+            # Phishing read-out, once both the email posture and the MX
+            # infrastructure are known — the gateway is what decides whether
+            # lookalike mail is filtered on arrival, and it comes from mail_infra.
+            for d, entry in email.items():
+                entry["phishing_posture"] = phishing_posture(entry, mail_infra.get(d))
+                services = ((entry.get("dmarc_vendors") or [])
+                            + (entry.get("spf_vendors") or []))
+                if services:
+                    log(f"[i] email services {d}: {', '.join(services)}")
+
         # ---- DNS zone transfer (AXFR) ----
         # One query per authoritative nameserver, reusing the NS list the DNS
         # snapshot above already collected. A server that answers hands over
