@@ -248,12 +248,17 @@ async def spf_lookup_count(record: str | None, txt_lookup,
     several more lookups. Returns
     `(count, complete, exceeded, unusable)`.
 
-    `unusable` maps each target the walk could not get an SPF record from to why
-    — `"no_spf_record"` or `"lookup_failed"`. These used to be skipped silently,
-    but an `include:` that resolves to nothing usable is a permerror in its own
+    `unusable` maps each target the walk could not get an SPF record from to
+    `(mechanism, reason)` — mechanism being `"include"` or `"redirect"`, reason
+    `"no_spf_record"` or `"lookup_failed"`. These used to be skipped silently,
+    but a mechanism that resolves to nothing usable is a permerror in its own
     right, and the caller diagnoses them further (a target whose *name* does not
     exist is a different and more serious problem than one that simply publishes
     no SPF).
+
+    The mechanism is tracked because a finding has to name something the operator
+    can actually find in the record: reporting a broken `redirect=` as an
+    `include:` sends them looking for a mechanism that isn't there.
 
     `txt_lookup` is the caller's async TXT resolver returning `(records, failed)`
     — reused rather than taking a resolver directly so this inherits the caller's
@@ -276,7 +281,7 @@ async def spf_lookup_count(record: str | None, txt_lookup,
         return 0, True, False, {}
 
     count, complete = 0, True
-    unusable: dict[str, str] = {}
+    unusable: dict[str, tuple[str, str]] = {}
     cache: dict[str, str | None] = {}
     queue = [parse_spf(record)]
     while queue:
@@ -286,8 +291,9 @@ async def spf_lookup_count(record: str | None, txt_lookup,
             # A lower bound above the cap is still a definitive permerror, so
             # stop here rather than resolving the rest of the tree.
             return count, False, True, unusable
-        targets = list(p["includes"]) + ([p["redirect"]] if p["redirect"] else [])
-        for target in targets:
+        targets = ([("include", t) for t in p["includes"]]
+                   + ([("redirect", p["redirect"])] if p["redirect"] else []))
+        for mechanism, target in targets:
             norm = target.lower().rstrip(".")
             if norm in cache:
                 sub = cache[norm]
@@ -296,7 +302,7 @@ async def spf_lookup_count(record: str | None, txt_lookup,
                 if failed:
                     complete = False
                     cache[norm] = None
-                    unusable[norm] = "lookup_failed"
+                    unusable[norm] = (mechanism, "lookup_failed")
                     continue
                 sub = next((t for t in recs if t.lower().startswith("v=spf1")), None)
                 cache[norm] = sub
@@ -306,7 +312,7 @@ async def spf_lookup_count(record: str | None, txt_lookup,
             if sub:
                 queue.append(parse_spf(sub))
             else:
-                unusable.setdefault(norm, "no_spf_record")
+                unusable.setdefault(norm, (mechanism, "no_spf_record"))
     return count, complete, count > max_lookups, unusable
 
 
@@ -329,17 +335,33 @@ async def classify_spf_includes(unusable: dict, resolver_ns) -> list:
     are rare, so this costs almost nothing in practice.
     """
     out = []
-    for target, reason in sorted(unusable.items()):
+    for target, (mechanism, reason) in sorted(unusable.items()):
         if reason == "lookup_failed":
-            out.append({"target": target, "state": "lookup_failed", "closest_zone": None})
+            out.append({"target": target, "mechanism": mechanism,
+                        "state": "lookup_failed", "closest_zone": None})
             continue
         # cname_target_status() asks for A/AAAA, so NoAnswer ("the name exists,
         # just not with this type") correctly reads as "resolves" for a target
         # that only ever publishes TXT.
         status, closest_zone = await cname_target_status(target, resolver_ns)
         state = {"nxdomain": "nxdomain", "resolves": "no_spf"}.get(status, "lookup_failed")
-        out.append({"target": target, "state": state, "closest_zone": closest_zone})
+        out.append({"target": target, "mechanism": mechanism,
+                    "state": state, "closest_zone": closest_zone})
     return out
+
+
+def spf_mechanism_text(inc: dict) -> str:
+    """How a diagnosed target is actually written in the record.
+
+    A finding has to name something the operator can find by searching their own
+    SPF record. Reporting a dead `redirect=` as an `include:` sends them looking
+    for a mechanism that isn't there. Defaults to `include:` so pre-enrichment
+    results, which carry no mechanism, keep their original wording.
+    """
+    target = inc.get("target")
+    if inc.get("mechanism") == "redirect":
+        return f"redirect={target}"
+    return f"include:{target}"
 
 
 # --------------------------------------------------------------------------- #
@@ -657,20 +679,24 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
         # in which case whoever takes the domain can authorise their own mail.
         out["spf_include_health"] = await classify_spf_includes(unusable, resolver_ns)
         for inc in out["spf_include_health"]:
+            # Name the mechanism the target came from: a broken redirect= is not
+            # an include:, and telling an operator otherwise points them at a
+            # mechanism their record doesn't contain.
+            mech = spf_mechanism_text(inc)
             if inc["state"] == "nxdomain":
                 out["issues"].append(
-                    f"SPF include:{inc['target']} does not exist (NXDOMAIN) — permerror "
+                    f"SPF {mech} does not exist (NXDOMAIN) — permerror "
                     f"(risk); if that domain is registrable, whoever registers it can "
                     f"publish SPF authorising their own mail for this domain"
                     + (f" [closest existing zone: {inc['closest_zone']}]"
                        if inc.get("closest_zone") else ""))
             elif inc["state"] == "no_spf":
                 out["issues"].append(
-                    f"SPF include:{inc['target']} publishes no SPF record — permerror, "
+                    f"SPF {mech} publishes no SPF record — permerror, "
                     f"the mechanism can never match")
             else:
                 out["issues"].append(
-                    f"SPF include:{inc['target']} could not be checked (DNS error) — "
+                    f"SPF {mech} could not be checked (DNS error) — "
                     f"inconclusive, not confirmation that it is broken")
     out["spf_vendors"] = classify_spf_vendors(out["spf_parsed"])
     if out["spf_parsed"].get("exceeds_lookup_limit"):

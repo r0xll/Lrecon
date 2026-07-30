@@ -72,8 +72,9 @@ def _spf_include_health(e: dict) -> dict:
 
 
 def _spf_include_md(target: str, e: dict) -> str:
-    """An include, flagged inline when it's broken — the list of includes is
-    where a reader looks, so the defect belongs there and not only in Issues."""
+    """An `include:` or `redirect=` target, flagged inline when it's broken — the
+    SPF breakdown is where a reader looks, so the defect belongs there and not
+    only in Issues. Keyed on the target, so it serves both mechanisms."""
     state = _spf_include_health(e).get((target or "").lower().rstrip("."))
     label, bad = _SPF_INCLUDE_FLAGS.get(state, (None, False))
     if not label:
@@ -598,7 +599,8 @@ def write_markdown(hosts, domains, res, path) -> None:
                                  + ", ".join(f"`{n}`" for n in nets[:12])
                                  + (f" +{len(nets) - 12} more" if len(nets) > 12 else ""))
                 if sp.get("redirect"):
-                    lines.append(f"- **SPF redirect:** `{sp['redirect']}`")
+                    lines.append("- **SPF redirect:** "
+                                 + _spf_include_md(sp["redirect"], e))
             if e.get("dmarc"):
                 lines += [f"- **DMARC policy:** `p={dp.get('p') or '?'}`"
                           + (f", `sp={dp['sp']}`" if dp.get("sp") else "")
@@ -1237,6 +1239,8 @@ def write_html(hosts, domains, res, path) -> None:
                            + ", ".join(_inc_html(i) for i in inc)
                            if inc else "SPF includes: none")
                 details += [f"SPF policy: {esc(qual)}", f"SPF DNS lookups: {lk_txt}", inc_txt]
+                if sp.get("redirect"):
+                    details.append("SPF redirect: " + _inc_html(sp["redirect"]))
             if e.get("dmarc"):
                 pol = f"<code>p={esc(dp.get('p') or '?')}</code>"
                 for tag in ("sp", "pct", "adkim", "aspf"):

@@ -396,6 +396,10 @@ identical in a plain TXT lookup and mean very different things:
 | **no SPF record** | permerror — the mechanism can never match, but nobody can hijack it |
 | **unchecked** | DNS error — inconclusive, never reported as either of the above |
 
+Each finding names the mechanism it came from — `include:` or `redirect=` — and
+the report flags the target where it's listed, so a broken `redirect=` is never
+reported as an include the record doesn't contain.
+
 The NXDOMAIN case reports the **closest still-existing zone** as evidence and
 stops short of asserting the domain is registrable — same discipline as the
 takeover confidence levels, and for the same reason (deciding that needs a

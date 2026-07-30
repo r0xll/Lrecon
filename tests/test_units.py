@@ -1291,7 +1291,7 @@ async def test_spf_lookup_count_handles_missing_target_record_and_no_spf():
         "v=spf1 include:empty.test -all", _spf_zone_txt({}))
     assert (count, complete, exceeded) == (1, True, False)
     # It used to be skipped silently; now it is reported for diagnosis.
-    assert unusable == {"empty.test": "no_spf_record"}
+    assert unusable == {"empty.test": ("include", "no_spf_record")}
     assert await intel.spf_lookup_count(None, _spf_zone_txt({})) == (0, True, False, {})
 
 
@@ -1302,7 +1302,8 @@ async def test_spf_lookup_count_separates_unusable_from_unreachable_includes():
     count, complete, exceeded, unusable = await intel.spf_lookup_count(
         "v=spf1 include:ok.test include:empty.test include:broken.test -all",
         _spf_zone_txt(zone, fail={"broken.test"}))
-    assert unusable == {"empty.test": "no_spf_record", "broken.test": "lookup_failed"}
+    assert unusable == {"empty.test": ("include", "no_spf_record"),
+                        "broken.test": ("include", "lookup_failed")}
     assert complete is False                    # the failed lookup is not hidden
 
 
@@ -1311,6 +1312,17 @@ async def test_spf_lookup_count_follows_redirect():
     count, complete, exceeded, unusable = await intel.spf_lookup_count(
         "v=spf1 redirect=r.test", _spf_zone_txt(zone))
     assert (count, complete, exceeded) == (4, True, False)
+
+
+async def test_spf_lookup_count_records_which_mechanism_broke():
+    """A record can reach a dead target through either mechanism, and the two are
+    fixed in different places — so which one found it is reported, not guessed."""
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
+        "v=spf1 redirect=dead.test", _spf_zone_txt({}))
+    assert unusable == {"dead.test": ("redirect", "no_spf_record")}
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
+        "v=spf1 redirect=gone.test", _spf_zone_txt({}, fail={"gone.test"}))
+    assert unusable == {"gone.test": ("redirect", "lookup_failed")}
 
 
 async def test_email_security_expands_spf_includes_for_the_lookup_limit(monkeypatch):
@@ -1769,8 +1781,9 @@ async def test_classify_spf_includes_separates_dead_from_unpublished(monkeypatch
                 "slow.test": ("unknown", None)}[target]
     monkeypatch.setattr(intel, "cname_target_status", fake_status)
     out = await intel.classify_spf_includes(
-        {"gone.test": "no_spf_record", "empty.test": "no_spf_record",
-         "slow.test": "no_spf_record"}, None)
+        {"gone.test": ("include", "no_spf_record"),
+         "empty.test": ("include", "no_spf_record"),
+         "slow.test": ("include", "no_spf_record")}, None)
     by_target = {i["target"]: i for i in out}
     assert by_target["gone.test"]["state"] == "nxdomain"
     assert by_target["gone.test"]["closest_zone"] == "com"
@@ -1788,9 +1801,10 @@ async def test_classify_spf_includes_does_not_requery_a_failed_lookup(monkeypatc
         calls.append(target)
         return "resolves", None
     monkeypatch.setattr(intel, "cname_target_status", fake_status)
-    out = await intel.classify_spf_includes({"broken.test": "lookup_failed"}, None)
-    assert out == [{"target": "broken.test", "state": "lookup_failed",
-                    "closest_zone": None}]
+    out = await intel.classify_spf_includes(
+        {"broken.test": ("include", "lookup_failed")}, None)
+    assert out == [{"target": "broken.test", "mechanism": "include",
+                    "state": "lookup_failed", "closest_zone": None}]
     assert calls == []
 
 
@@ -1806,12 +1820,36 @@ async def test_email_security_flags_a_dead_spf_include_as_a_spoofing_vector(monk
     monkeypatch.setattr(intel, "cname_target_status", fake_status)
     out = await intel.email_security("x.test", None)
     health = out["spf_include_health"]
-    assert health == [{"target": "gone.test", "state": "nxdomain", "closest_zone": "com"}]
+    assert health == [{"target": "gone.test", "mechanism": "include",
+                       "state": "nxdomain", "closest_zone": "com"}]
     issue = next(i for i in out["issues"] if "gone.test" in i)
     assert "NXDOMAIN" in issue and "closest existing zone: com" in issue
+    # The mechanism named is the one in the record.
+    assert "include:gone.test" in issue
     # Hedged on registrability, exactly as the takeover wording is.
     assert "if that domain is registrable" in issue
     assert out["grade"] == "FAIL"          # a permerror is a real defect
+
+
+async def test_email_security_names_a_dead_redirect_as_a_redirect(monkeypatch):
+    """The finding has to name a mechanism the operator can find in their record.
+    A domain with no include: at all must never be told to fix an include:."""
+    answers = _email_zone(spf="v=spf1 redirect=gone.test",
+                          extra={("gone.test", "TXT"): []})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+
+    async def fake_status(target, ns):
+        return "nxdomain", "com"
+    monkeypatch.setattr(intel, "cname_target_status", fake_status)
+    out = await intel.email_security("x.test", None)
+    assert out["spf_include_health"] == [{"target": "gone.test", "mechanism": "redirect",
+                                          "state": "nxdomain", "closest_zone": "com"}]
+    issue = next(i for i in out["issues"] if "gone.test" in i)
+    assert "redirect=gone.test" in issue
+    assert "include:" not in issue
+    # Same defect either way — the label changed, not the diagnosis.
+    assert "NXDOMAIN" in issue and "if that domain is registrable" in issue
+    assert out["grade"] == "FAIL"
 
 
 async def test_email_security_flags_an_include_with_no_spf_record(monkeypatch):
@@ -3536,8 +3574,8 @@ def _posture_res():
                        "redirect": None, "all_qualifier": "-", "lookup_count": 3,
                        "lookup_count_complete": True, "exceeds_lookup_limit": False},
         "dmarc_parsed": {"p": "reject", "rua": ["mailto:a@rep.redsift.cloud"]},
-        "spf_include_health": [{"target": "gone.test", "state": "nxdomain",
-                                "closest_zone": "com"}],
+        "spf_include_health": [{"target": "gone.test", "mechanism": "include",
+                                "state": "nxdomain", "closest_zone": "com"}],
         "spf_vendors": ["Microsoft 365"], "dmarc_vendors": ["Red Sift OnDMARC"],
         "phishing_posture": {"enforced": True, "policy": "reject", "pct": None,
                              "monitored_by": ["Red Sift OnDMARC"],
@@ -3575,6 +3613,30 @@ def test_write_html_email_shows_services_and_phishing_posture():
     # Shared posture wording renders its markup rather than leaking backticks.
     assert "<code>p=reject</code>" in content
     assert 'class="bad"' in content and "does not exist" in content
+
+
+def _redirect_res():
+    """A domain whose only SPF mechanism is a dead `redirect=` — no includes at
+    all, so the flag has nowhere to appear except the redirect line."""
+    res = _posture_res()
+    e = res["email"]["x.com"]
+    e["spf"] = "v=spf1 redirect=gone.test"
+    e["spf_parsed"] = dict(e["spf_parsed"], includes=[], redirect="gone.test")
+    e["spf_include_health"] = [{"target": "gone.test", "mechanism": "redirect",
+                                "state": "nxdomain", "closest_zone": "com"}]
+    e["issues"] = ["SPF redirect=gone.test does not exist (NXDOMAIN)"]
+    return res
+
+
+def test_writers_flag_a_broken_spf_redirect_on_the_redirect_line():
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], _redirect_res(), str(md))
+        report.write_html([Host("x.com")], ["x.com"], _redirect_res(), str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    assert "**SPF redirect:** `gone.test` (**does not exist**)" in md_text
+    assert "SPF redirect:" in html_text
+    assert '<code>gone.test</code> <span class="bad">(does not exist)</span>' in html_text
 
 
 def test_email_section_unchanged_when_no_analysis_present():
