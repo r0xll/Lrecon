@@ -22,7 +22,11 @@ include = ["lrecon*"]
 
 [project.optional-dependencies]
 screenshots = ["playwright>=1.40"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+# Live TLS certificate inspection (SAN mining, origin confirmation, expiry /
+# self-signed flags). Optional so the base install stays minimal — without it
+# the cert pass logs once and skips, like the other optional backends.
+tls = ["cryptography>=42"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=42"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

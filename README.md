@@ -371,6 +371,38 @@ raw text it reports a parsed breakdown:
   despite an enforced `p=`), and a missing `rua=` (no aggregate reporting).
 - **DKIM** — the matched selector and its record, or the explicit list of selectors
   probed so a "not found" reads as inconclusive rather than absent.
+- **MTA-STS + TLS-RPT** — SPF/DKIM/DMARC authenticate the *message*; MTA-STS
+  (RFC 8461) protects the *connection*, telling senders to require TLS with a
+  valid certificate. Without it STARTTLS is strippable by an active network
+  attacker and mail silently downgrades to plaintext. lrecon reads the
+  `_mta-sts` and `_smtp._tls` records and fetches the policy file to report the
+  actual `mode`. Plain absence is reported as a field, **not** raised as an
+  issue — most domains publish no MTA-STS, and treating that as a finding would
+  push nearly every domain to WARN and make the grade useless. A published but
+  *broken* policy is a real defect and does raise one, in three distinguishable
+  states: the policy file is **unreachable**, it is **served but invalid** (a 200
+  with no usable `mode=` — a catch-all page or a malformed file, so the published
+  record isn't enforceable), or it is valid but not enforcing (`mode=testing` /
+  `mode=none`). The remedies differ, so the report doesn't collapse them.
+
+**DNS zone transfer (AXFR).** One query per authoritative nameserver, reusing
+the NS list the DNS snapshot already collected. A server that answers hands over
+every record in the zone at once — including internal-only names no amount of
+brute-forcing would surface — so a successful transfer is a **critical** entry
+point (T1590.002). The report keeps the three outcomes distinct per nameserver:
+**allowed** (the finding, with the disclosed names), **refused** (correct
+configuration), and **not conclusive** (we couldn't reach it). That last
+distinction matters — reporting an unreachable nameserver as "transfers refused"
+would be a false negative. AXFR is TCP/53, which some sandboxed environments
+block outright, and a blocked attempt lands in the inconclusive bucket rather
+than being mistaken for a pass.
+
+**security.txt (RFC 9116).** Read from the live hosts already probed. Useful two
+ways: it names the disclosure channel a report should actually go to, and its
+`Policy`/`Canonical`/`Acknowledgments` URLs routinely point at hosts nothing else
+surfaced. An `Expires` date in the past is flagged — per the RFC the contact
+details should no longer be relied on. A catch-all route that returns the app's
+index page for every path is not mistaken for a published file.
 
 **Unique-IP enrichment.** Enrichment runs once per distinct IP, not per subdomain.
 On CDN-fronted targets where hundreds of hosts share a few IPs this cuts API calls
@@ -380,13 +412,68 @@ and wall time dramatically, and respects Shodan's ~1 req/s limit.
 then drops phantom subdomains so they never reach your report.
 
 **Subdomain-takeover leads (T1584.001).** Dangling CNAMEs to unclaimed
-S3/GitHub Pages/Heroku/Azure/etc. are flagged, distinguishing a matched
-unclaimed-service signature (high confidence) from a takeover-prone CNAME (lead).
+S3/GitHub Pages/Heroku/Azure/etc. are flagged with an explicit confidence, and
+the report lists the strongest leads first:
+
+| Confidence | Signal |
+|---|---|
+| **confirmed** | the target is NXDOMAIN *and* sits under a known takeover-prone provider, where re-registration is the service on offer |
+| **likely** | the provider's unclaimed-service signature matched in the response body |
+| **possible** | the target is NXDOMAIN but claimability is unverified — reported with the closest still-existing zone as evidence |
+
+Confidence turns on **claimability, not brokenness**. NXDOMAIN proves the target
+doesn't exist; it does not prove an attacker could create it. A broken CNAME to a
+typo under a partner's domain is NXDOMAIN too, yet nobody outside that partner
+can register the name — calling that confirmed would be a critical-severity false
+positive.
+
+To let you judge the rest, lrecon reports the **closest still-existing zone**,
+read from the SOA that an NXDOMAIN answer already carries. That one fact
+separates the two cases behind an identical rcode: a closest zone of `com` means
+the domain itself is unregistered and can simply be bought (a serious takeover),
+while `partner-company.com` means only a label is missing inside someone else's
+live zone. Deciding that automatically would need a full public-suffix list, so
+the fact is surfaced rather than guessed at.
+
+The NXDOMAIN path is DNS-only and needs no HTTP response, so it covers the case
+the signature checks structurally cannot: a dangling CNAME usually has *no* A
+record, so the host never reaches the HTTP probe at all. An inconclusive lookup
+(timeout/SERVFAIL) is never reported as a finding.
+
+**Live TLS certificate inspection.** Every other certificate signal in lrecon is
+second-hand — CT logs (crt.sh/certspotter) and Shodan's `ssl.cert.subject.CN`
+search. Reading the certificate a host *actually serves* adds what those can't:
+
+- **SAN mining** — in-scope names on the live cert become hosts tagged
+  `tls-san`, including names that never reached a CT log. Wildcards are dropped
+  (not resolvable hosts), and so is anything outside scope: a shared or CDN
+  certificate routinely carries other tenants' domains, which are not the
+  client's assets.
+- **Non-web TLS ports** — certs are read from the open TLS ports lrecon already
+  discovers (`8443`, `993`, `995`, `465`, `587`, `636`, …), not just `443`.
+  Forgotten internal hostnames sit on mail and admin endpoints nobody submits
+  to CT.
+- **Origin confirmation** — see below.
+- **Hygiene facts** — expired, not-yet-valid, self-signed, near-expiry, issuer.
+
+Certificates are read **without verification**, for the same reason lrecon keeps
+an unverified probe client: targets routinely serve self-signed, expired or
+mismatched certs, and those are exactly the ones worth reporting. Reading a cert
+is not trusting it, and nothing is sent beyond the handshake.
+
+This needs the optional `cryptography` dependency — `pip install 'lrecon[tls]'`.
+Without it the cert pass logs once and skips, like any other optional backend.
 
 **Cloudflare origin discovery.** When Cloudflare fronts a host, lrecon collects
 origin-IP candidates passively — unproxied in-scope subdomains, SPF `ip4:`/`ip6:`
 literals, MX host IPs, and a Shodan `ssl.cert.subject.CN` search — then (active
-mode only) confirms a candidate by sending it a spoofed `Host` header. Every
+mode only) confirms a candidate from **the certificate it serves**, falling back
+to a spoofed `Host` header. The cert is tried first because it is much stronger
+evidence: an IP presenting a certificate that names the target *is* serving the
+target, whereas the header test only says "answered without looking like
+Cloudflare", which a shared host or default vhost can do by accident. A cert
+match also settles it without sending a request past the handshake, so the
+confirmed case touches the target less than it used to. Every
 candidate IP is enriched with ASN/org (via IPinfo, if configured) so you can
 immediately see whether a leaked origin sits on the client's own infrastructure
 or a third party's. A confirmed origin is an **origin IP disclosure / WAF-bypass**
@@ -578,6 +665,16 @@ silently exhaust the allowance on a run where you didn't need it.
 **Three interchangeable backends.** Pick one with `--dork-provider`
 (`auto`/`google`/`brave`/`vertex`); `auto` uses whichever is configured,
 preferring Google CSE so existing key-holders keep their current behavior.
+
+**Automatic failover.** With more than one backend configured, `auto` falls
+through to the next one when a backend fails *terminally* — a revoked key, an
+exhausted quota, a rejected request. Since Google CSE is closed to new customers,
+a stale CSE key sitting beside a working Brave key is a realistic setup, and it
+would otherwise produce zero hits for the whole run. Failover resumes at the
+domain that failed (earlier domains were already swept), hits are deduped by URL
+across backends, and the startup line names the fallback chain. Quota use is
+unchanged when the first backend works, since nothing else is queried. Pinning a
+backend explicitly with `--dork-provider` never falls back.
 
 | Backend | Flag / env | Credentials | Notes |
 |---|---|---|---|

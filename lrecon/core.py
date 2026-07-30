@@ -14,6 +14,8 @@ from .people import *
 from .dorking import *
 from .vt import *
 from . import backends
+from . import tlsinfo
+from .tlsinfo import TLS_PORTS, fetch_cert, in_scope_cert_names
 
 # --------------------------------------------------------------------------- #
 # Orchestration
@@ -126,6 +128,50 @@ async def verify_keys(client, keys: dict) -> None:
         log("[i] HIBP: key configured but not required — domain-breach lookup uses HIBP's keyless endpoint")
 
 
+async def _run_dorks(client, domains, providers, keys, limiter) -> tuple:
+    """Sweep every domain, falling back to the next configured search backend on
+    a terminal failure. Returns (hits, providers_used).
+
+    A terminal failure (revoked key, exhausted quota, malformed request) will
+    recur identically for every remaining domain, so continuing with that
+    backend is pointless — but giving up entirely wastes any other configured
+    backend. Google CSE is closed to new customers, so a stale CSE key sitting
+    alongside a working Brave key is a realistic setup, and it used to yield
+    zero hits.
+
+    Fallback resumes at the domain that failed rather than restarting: earlier
+    domains completed, while the failing one aborted partway through its
+    categories and still needs a full sweep. Hits are deduped by link across
+    backends — _run_templates() only dedupes within a single domain, and two
+    engines routinely index the same URL.
+    """
+    hits, used, seen = [], [], set()
+    remaining = list(domains)
+    for i, provider in enumerate(providers):
+        exhausted = False
+        while remaining:
+            d = remaining[0]
+            found, terminal = await dork_domain(client, d, provider, keys, limiter)
+            for hit in found:
+                if hit["link"] in seen:
+                    continue
+                seen.add(hit["link"])
+                hits.append(hit)
+                if provider not in used:
+                    used.append(provider)
+            if terminal:
+                nxt = providers[i + 1] if i + 1 < len(providers) else None
+                log(f"[!] {provider} dork: terminal failure on {d} — "
+                    + (f"falling back to {nxt}" if nxt else
+                       "no other search backend configured, giving up"))
+                exhausted = True
+                break
+            remaining.pop(0)                  # this domain is fully swept
+        if not exhausted:                     # every domain swept, nothing to fall back for
+            break
+    return hits, used
+
+
 async def run(domains, args, keys) -> list:
     ns = args.resolvers.split(",") if args.resolvers else DEFAULT_RESOLVERS
     use_prog = _HAVE_RICH and not args.no_progress
@@ -236,6 +282,23 @@ async def run(domains, args, keys) -> list:
             log(f"[+] {sum(1 for h in hosts.values() if h.ips and not h.wildcard)} "
                 f"resolving (non-wildcard) hosts")
 
+            # ---- Dangling-CNAME takeover leads ----
+            # A CNAME whose target doesn't resolve has no A record, so Phase 4
+            # filters the host out (`h.ips` gate) and the HTTP-body signature
+            # check can never run — this is the only place the classic takeover
+            # case is visible. DNS-only, same touch tier as the resolution above.
+            dangling = [h for h in hosts.values()
+                        if h.cname and not h.ips and not h.wildcard]
+            if dangling:
+                statuses = await asyncio.gather(
+                    *(cname_target_status(h.cname, ns) for h in dangling))
+                for h, (status, closest_zone) in zip(dangling, statuses):
+                    mark_dangling_cname(h, status, closest_zone)
+                n_dangling = sum(1 for h in dangling if h.takeover)
+                if n_dangling:
+                    log(f"[!] {n_dangling} dangling CNAME(s) — subdomain-takeover "
+                        f"candidate(s) with a non-existent target")
+
         # ---- Phase 3: enrichment on UNIQUE IPs ----
         ip_to_hosts = defaultdict(list)
         for h in hosts.values():
@@ -266,6 +329,7 @@ async def run(domains, args, keys) -> list:
                     apply_ipinfo(h, info, ip)
 
         # ---- Phase 4: active probe / port scan / favicon ----
+        certs = []
         if not args.passive_only:
             port_sem = asyncio.Semaphore(300)
             active_hosts = [h for h in hosts.values() if h.ips and not h.wildcard]
@@ -322,6 +386,37 @@ async def run(domains, args, keys) -> list:
                 log(f"[+] tech-stack confirmation: {n_confirmed} host(s) corroborated live, "
                     f"{n_unconfirmed} unconfirmed (Shodan/InternetDB banner only — verify before triaging)")
 
+            # ---- TLS certificates on live hosts ----
+            # The cert a host actually serves — which CT logs and Shodan cannot
+            # give us: names that never reached a log, and the mail/admin TLS
+            # ports nobody submits to CT. Read without verification (see
+            # tlsinfo) because expired/self-signed/mismatched certs are exactly
+            # the ones worth reporting. Also the input for the SAN wire-back.
+            if tlsinfo.HAVE_CRYPTO:
+                targets = []
+                for h in active_hosts:
+                    open_tls = [p for p in (h.ports or []) if p in TLS_PORTS]
+                    for port in (open_tls or [443])[:4]:      # cap per host
+                        targets.append((h.subdomain, port))
+                cert_sem = asyncio.Semaphore(args.concurrency)
+
+                async def read_cert(name, port):
+                    async with cert_sem:
+                        c = await fetch_cert(name, port)
+                    return {"host": name, "port": port, **c} if c else None
+
+                got = await _gather_with_progress(
+                    (read_cert(n, p) for n, p in targets),
+                    f"reading TLS certs ({len(targets)} endpoint(s))", use_prog)
+                certs = [c for c in got if c]
+                if certs:
+                    n_bad = sum(1 for c in certs if c["expired"] or c["self_signed"])
+                    log(f"[+] TLS certs: {len(certs)} read"
+                        + (f" ({n_bad} expired or self-signed)" if n_bad else ""))
+            else:
+                log("[i] TLS cert inspection: cryptography not installed — skipping "
+                    "(pip install 'lrecon[tls]')")
+
         # ---- Cloudflare origin discovery ----
         cf = {"detected": False, "fronted": [], "candidates": {}}
         cf_nets = []
@@ -354,6 +449,24 @@ async def run(domains, args, keys) -> list:
                     nh.ips, nh.cname = await resolve_full(h.rdns, ns)
                 hosts[h.rdns] = nh
 
+        # ---- TLS SAN wire-back: add in-scope names found on live certs ----
+        # Same shape as the rDNS wire-back above. in_scope_cert_names() drops
+        # wildcards (not resolvable hosts) and anything outside scope — a shared
+        # or CDN cert routinely carries other tenants' domains, which are not the
+        # client's assets and must never enter the report.
+        san_added = 0
+        for cert in certs:
+            for name in in_scope_cert_names(cert, domains):
+                if name in hosts:
+                    continue
+                nh = Host(subdomain=name, source={"tls-san"})
+                if not args.passive_only:
+                    nh.ips, nh.cname = await resolve_full(name, ns)
+                hosts[name] = nh
+                san_added += 1
+        if san_added:
+            log(f"[+] tls-san: {san_added} new in-scope host(s) from certificate SANs")
+
         # ---- ASN / netblock expansion (opt-in) ----
         asn_info = {}
         if args.asn_expand and not args.passive_only:
@@ -374,7 +487,7 @@ async def run(domains, args, keys) -> list:
         email = {}
         if not args.passive_only:
             for d in domains:
-                email[d] = await email_security(d, ns)
+                email[d] = await email_security(d, ns, client)
                 g = email[d].get("grade")
                 if g:
                     log(f"[+] email {d}: {g} ({len(email[d].get('issues', []))} issue(s))")
@@ -404,6 +517,33 @@ async def run(domains, args, keys) -> list:
                     else:
                         log(f"[!] mail infra {d}: no managed provider recognized — possible self-hosted MTA")
 
+        # ---- DNS zone transfer (AXFR) ----
+        # One query per authoritative nameserver, reusing the NS list the DNS
+        # snapshot above already collected. A server that answers hands over
+        # every internal name in the zone at once, so this is critical when it
+        # lands — and cheap when it doesn't.
+        axfr = {}
+        if not args.passive_only:
+            for d in domains:
+                ns_names = (dns_records.get(d) or {}).get("ns") or []
+                result = await zone_transfer(d, ns_names, ns)
+                axfr[d] = result
+                if result["transferred"]:
+                    total = sum(result["transferred"].values())
+                    log(f"[!] AXFR {d}: zone transfer ALLOWED by "
+                        f"{', '.join(result['transferred'])} — {total} record(s) "
+                        f"disclosed (critical)")
+                elif result["refused"] and not result["errors"]:
+                    log(f"[+] AXFR {d}: refused by all {len(result['refused'])} "
+                        f"nameserver(s) — correctly restricted")
+                elif result["refused"] or result["errors"]:
+                    # Never call an unreachable nameserver a refusal: that would
+                    # report a blocked network path as a clean result.
+                    parts = ([f"{len(result['refused'])} refused"] if result["refused"] else []) \
+                        + ([f"{len(result['errors'])} unreachable"] if result["errors"] else [])
+                    log(f"[!] AXFR {d}: {', '.join(parts)} — inconclusive for the "
+                        f"unreachable one(s), not evidence that transfers are refused")
+
         gh_limiter = RateLimiter(per_second=0.2)              # code search ~10/min; shared below
         github_findings = []
         if keys.get("github"):
@@ -432,19 +572,14 @@ async def run(domains, args, keys) -> list:
         # sources, none of which are passive-only-gated either).
         dorks = []
         if args.dork:
-            provider = select_dork_provider(keys, getattr(args, "dork_provider", "auto"))
-            if provider:
+            providers = configured_dork_providers(keys, getattr(args, "dork_provider", "auto"))
+            if providers:
                 dork_limiter = RateLimiter(per_second=1.0)
-                for d in domains:
-                    hits, terminal = await dork_domain(client, d, provider, keys, dork_limiter)
-                    dorks += hits
-                    if terminal:
-                        log(f"[!] {provider} dork: stopping after {d} — the error would repeat "
-                            f"identically for every remaining domain")
-                        break
+                dorks, used = await _run_dorks(client, domains, providers, keys, dork_limiter)
                 if dorks:
                     n_cat = len({d["category"] for d in dorks})
-                    log(f"[+] {provider} dork: {len(dorks)} hit(s) across {n_cat} categor{'y' if n_cat == 1 else 'ies'}")
+                    log(f"[+] {'/'.join(used)} dork: {len(dorks)} hit(s) across "
+                        f"{n_cat} categor{'y' if n_cat == 1 else 'ies'}")
             elif getattr(args, "dork_provider", "auto") not in (None, "auto"):
                 log(f"[!] --dork set but --dork-provider {args.dork_provider} not configured — skipping")
             else:
@@ -565,6 +700,7 @@ async def run(domains, args, keys) -> list:
     # not-passive-only and uses probe_client (self-signed certs common on
     # auth endpoints). Feeds both entry_points and the dossier.
     auth_surfaces = []
+    security_txts = []
     if not args.passive_only:
         live = [h for h in host_list if h.http_status and not h.wildcard]
         results = await asyncio.gather(*[auth_surface(probe_client, h.subdomain) for h in live])
@@ -573,9 +709,21 @@ async def run(domains, args, keys) -> list:
             idps = ", ".join(sorted({a.get("idp") or "unknown" for a in auth_surfaces}))
             log(f"[+] auth-surface: {len(auth_surfaces)} host(s) expose OIDC/SSO discovery ({idps})")
 
+        # security.txt (RFC 9116) on the same live hosts — a file published
+        # deliberately, so this is discovery. It names the disclosure channel a
+        # report should go to, and its Policy/Canonical URLs often point at
+        # hosts nothing else surfaced.
+        st = await asyncio.gather(*[security_txt(probe_client, h.subdomain) for h in live])
+        security_txts = [s for s in st if s]
+        if security_txts:
+            n_expired = sum(1 for s in security_txts if s.get("expired"))
+            log(f"[+] security.txt: {len(security_txts)} host(s) publish one"
+                + (f", {n_expired} expired" if n_expired else ""))
+
     # ---- Entry-point summary (red-team signal: what to chase first) ----
     entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings,
-                                          nuclei, dorks, auth_surfaces, whois=whois)
+                                          nuclei, dorks, auth_surfaces, whois=whois,
+                                          axfr=axfr)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
@@ -594,6 +742,7 @@ async def run(domains, args, keys) -> list:
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
-            "vt": vt_intel, "auth_surface": auth_surfaces}
+            "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs,
+            "axfr": axfr, "security_txt": security_txts}
 
 

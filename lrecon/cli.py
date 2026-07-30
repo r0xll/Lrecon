@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
 from .core import run
-from .dorking import select_dork_provider
+from .dorking import configured_dork_providers, select_dork_provider
 from .report import (write_markdown, write_html, write_live_hosts, write_csv, write_users_csv,
                      write_origin_ips, screenshot_hosts)
 from .backends import available_backends
@@ -242,9 +242,13 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     log(f"[i] people-enum: {', '.join(people_sources) if people_sources else 'off (no hunter/rocketreach/github key)'}"
         f" | email verify: {'on (active)' if args.verify_emails else 'off'}")
     if args.dork:
-        provider = select_dork_provider(keys, args.dork_provider)
-        if provider:
-            log(f"[i] dork: on (backend: {provider})")
+        chain = configured_dork_providers(keys, args.dork_provider)
+        if chain:
+            # Name the whole chain so the operator knows a dead first backend
+            # won't sink the sweep — failover only triggers on a terminal error.
+            log(f"[i] dork: on (backend: {chain[0]}"
+                + (f", fallback: {' -> '.join(chain[1:])}" if len(chain) > 1 else "")
+                + ")")
         elif args.dork_provider != "auto":
             log(f"[i] dork: requested backend '{args.dork_provider}' not configured — will skip")
         else:
@@ -272,10 +276,13 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     users_path = f"{out_base}.users.csv"
     origin_path = f"{out_base}.origin_ips.txt"
 
-    full = {k: res[k] for k in ("cf", "email", "github", "buckets", "breach",
-                                "asn", "favicon_pivots", "nuclei", "diff", "per_source",
-                                "entry_points", "whois", "dorks", "dns", "mail_infra", "vt",
-                                "auth_surface")}
+    # Every result key the JSON export carries. Anything added to run()'s return
+    # value has to be listed here too, or it renders in the Markdown/HTML report
+    # but silently vanishes from the machine-readable output.
+    full = {k: res.get(k) for k in ("cf", "email", "github", "buckets", "breach",
+                                    "asn", "favicon_pivots", "nuclei", "diff", "per_source",
+                                    "entry_points", "whois", "dorks", "dns", "mail_infra", "vt",
+                                    "auth_surface", "certs", "axfr", "security_txt")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))

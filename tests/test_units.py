@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 import lrecon
-from lrecon import (enrich, intel, state, backends, sources, report, people, cli, core,
-                    dorking, vt, llm, news, dossier)
+from lrecon import (active, enrich, intel, state, backends, sources, report, people, cli,
+                    core, dorking, vt, llm, news, dossier)
 from lrecon.common import Host, Person, CF_FALLBACK, WEB_PORTS, non_web_ports
 
 
@@ -1351,12 +1351,531 @@ async def test_email_security_flags_pct_sp_and_missing_rua(monkeypatch):
     assert "rua=" in joined
 
 
+# --------------------------------------------------------------------------- #
+# SMTP transport security (MTA-STS / TLS-RPT)
+# --------------------------------------------------------------------------- #
+def _email_zone(spf="v=spf1 -all", extra=None):
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord(spf)],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord("v=DMARC1; p=reject; rua=mailto:d@x.test")],
+        ("default._domainkey.x.test", "TXT"): [_FakeTXTRecord("v=DKIM1; p=k")],
+    }
+    answers.update(extra or {})
+    return answers
+
+
+class _PolicyClient:
+    """Serves (or refuses) the MTA-STS policy file."""
+    def __init__(self, body=None, status=200):
+        self.body, self.status, self.calls = body, status, []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self.body is None:
+            raise Exception("unreachable")
+        return _FakeRespText(self.status, self.body)
+
+
+async def test_email_security_reads_mta_sts_and_tls_rpt(monkeypatch):
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=20260101")],
+        ("_smtp._tls.x.test", "TXT"): [_FakeTXTRecord("v=TLSRPTv1; rua=mailto:t@x.test")],
+    })
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    client = _PolicyClient("version: STSv1\nmode: enforce\nmx: mail.x.test\nmax_age: 604800\n")
+    out = await intel.email_security("x.test", None, client)
+    assert out["mta_sts"].startswith("v=STSv1")
+    assert out["tls_rpt"].startswith("v=TLSRPTv1")
+    assert out["mta_sts_mode"] == "enforce"
+    assert out["mta_sts_policy"]["mx"] == ["mail.x.test"]
+    assert client.calls == ["https://mta-sts.x.test/.well-known/mta-sts.txt"]
+    assert out["grade"] == "PASS" and out["issues"] == []
+
+
+async def test_email_security_absent_mta_sts_is_reported_not_raised_as_an_issue(monkeypatch):
+    """Most domains publish no MTA-STS. Treating that as an issue would push
+    nearly every domain to WARN and make the grade meaningless, so absence is a
+    field, not a finding."""
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(_email_zone()))
+    out = await intel.email_security("x.test", None, _PolicyClient())
+    assert out["mta_sts"] is None and out["tls_rpt"] is None
+    assert not any("MTA-STS" in i for i in out["issues"])
+    assert out["grade"] == "PASS"
+
+
+async def test_email_security_flags_published_but_broken_mta_sts(monkeypatch):
+    """A record with no reachable policy file *is* a misconfiguration: senders
+    fall back to strippable opportunistic TLS."""
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None, _PolicyClient(body=None))
+    assert out["mta_sts_policy"] is None
+    assert any("policy file is unreachable" in i for i in out["issues"])
+    assert out["grade"] == "WARN"
+
+
+async def test_email_security_flags_a_served_but_invalid_mta_sts_policy(monkeypatch):
+    """A 200 that isn't a policy file — a catch-all page, or an empty body — used
+    to be recorded as a published policy with no issue raised, because the parser
+    seeded a truthy dict. The record is not enforceable and must say so, and this
+    is distinct from unreachable: the endpoint answers, so the content is what
+    needs fixing."""
+    for body in ("<html><body>Not found</body></html>", "", "garbage: value\n"):
+        answers = _email_zone(extra={
+            ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+        monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+        out = await intel.email_security("x.test", None, _PolicyClient(body))
+        assert out["mta_sts_mode"] is None, body
+        assert any("invalid (no usable mode=)" in i for i in out["issues"]), body
+        assert not any("unreachable" in i for i in out["issues"]), body
+        assert out["grade"] == "WARN", body
+
+
+async def test_email_security_ignores_an_unrecognised_mta_sts_mode(monkeypatch):
+    """A mode outside RFC 8461's three must not reach the report looking real."""
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security(
+        "x.test", None, _PolicyClient("version: STSv1\nmode: banana\n"))
+    assert out["mta_sts_mode"] is None
+    assert any("invalid (no usable mode=)" in i for i in out["issues"])
+
+
+def test_mta_sts_report_wording_distinguishes_invalid_from_unreachable():
+    unreachable = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": None,
+                                        "mta_sts_mode": None})
+    assert "unreachable" in unreachable
+    invalid = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": {"mx": []},
+                                    "mta_sts_mode": None})
+    assert "invalid" in invalid and "not enforceable" in invalid
+    assert "unreachable" not in invalid
+    # And it must never read as though a policy is in effect.
+    assert "unspecified" not in invalid
+
+
+async def test_email_security_flags_non_enforcing_mta_sts_modes(monkeypatch):
+    for mode, phrase in (("testing", "mode=testing"), ("none", "mode=none")):
+        answers = _email_zone(extra={
+            ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+        monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+        out = await intel.email_security(
+            "x.test", None, _PolicyClient(f"version: STSv1\nmode: {mode}\n"))
+        assert out["mta_sts_mode"] == mode
+        assert any(phrase in i for i in out["issues"]), mode
+
+
+async def test_email_security_without_a_client_skips_the_policy_fetch(monkeypatch):
+    """The client is optional so callers that only want DNS keep working."""
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    assert out["mta_sts"].startswith("v=STSv1")
+    assert out["mta_sts_policy"] is None and out["mta_sts_mode"] is None
+    assert not any("MTA-STS" in i for i in out["issues"])   # nothing was checked
+
+
+def test_mta_sts_report_wording_covers_every_state():
+    assert "not published" in report._mta_sts_text({})
+    assert "unreachable" in report._mta_sts_text({"mta_sts": "v=STSv1"})
+    enforce = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": {"mode": "enforce"},
+                                    "mta_sts_mode": "enforce"})
+    assert "enforce" in enforce and "must use validated TLS" in enforce
+    testing = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": {"mode": "testing"},
+                                    "mta_sts_mode": "testing"})
+    assert "not enforcing" in testing
+
+
+def test_md_emph_to_html_renders_shared_wording_safely():
+    """Both writers share one MTA-STS string, so the converter must handle its
+    markup and escape everything else."""
+    assert report._md_emph_to_html("a **bold** and `code`") == \
+        "a <strong>bold</strong> and <code>code</code>"
+    assert report._md_emph_to_html("<script>x</script>") == \
+        "&lt;script&gt;x&lt;/script&gt;"
+    assert report._md_emph_to_html("**<b>**") == "<strong>&lt;b&gt;</strong>"
+
+
+# --------------------------------------------------------------------------- #
+# DNS zone transfer (AXFR)
+# --------------------------------------------------------------------------- #
+class _NSResolver:
+    """Resolves nameserver hostnames to IPs; unknown names fail."""
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    async def resolve(self, name, rtype, **kwargs):
+        if rtype == "A" and name in self.mapping:
+            return [self.mapping[name]]
+        raise Exception(f"no {rtype} for {name}")
+
+
+class _FakeZone:
+    """Stands in for dns.zone.Zone — nodes are relative labels."""
+    def __init__(self, origin):
+        self.origin, self.nodes = origin, {}
+
+
+def _patch_xfr(monkeypatch, nodes_by_ip=None, raises=None):
+    """Patch dnspython's AXFR entry point. `nodes_by_ip` populates the zone for
+    a server that allows the transfer; `raises` simulates refusal/timeout."""
+    monkeypatch.setattr(intel, "_HAVE_XFR", True)
+    monkeypatch.setattr(intel.dns.zone, "Zone", _FakeZone)
+    monkeypatch.setattr(intel.dns.message, "make_query", lambda *a, **k: object())
+
+    async def fake_xfr(where, zone, query, **kwargs):
+        if raises and where in raises:
+            raise raises[where]
+        for label in (nodes_by_ip or {}).get(where, []):
+            zone.nodes[_Label(label)] = object()
+    monkeypatch.setattr(intel.dns.asyncquery, "inbound_xfr", fake_xfr)
+
+
+class _Label:
+    def __init__(self, text):
+        self._t = text
+
+    def to_text(self):
+        return self._t
+
+    def __hash__(self):
+        return hash(self._t)
+
+    def __eq__(self, other):
+        return isinstance(other, _Label) and other._t == self._t
+
+
+async def test_zone_transfer_reports_a_successful_axfr(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver",
+                        lambda ns: _NSResolver({"ns1.x.test": "10.0.0.1"}))
+    _patch_xfr(monkeypatch, nodes_by_ip={"10.0.0.1": ["@", "www", "internal-vpn"]})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["transferred"] == {"ns1.x.test": 3}
+    assert out["records"] == ["internal-vpn.x.test", "www.x.test", "x.test"]
+    assert out["errors"] == {} and out["truncated"] is False
+
+
+class TransferError(Exception):
+    """Stands in for dns.query.TransferError — the server answered and declined."""
+
+
+class Timeout(Exception):
+    """Stands in for dns.exception.Timeout — no answer at all."""
+
+
+async def test_zone_transfer_separates_refusal_from_unreachable(monkeypatch):
+    """A server that answers and declines is correctly configured; one we never
+    reached tells us nothing. Folding the second into the first would report a
+    blocked network path as "transfers refused" — a false negative on a critical
+    check, and exactly what a live run against Cloudflare-hosted NS produces."""
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _NSResolver(
+        {"ns1.x.test": "10.0.0.1", "ns2.x.test": "10.0.0.2"}))
+    _patch_xfr(monkeypatch, raises={"10.0.0.1": TransferError("REFUSED"),
+                                    "10.0.0.2": Timeout("blocked")})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test", "ns2.x.test"], None)
+    assert out["transferred"] == {}
+    assert set(out["attempted"]) == {"ns1.x.test", "ns2.x.test"}
+    assert out["refused"] == {"ns1.x.test": "TransferError"}
+    assert out["errors"] == {"ns2.x.test": "Timeout"}
+
+
+async def test_zone_transfer_unknown_failure_is_inconclusive_not_a_refusal(monkeypatch):
+    """Default to "we don't know" for an unrecognised exception: claiming a
+    refusal we can't prove is the dangerous direction."""
+    monkeypatch.setattr(intel, "get_resolver",
+                        lambda ns: _NSResolver({"ns1.x.test": "10.0.0.1"}))
+    _patch_xfr(monkeypatch, raises={"10.0.0.1": Exception("something odd")})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["refused"] == {}
+    assert out["errors"] == {"ns1.x.test": "Exception"}
+
+
+async def test_zone_transfer_unresolvable_nameserver_is_an_error_not_a_pass(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _NSResolver({}))
+    _patch_xfr(monkeypatch)
+    out = await intel.zone_transfer("x.test", ["ghost.x.test"], None)
+    assert out["attempted"] == []
+    assert out["errors"] == {"ghost.x.test": "nameserver did not resolve"}
+
+
+async def test_zone_transfer_caps_stored_records_but_keeps_the_exact_count(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver",
+                        lambda ns: _NSResolver({"ns1.x.test": "10.0.0.1"}))
+    labels = [f"h{i:04d}" for i in range(intel.AXFR_RECORD_CAP + 25)]
+    _patch_xfr(monkeypatch, nodes_by_ip={"10.0.0.1": labels})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["transferred"]["ns1.x.test"] == len(labels)      # exact count kept
+    assert len(out["records"]) == intel.AXFR_RECORD_CAP         # storage capped
+    assert out["truncated"] is True
+
+
+async def test_zone_transfer_no_nameservers_or_no_dnspython_is_empty(monkeypatch):
+    assert (await intel.zone_transfer("x.test", [], None))["attempted"] == []
+    monkeypatch.setattr(intel, "_HAVE_XFR", False)
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["transferred"] == {} and out["attempted"] == []
+
+
+def test_successful_axfr_is_a_critical_entry_point():
+    cf = {"detected": False, "candidates": {}}
+    axfr = {"x.com": {"transferred": {"ns1.x.com": 42}, "attempted": ["ns1.x.com"],
+                      "records": [], "errors": {}, "truncated": False}}
+    eps = intel.summarize_entry_points([], cf, [], {}, [], [], axfr=axfr)
+    assert [e["type"] for e in eps] == ["dns-zone-transfer"]
+    assert eps[0]["severity"] == "critical"
+    assert "42 record(s)" in eps[0]["summary"]
+    # A refusal must not produce an entry point.
+    refused = {"x.com": {"transferred": {}, "attempted": ["ns1.x.com"], "errors": {}}}
+    assert intel.summarize_entry_points([], cf, [], {}, [], [], axfr=refused) == []
+
+
+# --------------------------------------------------------------------------- #
+# security.txt (RFC 9116)
+# --------------------------------------------------------------------------- #
+_SECURITY_TXT = """# our policy
+Contact: mailto:security@x.com
+Contact: https://x.com/report
+Expires: 2030-01-01T00:00:00Z
+Policy: https://internal-portal.x.com/vdp
+Acknowledgments: https://x.com/thanks
+Preferred-Languages: en
+"""
+
+
+class _PathClient:
+    """Serves specific paths; everything else 404s. Records what was requested."""
+    def __init__(self, by_path):
+        self.by_path, self.calls = by_path, []
+
+    async def get(self, url, **kwargs):
+        from urllib.parse import urlparse
+        self.calls.append(url)
+        # Exact-path match: "/.well-known/security.txt" also *ends with*
+        # "/security.txt", which would hide the fallback ordering.
+        body = self.by_path.get(urlparse(url).path)
+        return _FakeRespText(200, body) if body is not None else _FakeRespText(404, "")
+
+
+async def test_security_txt_parsed_from_well_known_path():
+    client = _PathClient({"/.well-known/security.txt": _SECURITY_TXT})
+    out = await intel.security_txt(client, "x.com")
+    assert out["host"] == "x.com"
+    assert out["contact"] == ["mailto:security@x.com", "https://x.com/report"]
+    # The Policy URL points at a host nothing else surfaced — the reason to parse it.
+    assert out["policy"] == ["https://internal-portal.x.com/vdp"]
+    assert out["expired"] is False
+    assert client.calls == ["https://x.com/.well-known/security.txt"]
+
+
+async def test_security_txt_falls_back_to_the_legacy_root_path():
+    client = _PathClient({"/security.txt": _SECURITY_TXT})
+    out = await intel.security_txt(client, "x.com")
+    assert out["url"].endswith("/security.txt")
+    assert len(client.calls) == 2                 # well-known tried first
+
+
+async def test_security_txt_flags_an_expired_policy():
+    body = _SECURITY_TXT.replace("2030-01-01", "2020-01-01")
+    out = await intel.security_txt(_PathClient({"/.well-known/security.txt": body}), "x.com")
+    assert out["expired"] is True
+
+
+async def test_security_txt_unparseable_expires_is_neither_state():
+    body = _SECURITY_TXT.replace("2030-01-01T00:00:00Z", "whenever")
+    out = await intel.security_txt(_PathClient({"/.well-known/security.txt": body}), "x.com")
+    assert out["expired"] is None                 # not False — we don't know
+
+
+async def test_security_txt_ignores_a_catch_all_html_page():
+    """A wildcard route returning the app's index page for every path must not
+    be reported as a published security.txt."""
+    html_page = "<html><body>Page not found</body></html>"
+    assert await intel.security_txt(
+        _PathClient({"/.well-known/security.txt": html_page}), "x.com") == {}
+    # Nor a 200 that simply has no Contact field.
+    assert await intel.security_txt(
+        _PathClient({"/.well-known/security.txt": "Expires: 2030-01-01T00:00:00Z"}),
+        "x.com") == {}
+
+
+async def test_security_txt_absent_returns_empty():
+    assert await intel.security_txt(_PathClient({}), "x.com") == {}
+
+
 class NXDOMAIN(Exception):
-    """Stands in for dns.resolver.NXDOMAIN — matched by class name."""
+    """Stands in for dns.resolver.NXDOMAIN — matched by class name, so the class
+    must be named exactly this (a subclass under another name would not match).
+
+    Pass `zone` to include an authority section, the way a real resolver returns
+    the SOA of the closest enclosing zone alongside an NXDOMAIN.
+    """
+    def __init__(self, *args, zone=None):
+        super().__init__(*args)
+        self.zone = zone
+
+    def responses(self):
+        if not self.zone:
+            return {}
+        import dns.rdatatype
+        return {"q": _NXResponse([_SOARRset(f"{self.zone}.", dns.rdatatype.SOA)])}
 
 
 class NoAnswer(Exception):
     """Stands in for dns.resolver.NoAnswer — matched by class name."""
+
+
+class _CnameTargetResolver:
+    """Resolver for cname_target_status: names in `live` answer, names in
+    `missing` raise NXDOMAIN, names in `noanswer` exist without an address, and
+    anything else fails with a transport error (inconclusive)."""
+    def __init__(self, live=(), missing=(), noanswer=()):
+        self.live, self.missing, self.noanswer = set(live), set(missing), set(noanswer)
+
+    async def resolve(self, name, rtype, **kwargs):
+        if name in self.missing:
+            raise NXDOMAIN(name)
+        if name in self.noanswer:
+            raise NoAnswer(name)
+        if name in self.live:
+            return ["1.2.3.4"] if rtype == "A" else ["::1"]
+        raise Exception(f"timeout for {name} {rtype}")
+
+
+class _SOARRset:
+    def __init__(self, name, rdtype):
+        self.name, self.rdtype = name, rdtype
+
+
+class _NXResponse:
+    def __init__(self, authority):
+        self.authority = authority
+
+
+async def test_cname_target_status_distinguishes_missing_live_and_inconclusive(monkeypatch):
+    """NXDOMAIN on the target is the takeover signal; a resolvable target is not
+    a finding; and a timeout must stay inconclusive rather than being reported."""
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _CnameTargetResolver(
+        live=["ok.example.net"], missing=["gone.example.net"],
+        noanswer=["exists.example.net"]))
+    assert await sources.cname_target_status("gone.example.net", None) == ("nxdomain", None)
+    assert await sources.cname_target_status("ok.example.net", None) == ("resolves", None)
+    # The name exists, just carries no address — not a dangling target.
+    assert await sources.cname_target_status("exists.example.net", None) == ("resolves", None)
+    assert await sources.cname_target_status("slow.example.net", None) == ("unknown", None)
+    assert await sources.cname_target_status("", None) == ("unknown", None)
+
+
+async def test_cname_target_status_reports_the_closest_existing_zone(monkeypatch):
+    """The SOA in an NXDOMAIN answer is what separates "the domain itself doesn't
+    exist" from "a label is missing inside someone else's live zone"."""
+    class _R:
+        async def resolve(self, name, rtype, **kwargs):
+            raise NXDOMAIN(name, zone="com" if "no-such-domain" in name
+                           else "partner-company.com")
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    assert await sources.cname_target_status("a.no-such-domain.com", None) == \
+        ("nxdomain", "com")
+    assert await sources.cname_target_status("typo.partner-company.com", None) == \
+        ("nxdomain", "partner-company.com")
+
+
+async def test_cname_target_status_tolerates_nxdomain_without_authority(monkeypatch):
+    """A resolver that surfaces no authority section must degrade to no zone, not
+    raise — the status is still usable."""
+    class _R:
+        async def resolve(self, name, rtype, **kwargs):
+            raise NXDOMAIN(name)          # plain, no .responses()
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    assert await sources.cname_target_status("gone.example.net", None) == ("nxdomain", None)
+
+
+def test_mark_dangling_cname_flags_only_nxdomain():
+    """"resolves" and "unknown" must never become client-facing findings."""
+    for status in ("resolves", "unknown"):
+        h = Host("dev.x.com", cname="gone.example.net")
+        active.mark_dangling_cname(h, status)
+        assert h.takeover is None and h.takeover_confidence is None
+    h = Host("dev.x.com", cname="gone.example.net")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover is not None and "NXDOMAIN" in h.takeover
+
+
+def test_mark_dangling_cname_confirms_only_a_claimable_provider():
+    """NXDOMAIN proves the target is broken, not that an attacker could create
+    it. Only a known takeover-prone provider — where re-registration is the
+    service on offer — justifies "confirmed" and its critical severity."""
+    h = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "confirmed"
+    assert "s3.amazonaws.com" in h.takeover and "claimable" in h.takeover
+
+
+def test_mark_dangling_cname_does_not_claim_an_unknown_target_is_takeable():
+    """Regression for the critical-severity false positive: a broken CNAME to a
+    typo under a partner's domain is NXDOMAIN, but nobody outside that partner
+    can register the name."""
+    h = Host("dev.x.com", cname="typo.partner-company.com")
+    assert not any(sig in h.cname for sig in intel.TAKEOVER_SIGS)
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="partner-company.com")
+    assert h.takeover_confidence == "possible"
+    # The evidence an operator needs to judge, and no assertion of claimability.
+    assert "closest existing zone is partner-company.com" in h.takeover
+    assert "claimability is unverified" in h.takeover
+
+
+def test_mark_dangling_cname_still_reports_an_unsignatured_provider():
+    """Downgrading confidence must not mean dropping the lead: a service nobody
+    has written a signature for is still surfaced, just not as confirmed."""
+    unknown = "abandoned.some-saas-nobody-signatured.io"
+    assert not any(sig in unknown for sig in intel.TAKEOVER_SIGS)
+    h = Host("dev.x.com", cname=unknown)
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="com")
+    assert h.takeover_confidence == "possible"
+    assert unknown in h.takeover
+
+
+def test_unclaimable_nxdomain_is_high_not_critical():
+    """The severity consequence of the downgrade, end to end."""
+    cf = {"detected": False, "candidates": {}}
+    h = Host("dev.x.com", cname="typo.partner-company.com")
+    active.mark_dangling_cname(h, "nxdomain", closest_zone="partner-company.com")
+    assert intel.summarize_entry_points([h], cf, [], {}, [], [])[0]["severity"] == "high"
+    p = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com")
+    active.mark_dangling_cname(p, "nxdomain")
+    assert intel.summarize_entry_points([p], cf, [], {}, [], [])[0]["severity"] == "critical"
+
+
+def test_mark_dangling_cname_does_not_overwrite_a_signature_finding():
+    """A body-signature hit already carries corroborating evidence."""
+    h = Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com",
+             takeover="Dangling CNAME -> ... unclaimed-service signature matched",
+             takeover_confidence="likely")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "likely"
+
+
+def test_check_takeover_sets_confidence_for_both_signature_paths():
+    body_hit = Host("a.x.com", cname="a.x.com.s3.amazonaws.com")
+    active._check_takeover(body_hit, "<html>nosuchbucket</html>")
+    assert body_hit.takeover_confidence == "likely"
+    no_body = Host("b.x.com", cname="b.x.com.s3.amazonaws.com")
+    active._check_takeover(no_body, "<html>a normal page</html>")
+    assert no_body.takeover_confidence == "possible"
+
+
+def test_entry_point_takeover_severity_comes_from_confidence_not_text():
+    """Regression for the old phrase-match on the summary string."""
+    cf = {"detected": False, "candidates": {}}
+    sev = {}
+    for conf in ("confirmed", "likely", "possible"):
+        h = Host("a.x.com", cname="c", takeover="wording that says nothing",
+                 takeover_confidence=conf)
+        eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+        sev[conf] = eps[0]["severity"]
+        assert eps[0]["confidence"] == conf
+    assert sev == {"confirmed": "critical", "likely": "critical", "possible": "high"}
 
 
 class _AbsentRecordResolver:
@@ -1476,6 +1995,209 @@ async def test_mail_infra_lookup_keyless_still_enriches_asn_org(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# Live TLS certificate inspection
+# --------------------------------------------------------------------------- #
+from lrecon import tlsinfo
+
+# Gate only the tests that need a real certificate, and gate them on the flag
+# tlsinfo actually uses. A module-level importorskip would skip this whole file
+# when the optional [tls] extra is missing — silently taking every other test
+# with it — and `import cryptography` succeeding doesn't mean x509 loads: a
+# half-installed native extension raises from `from cryptography import x509`.
+requires_crypto = pytest.mark.skipif(
+    not tlsinfo.HAVE_CRYPTO, reason="needs the optional [tls] extra")
+
+_CERT_KEY = None
+
+
+def _cert_key():
+    """One RSA key for every generated cert — keygen is slow, and built lazily so
+    importing this module never requires cryptography."""
+    global _CERT_KEY
+    if _CERT_KEY is None:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        _CERT_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return _CERT_KEY
+
+
+def _make_cert(cn="www.x.com", sans=("www.x.com", "api.x.com"), days=30,
+               issuer_cn=None, not_before_days=1):
+    """A DER certificate to parse — no network, no fixtures on disk."""
+    import datetime
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+
+    key = _cert_key()
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]) if cn \
+        else x509.Name([])
+    issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)]) \
+        if issuer_cn else subject
+    now = datetime.datetime.now(datetime.timezone.utc)
+    builder = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+               .public_key(key.public_key()).serial_number(x509.random_serial_number())
+               .not_valid_before(now - datetime.timedelta(days=not_before_days))
+               .not_valid_after(now + datetime.timedelta(days=days)))
+    if sans:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(s) for s in sans]), False)
+    cert = builder.sign(key, hashes.SHA256())
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+@requires_crypto
+def test_parse_cert_extracts_names_issuer_and_validity():
+    c = tlsinfo.parse_cert(_make_cert(cn="www.x.com",
+                                      sans=("www.x.com", "api.x.com", "*.dev.x.com"),
+                                      issuer_cn="Some CA"))
+    assert c["cn"] == "www.x.com"
+    assert c["sans"] == ["*.dev.x.com", "api.x.com", "www.x.com"]   # sorted, lowercased
+    assert c["issuer"] == "some ca"
+    assert c["expired"] is False and c["not_yet_valid"] is False
+    assert c["self_signed"] is False
+    assert 25 <= c["days_to_expiry"] <= 30
+
+
+@requires_crypto
+def test_parse_cert_flags_self_signed_and_expired():
+    self_signed = tlsinfo.parse_cert(_make_cert(issuer_cn=None))
+    assert self_signed["self_signed"] is True
+    # not_valid_after in the past: negative `days` puts expiry before now.
+    expired = tlsinfo.parse_cert(_make_cert(days=-5, not_before_days=30))
+    assert expired["expired"] is True
+    assert expired["days_to_expiry"] < 0
+
+
+@requires_crypto
+def test_parse_cert_tolerates_no_san_and_no_cn():
+    no_san = tlsinfo.parse_cert(_make_cert(sans=()))
+    assert no_san["sans"] == [] and no_san["cn"] == "www.x.com"
+    no_cn = tlsinfo.parse_cert(_make_cert(cn=None, sans=("only.x.com",)))
+    assert no_cn["cn"] is None and no_cn["sans"] == ["only.x.com"]
+
+
+def test_parse_cert_malformed_returns_none_not_raises():
+    assert tlsinfo.parse_cert(b"not a certificate") is None
+    assert tlsinfo.parse_cert(b"") is None
+
+
+def test_cert_names_folds_in_the_cn():
+    """Older/internal CAs still put the only name in the CN."""
+    assert tlsinfo.cert_names({"cn": "only.x.com", "sans": []}) == ["only.x.com"]
+    both = tlsinfo.cert_names({"cn": "a.x.com", "sans": ["b.x.com"]})
+    assert set(both) == {"a.x.com", "b.x.com"}
+    assert tlsinfo.cert_names(None) == []
+
+
+def test_cert_matches_scope_accepts_apex_subdomain_and_wildcard():
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["x.com"]}, ["x.com"]) == "x.com"
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["a.x.com"]}, ["x.com"]) == "a.x.com"
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["*.x.com"]}, ["x.com"]) == "*.x.com"
+    # A lookalike domain must not count as in scope.
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["notx.com"]}, ["x.com"]) is None
+    assert tlsinfo.cert_matches_scope({"cn": None, "sans": ["x.com.evil.net"]},
+                                      ["x.com"]) is None
+
+
+def test_in_scope_cert_names_drops_wildcards_and_other_tenants():
+    """A shared/CDN cert carries other tenants' domains — those are not the
+    client's assets. Wildcards aren't resolvable hosts, so they're dropped too."""
+    cert = {"cn": "www.x.com",
+            "sans": ["www.x.com", "api.x.com", "*.dev.x.com", "other-tenant.net"]}
+    assert tlsinfo.in_scope_cert_names(cert, ["x.com"]) == ["api.x.com", "www.x.com"]
+
+
+async def test_fetch_cert_returns_none_when_unreachable():
+    """An unreachable or non-TLS peer must not raise into the scan."""
+    assert await tlsinfo.fetch_cert("127.0.0.1", port=1, timeout=0.5) is None
+
+
+@requires_crypto
+async def test_fetch_cert_skips_cleanly_without_cryptography(monkeypatch):
+    monkeypatch.setattr(tlsinfo, "HAVE_CRYPTO", False)
+    assert await tlsinfo.fetch_cert("example.com") is None
+    assert tlsinfo.parse_cert(_make_cert()) is None
+
+
+def test_tls_sni_omitted_for_bare_ip():
+    """SNI carries a hostname; sending an IP literal is invalid. Origin discovery
+    depends on seeing the default cert an IP serves."""
+    assert tlsinfo._is_ip("192.0.2.1") is True
+    assert tlsinfo._is_ip("2001:db8::1") is True
+    assert tlsinfo._is_ip("example.com") is False
+
+
+async def test_cloudflare_origin_confirmed_by_cert_without_http_probe(monkeypatch):
+    """A cert naming the target is stronger evidence than the Server header, and
+    settles it without sending a request past the handshake."""
+    monkeypatch.setattr(intel, "fetch_cert", _fake_fetch_cert(
+        {"9.9.9.9": {"cn": "www.x.com", "sans": ["www.x.com"], "issuer": "Some CA"}}))
+    probe = _RecordingProbeClient()
+    hosts = {"a.x.com": Host("a.x.com", ips=["9.9.9.9"]),
+             "cf.x.com": Host("cf.x.com", ips=["104.16.0.1"])}
+    cf_nets = [ipaddress.ip_network("104.16.0.0/13")]
+    monkeypatch.setattr(intel, "enrich_ipinfo", _no_ipinfo)
+    # No apex SPF/MX candidates: keeps the test off the network, so the only
+    # candidate is the unproxied in-scope host.
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _AbsentRecordResolver())
+    out = await intel.cloudflare_origin_analysis(
+        None, probe, ["x.com"], hosts, {}, cf_nets, active=True, resolver_ns=None)
+    cand = out["candidates"]["9.9.9.9"]
+    assert cand["confirmed"] is True
+    assert "TLS cert" in cand["evidence"] and "www.x.com" in cand["evidence"]
+    assert cand["cert"]["cn"] == "www.x.com"
+    assert probe.calls == []                 # no HTTP request needed
+
+
+async def test_cloudflare_origin_falls_back_to_host_header_when_cert_unhelpful(monkeypatch):
+    """An out-of-scope or absent cert must not confirm, and must not stop the
+    existing header probe from doing its job."""
+    monkeypatch.setattr(intel, "fetch_cert", _fake_fetch_cert(
+        {"9.9.9.9": {"cn": "shared-host.example", "sans": [], "issuer": "CA"}}))
+    probe = _RecordingProbeClient(status=200, server="nginx")
+    hosts = {"a.x.com": Host("a.x.com", ips=["9.9.9.9"]),
+             "cf.x.com": Host("cf.x.com", ips=["104.16.0.1"])}
+    monkeypatch.setattr(intel, "enrich_ipinfo", _no_ipinfo)
+    # No apex SPF/MX candidates: keeps the test off the network, so the only
+    # candidate is the unproxied in-scope host.
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _AbsentRecordResolver())
+    out = await intel.cloudflare_origin_analysis(
+        None, probe, ["x.com"], hosts, {}, [ipaddress.ip_network("104.16.0.0/13")],
+        active=True, resolver_ns=None)
+    cand = out["candidates"]["9.9.9.9"]
+    assert cand["confirmed"] is True
+    assert cand["evidence"].startswith("Host: x.com")
+    assert probe.calls                        # the header probe still ran
+
+
+def _fake_fetch_cert(by_ip):
+    async def fake(host, port=443, sni=None, timeout=6.0):
+        return by_ip.get(host)
+    return fake
+
+
+async def _no_ipinfo(client, ip, token):
+    return {}
+
+
+class _RecordingProbeClient:
+    """Records every request so 'no HTTP touch' can be asserted."""
+    def __init__(self, status=None, server=""):
+        self.calls = []
+        self._status, self._server = status, server
+
+    class _Resp:
+        def __init__(self, status_code, headers):
+            self.status_code, self.headers = status_code, headers
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self._status is None:
+            raise Exception("connection refused")
+        return self._Resp(self._status, {"server": self._server})
+
+
+# --------------------------------------------------------------------------- #
 # Search-engine dorking (Google Custom Search API)
 # --------------------------------------------------------------------------- #
 def test_parse_cse_response_extracts_hits():
@@ -1544,26 +2266,114 @@ async def test_google_dork_network_exception_not_terminal():
     assert terminal is False
 
 
-async def test_google_dork_terminal_status_stops_remaining_domains_in_core_loop():
-    """
-    Mirrors core.py's `for d in domains: ... if terminal: break` wiring —
-    the second domain must never be queried once the first returns terminal.
-    """
-    queried_domains = []
+def _fake_dork_domain(monkeypatch, behavior, calls):
+    """Patch core.dork_domain with a per-(provider, domain) script.
 
-    async def fake_dork(client, domain, key, cx, limiter):
-        queried_domains.append(domain)
-        return [], True   # simulate a terminal 403 on the very first domain
+    `behavior(provider, domain)` returns (hits, terminal); `calls` records
+    (provider, domain) in order so failover and resume points are observable.
+    """
+    async def fake(client, domain, provider, keys, limiter):
+        calls.append((provider, domain))
+        return behavior(provider, domain)
+    monkeypatch.setattr(core, "dork_domain", fake)
 
-    domains = ["a.com", "b.com", "c.com"]
-    dorks = []
-    for d in domains:
-        hits, terminal = await fake_dork(None, d, "key", "cx", None)
-        dorks += hits
-        if terminal:
-            break
-    assert queried_domains == ["a.com"]
-    assert dorks == []
+
+def _hit(domain, n=1):
+    return [{"link": f"https://{domain}/{n}", "category": "admin-panel",
+             "severity": "medium"}]
+
+
+async def test_run_dorks_falls_back_to_next_backend_on_terminal_failure(monkeypatch):
+    """A dead first backend must not sink the sweep. Google CSE is closed to new
+    customers, so a stale CSE key beside a working Brave key is realistic — it
+    used to yield zero hits."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: (
+        ([], True) if p == "google" else (_hit(d), False)), calls)
+    hits, used = await core._run_dorks(None, ["a.com", "b.com"],
+                                       ["google", "brave"], {}, None)
+    assert used == ["brave"]
+    assert sorted(h["link"] for h in hits) == ["https://a.com/1", "https://b.com/1"]
+    assert ("brave", "a.com") in calls and ("brave", "b.com") in calls
+
+
+async def test_run_dorks_resumes_at_the_failing_domain_not_from_the_start(monkeypatch):
+    """Earlier domains were fully swept, but the failing one aborted partway
+    through its categories — so the fallback re-sweeps that one and continues,
+    without re-burning quota on the domains already done."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: (
+        ([], True) if (p == "google" and d == "b.com")
+        else (_hit(d), False)), calls)
+    hits, used = await core._run_dorks(None, ["a.com", "b.com", "c.com"],
+                                       ["google", "brave"], {}, None)
+    assert [d for p, d in calls if p == "google"] == ["a.com", "b.com"]
+    assert [d for p, d in calls if p == "brave"] == ["b.com", "c.com"]
+    assert used == ["google", "brave"]
+    assert len(hits) == 3                       # a from google, b+c from brave
+
+
+async def test_run_dorks_dedupes_hits_across_backends(monkeypatch):
+    """_run_templates only dedupes within one domain; two engines routinely
+    index the same URL, so the cross-backend dedupe has to live here."""
+    calls = []
+    shared = [{"link": "https://a.com/same", "category": "git-exposure",
+               "severity": "high"}]
+
+    def behavior(provider, domain):
+        if provider == "google":
+            return (shared, False) if domain == "a.com" else ([], True)
+        return shared + _hit("b.com"), False
+
+    _fake_dork_domain(monkeypatch, behavior, calls)
+    hits, _ = await core._run_dorks(None, ["a.com", "b.com"],
+                                    ["google", "brave"], {}, None)
+    assert [h["link"] for h in hits] == ["https://a.com/same", "https://b.com/1"]
+
+
+async def test_run_dorks_non_terminal_result_does_not_switch_backends(monkeypatch):
+    """Only a terminal failure justifies failover — an empty-but-healthy sweep
+    must not burn a second backend's quota."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: ([], False), calls)
+    hits, used = await core._run_dorks(None, ["a.com"], ["google", "brave"], {}, None)
+    assert hits == [] and used == []
+    assert [p for p, _ in calls] == ["google"]          # brave never touched
+
+
+async def test_run_dorks_gives_up_after_every_backend_fails_terminally(monkeypatch):
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: ([], True), calls)
+    hits, used = await core._run_dorks(None, ["a.com"],
+                                       ["google", "brave", "vertex"], {}, None)
+    assert hits == [] and used == []
+    assert [p for p, _ in calls] == ["google", "brave", "vertex"]
+
+
+async def test_run_dorks_single_backend_behaves_like_the_old_loop(monkeypatch):
+    """Regression: with one configured backend, a terminal failure still stops
+    the remaining domains rather than retrying them."""
+    calls = []
+    _fake_dork_domain(monkeypatch, lambda p, d: ([], True), calls)
+    hits, used = await core._run_dorks(None, ["a.com", "b.com"], ["brave"], {}, None)
+    assert hits == [] and used == []
+    assert calls == [("brave", "a.com")]               # b.com never queried
+
+
+def test_configured_dork_providers_lists_every_ready_backend_in_order():
+    vertex = {"access_token": "t", "project": "p", "engine": "e"}
+    keys = {"google_cse": "k", "google_cse_cx": "cx", "brave": "b", "vertex": vertex}
+    assert dorking.configured_dork_providers(keys) == ["google", "brave", "vertex"]
+    assert dorking.configured_dork_providers({"brave": "b", "vertex": vertex}) \
+        == ["brave", "vertex"]
+    assert dorking.configured_dork_providers({}) == []
+
+
+def test_configured_dork_providers_explicit_choice_never_falls_back():
+    """Pinning a backend must not silently use a different one."""
+    keys = {"google_cse": "k", "google_cse_cx": "cx", "brave": "b"}
+    assert dorking.configured_dork_providers(keys, "brave") == ["brave"]
+    assert dorking.configured_dork_providers(keys, "vertex") == []   # not configured
 
 
 # --------------------------------------------------------------------------- #
@@ -1876,7 +2686,8 @@ def test_summarize_entry_points_ranks_critical_first():
     hosts = [
         Host("dev.x.com", cname="dev.x.com.s3.amazonaws.com",
              takeover="Dangling CNAME -> dev.x.com.s3.amazonaws.com (s3.amazonaws.com); "
-                      "unclaimed-service signature matched"),
+                      "unclaimed-service signature matched",
+             takeover_confidence="likely"),
         Host("legacy.x.com", vulns=["CVE-2026-1"]),
     ]
     cf = {"detected": True, "candidates": {"1.2.3.4": {"confirmed": True, "evidence": "e"}}}
@@ -2533,6 +3344,197 @@ def test_write_html_spf_lookup_count_flags_a_confirmed_permerror():
     assert 'class="bad"' in content
     assert "&ge;12/10" in content or "≥12/10" in content
     assert "permerror" in content
+
+
+def _takeover_hosts():
+    return [
+        Host("weak.x.com", ips=["1.2.3.4"], cname="w.s3.amazonaws.com",
+             takeover="CNAME -> w.s3.amazonaws.com (s3.amazonaws.com); verify",
+             takeover_confidence="possible"),
+        Host("gone.x.com", cname="g.example.net",
+             takeover="Dangling CNAME -> g.example.net; target name does not exist (NXDOMAIN)",
+             takeover_confidence="confirmed"),
+    ]
+
+
+def test_write_markdown_takeover_shows_confidence_confirmed_first():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown(_takeover_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "confirmed — claimable at a known provider" in content
+    assert "possible — unverified, see detail" in content
+    # Highest confidence first: that's the order the leads get worked in.
+    assert content.index("gone.x.com") < content.index("weak.x.com")
+
+
+def test_write_html_takeover_has_confidence_column():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(_takeover_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "<th>Confidence</th>" in content
+    assert 'class="bad"' in content and 'class="warn"' in content
+    assert content.index("gone.x.com") < content.index("weak.x.com")
+
+
+def test_takeover_report_tolerates_a_lead_with_no_confidence_set():
+    """An unlabelled lead must still render, not vanish or raise."""
+    hosts = [Host("old.x.com", cname="c", takeover="found some other way")]
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown(hosts, ["x.com"], {}, str(md))
+        report.write_html(hosts, ["x.com"], {}, str(html))
+        assert "old.x.com" in md.read_text()
+        assert "old.x.com" in html.read_text()
+
+
+def _cert_res():
+    return {"certs": [
+        {"host": "www.x.com", "port": 443, "cn": "www.x.com",
+         "sans": ["www.x.com", "api.x.com"], "issuer": "Real CA",
+         "not_after": "2027-01-01T00:00:00+00:00", "not_before": "2026-01-01T00:00:00+00:00",
+         "expired": False, "not_yet_valid": False, "days_to_expiry": 400,
+         "self_signed": False},
+        {"host": "mail.x.com", "port": 993, "cn": "mail.x.com", "sans": [],
+         "issuer": "mail.x.com", "not_after": "2020-01-01T00:00:00+00:00",
+         "not_before": "2019-01-01T00:00:00+00:00", "expired": True,
+         "not_yet_valid": False, "days_to_expiry": -2000, "self_signed": True},
+    ]}
+
+
+def test_cert_flags_names_every_condition_worth_attention():
+    good = {"expired": False, "not_yet_valid": False, "self_signed": False,
+            "days_to_expiry": 400}
+    assert report._cert_flags(good) == []
+    soon = {**good, "days_to_expiry": 5}
+    assert report._cert_flags(soon) == ["expires in 5d"]
+    bad = {"expired": True, "not_yet_valid": False, "self_signed": True,
+           "days_to_expiry": -10}
+    flags = report._cert_flags(bad)
+    assert "expired" in flags and "self-signed" in flags
+    # An already-expired cert shouldn't also claim it "expires in -10d".
+    assert not any("expires in" in f for f in flags)
+
+
+def test_write_markdown_cert_section_lists_endpoints_flagged_first():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("www.x.com", ips=["1.2.3.4"])], ["x.com"],
+                              _cert_res(), str(path))
+        content = path.read_text()
+    assert "TLS certificates (as served)" in content
+    assert "`mail.x.com:993`" in content and "`www.x.com:443`" in content
+    assert "expired" in content and "self-signed" in content
+    # The flagged cert is the row that matters, so it sorts first.
+    assert content.index("mail.x.com:993") < content.index("www.x.com:443")
+
+
+def test_write_html_cert_section_flags_bad_certs():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("www.x.com", ips=["1.2.3.4"])], ["x.com"],
+                          _cert_res(), str(path))
+        content = path.read_text()
+    assert "TLS certificates (as served)" in content
+    assert "<th>SANs</th>" in content
+    assert 'class="bad"' in content
+    assert content.index("mail.x.com") < content.index("www.x.com:443")
+
+
+def test_cert_section_absent_when_no_certs_read():
+    """A run without the [tls] extra must not emit an empty section."""
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("a.x.com")], ["x.com"], {}, str(md))
+        report.write_html([Host("a.x.com")], ["x.com"], {}, str(html))
+        assert "TLS certificates" not in md.read_text()
+        assert "TLS certificates" not in html.read_text()
+
+
+def _axfr_res(allowed=True):
+    if allowed:
+        return {"axfr": {"x.com": {"transferred": {"ns1.x.com": 3},
+                                   "attempted": ["ns1.x.com", "ns2.x.com"],
+                                   "refused": {"ns2.x.com": "TransferError"},
+                                   "records": ["x.com", "www.x.com", "internal-vpn.x.com"],
+                                   "errors": {"ns3.x.com": "Timeout"},
+                                   "truncated": False}}}
+    return {"axfr": {"x.com": {"transferred": {}, "attempted": ["ns1.x.com"],
+                               "refused": {"ns1.x.com": "TransferError"},
+                               "records": [], "errors": {}, "truncated": False}}}
+
+
+def test_write_markdown_axfr_section_shows_disclosure_and_inconclusive():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("a.x.com")], ["x.com"], _axfr_res(), str(path))
+        content = path.read_text()
+    assert "DNS zone transfer (AXFR)" in content
+    assert "transfer ALLOWED" in content
+    assert "internal-vpn.x.com" in content
+    # An unreachable nameserver must read as inconclusive, never as a refusal.
+    assert "not conclusive" in content and "Timeout" in content
+    assert "unreachable, not a refusal" in content
+
+
+def test_write_markdown_axfr_refusal_reads_as_correct_not_as_a_finding():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("a.x.com")], ["x.com"], _axfr_res(allowed=False), str(path))
+        content = path.read_text()
+    assert "refused by 1 nameserver(s) (correctly restricted)" in content
+    assert "ALLOWED" not in content
+
+
+def test_write_html_axfr_section_counts_only_allowed_transfers():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("a.x.com")], ["x.com"], _axfr_res(), str(path))
+        content = path.read_text()
+    assert "DNS zone transfer (AXFR)" in content
+    assert "transfer ALLOWED" in content and "refused" in content
+    assert "internal-vpn.x.com" in content
+
+
+def test_axfr_section_absent_when_never_attempted():
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("a.x.com")], ["x.com"], {}, str(md))
+        report.write_html([Host("a.x.com")], ["x.com"], {}, str(html))
+        assert "zone transfer" not in md.read_text().lower()
+        assert "zone transfer" not in html.read_text().lower()
+
+
+def _stxt_res():
+    return {"security_txt": [
+        {"host": "x.com", "url": "https://x.com/.well-known/security.txt",
+         "contact": ["mailto:security@x.com"], "expires": ["2020-01-01T00:00:00Z"],
+         "policy": ["https://internal-portal.x.com/vdp"], "expired": True},
+    ]}
+
+
+def test_write_markdown_security_txt_flags_expired():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("x.com")], ["x.com"], _stxt_res(), str(path))
+        content = path.read_text()
+    assert "security.txt (RFC 9116)" in content
+    assert "mailto:security@x.com" in content
+    assert "expired" in content
+    assert "internal-portal.x.com" in content
+
+
+def test_write_html_security_txt_links_contact_and_policy():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("x.com")], ["x.com"], _stxt_res(), str(path))
+        content = path.read_text()
+    assert "security.txt (RFC 9116)" in content
+    assert 'href="https://internal-portal.x.com/vdp"' in content
+    assert "expired" in content
+    # A non-URL contact must not become a broken anchor.
+    assert 'href="mailto:security@x.com"' not in content
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():

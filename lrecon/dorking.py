@@ -268,23 +268,38 @@ def _vertex_ready(creds) -> bool:
                 and (creds.get("engine") or creds.get("datastore")))
 
 
-def select_dork_provider(keys: dict, requested: str | None = "auto") -> str | None:
-    """Resolve which dork backend to use. An explicit `requested` provider is
-    honored only if its credentials are actually present (else None, so the
-    caller reports "not configured"); `auto`/None picks the first configured
-    backend, preferring Google CSE so existing key-holders keep their current
-    behavior, then Brave, then Vertex."""
+DORK_PROVIDER_ORDER = ("google", "brave", "vertex")
+
+
+def configured_dork_providers(keys: dict, requested: str | None = "auto") -> list:
+    """Every usable dork backend, in the order they should be tried.
+
+    `auto`/None returns all configured backends, preferring Google CSE so
+    existing key-holders keep their current behavior, then Brave, then Vertex.
+    An explicit `requested` provider returns just that one, and only if its
+    credentials are actually present (else `[]`, so the caller reports "not
+    configured") — pinning a backend must never silently fall back to another.
+
+    The list matters because a backend can fail *terminally* mid-run (revoked
+    key, exhausted quota): Google CSE is closed to new customers, so a stale CSE
+    key alongside a working Brave key is a realistic setup, and without a
+    fallback chain the run would produce nothing.
+    """
     ready = {
         "google": bool(keys.get("google_cse") and keys.get("google_cse_cx")),
         "brave": bool(keys.get("brave")),
         "vertex": _vertex_ready(keys.get("vertex")),
     }
     if requested and requested != "auto":
-        return requested if ready.get(requested) else None
-    for name in ("google", "brave", "vertex"):
-        if ready[name]:
-            return name
-    return None
+        return [requested] if ready.get(requested) else []
+    return [name for name in DORK_PROVIDER_ORDER if ready[name]]
+
+
+def select_dork_provider(keys: dict, requested: str | None = "auto") -> str | None:
+    """The backend a run starts with, or None if nothing is configured. Thin
+    wrapper over configured_dork_providers() so there's one source of truth;
+    used for the startup log line and by callers that only need the first."""
+    return next(iter(configured_dork_providers(keys, requested)), None)
 
 
 async def dork_domain(client, domain: str, provider: str, keys: dict, limiter) -> tuple:
