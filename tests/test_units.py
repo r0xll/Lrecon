@@ -1882,7 +1882,25 @@ async def test_mail_infra_lookup_keyless_still_enriches_asn_org(monkeypatch):
 # --------------------------------------------------------------------------- #
 from lrecon import tlsinfo
 
-crypto = pytest.importorskip("cryptography", reason="optional [tls] extra")
+# Gate only the tests that need a real certificate, and gate them on the flag
+# tlsinfo actually uses. A module-level importorskip would skip this whole file
+# when the optional [tls] extra is missing — silently taking every other test
+# with it — and `import cryptography` succeeding doesn't mean x509 loads: a
+# half-installed native extension raises from `from cryptography import x509`.
+requires_crypto = pytest.mark.skipif(
+    not tlsinfo.HAVE_CRYPTO, reason="needs the optional [tls] extra")
+
+_CERT_KEY = None
+
+
+def _cert_key():
+    """One RSA key for every generated cert — keygen is slow, and built lazily so
+    importing this module never requires cryptography."""
+    global _CERT_KEY
+    if _CERT_KEY is None:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        _CERT_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return _CERT_KEY
 
 
 def _make_cert(cn="www.x.com", sans=("www.x.com", "api.x.com"), days=30,
@@ -1892,9 +1910,8 @@ def _make_cert(cn="www.x.com", sans=("www.x.com", "api.x.com"), days=30,
     from cryptography import x509
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
 
-    key = _make_cert._key
+    key = _cert_key()
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)]) if cn \
         else x509.Name([])
     issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_cn)]) \
@@ -1911,14 +1928,7 @@ def _make_cert(cn="www.x.com", sans=("www.x.com", "api.x.com"), days=30,
     return cert.public_bytes(serialization.Encoding.DER)
 
 
-def _cert_key():
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    return rsa.generate_private_key(public_exponent=65537, key_size=2048)
-
-
-_make_cert._key = _cert_key()          # generated once; RSA keygen is slow
-
-
+@requires_crypto
 def test_parse_cert_extracts_names_issuer_and_validity():
     c = tlsinfo.parse_cert(_make_cert(cn="www.x.com",
                                       sans=("www.x.com", "api.x.com", "*.dev.x.com"),
@@ -1931,6 +1941,7 @@ def test_parse_cert_extracts_names_issuer_and_validity():
     assert 25 <= c["days_to_expiry"] <= 30
 
 
+@requires_crypto
 def test_parse_cert_flags_self_signed_and_expired():
     self_signed = tlsinfo.parse_cert(_make_cert(issuer_cn=None))
     assert self_signed["self_signed"] is True
@@ -1940,6 +1951,7 @@ def test_parse_cert_flags_self_signed_and_expired():
     assert expired["days_to_expiry"] < 0
 
 
+@requires_crypto
 def test_parse_cert_tolerates_no_san_and_no_cn():
     no_san = tlsinfo.parse_cert(_make_cert(sans=()))
     assert no_san["sans"] == [] and no_san["cn"] == "www.x.com"
@@ -1983,6 +1995,7 @@ async def test_fetch_cert_returns_none_when_unreachable():
     assert await tlsinfo.fetch_cert("127.0.0.1", port=1, timeout=0.5) is None
 
 
+@requires_crypto
 async def test_fetch_cert_skips_cleanly_without_cryptography(monkeypatch):
     monkeypatch.setattr(tlsinfo, "HAVE_CRYPTO", False)
     assert await tlsinfo.fetch_cert("example.com") is None
