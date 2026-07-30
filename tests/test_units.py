@@ -1231,7 +1231,7 @@ async def test_spf_lookup_count_expands_includes_past_the_limit():
     """The finding this exists for: a record that looks compliant at the top level
     but blows RFC 7208 §4.6.4's budget once includes are evaluated."""
     assert intel.parse_spf(_SPF_OVERFLOW_ROOT)["lookup_count"] == 2   # under 10 alone
-    count, complete, exceeded = await intel.spf_lookup_count(
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
         _SPF_OVERFLOW_ROOT, _spf_zone_txt(_SPF_OVERFLOW_ZONE))
     assert exceeded is True
     assert count > intel.SPF_MAX_LOOKUPS
@@ -1239,7 +1239,7 @@ async def test_spf_lookup_count_expands_includes_past_the_limit():
 
 async def test_spf_lookup_count_counts_a_compliant_tree_exactly():
     zone = {"b.test": "v=spf1 a mx -all"}                # 2
-    count, complete, exceeded = await intel.spf_lookup_count(
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
         "v=spf1 include:b.test ip4:1.2.3.4 -all", _spf_zone_txt(zone))
     assert (count, complete, exceeded) == (3, True, False)   # 1 include + a + mx
 
@@ -1250,7 +1250,7 @@ async def test_spf_lookup_count_terminates_on_an_include_cycle():
     keeps it to a single DNS query."""
     calls = []
     zone = {"a.test": "v=spf1 include:a.test -all"}
-    count, complete, exceeded = await intel.spf_lookup_count(
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
         zone["a.test"], _spf_zone_txt(zone, calls=calls))
     assert exceeded is True
     assert count <= intel.SPF_MAX_LOOKUPS + 1            # stopped as soon as it passed
@@ -1265,7 +1265,7 @@ async def test_spf_lookup_count_stops_querying_once_over_the_limit():
             for i in range(9)}
     zone.update({f"n{i}{j}.test": "v=spf1 a mx -all" for i in range(9) for j in range(9)})
     root = "v=spf1 " + " ".join(f"include:s{i}.test" for i in range(9))
-    count, complete, exceeded = await intel.spf_lookup_count(root, _spf_zone_txt(zone, calls=calls))
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(root, _spf_zone_txt(zone, calls=calls))
     assert exceeded is True
     # Every queued target came from a counted lookup, so queries stay bounded by
     # the budget rather than by the size of the tree (81+ records here).
@@ -1276,7 +1276,7 @@ async def test_spf_lookup_count_reports_incomplete_rather_than_guessing():
     """A failed lookup inside an include must not be silently treated as zero
     further lookups — that would claim compliance we cannot verify."""
     zone = {"b.test": "v=spf1 a mx -all"}
-    count, complete, exceeded = await intel.spf_lookup_count(
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
         "v=spf1 include:b.test include:gone.test -all",
         _spf_zone_txt(zone, fail={"gone.test"}))
     assert complete is False
@@ -1287,15 +1287,28 @@ async def test_spf_lookup_count_reports_incomplete_rather_than_guessing():
 async def test_spf_lookup_count_handles_missing_target_record_and_no_spf():
     """An include: pointing at a domain with no SPF is a permerror in its own
     right, but the lookup still counted and there is nothing to expand."""
-    count, complete, exceeded = await intel.spf_lookup_count(
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
         "v=spf1 include:empty.test -all", _spf_zone_txt({}))
     assert (count, complete, exceeded) == (1, True, False)
-    assert await intel.spf_lookup_count(None, _spf_zone_txt({})) == (0, True, False)
+    # It used to be skipped silently; now it is reported for diagnosis.
+    assert unusable == {"empty.test": "no_spf_record"}
+    assert await intel.spf_lookup_count(None, _spf_zone_txt({})) == (0, True, False, {})
+
+
+async def test_spf_lookup_count_separates_unusable_from_unreachable_includes():
+    """A target that answers with no SPF and one whose lookup failed are both
+    unusable, but for different reasons the caller has to tell apart."""
+    zone = {"ok.test": "v=spf1 -all"}
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
+        "v=spf1 include:ok.test include:empty.test include:broken.test -all",
+        _spf_zone_txt(zone, fail={"broken.test"}))
+    assert unusable == {"empty.test": "no_spf_record", "broken.test": "lookup_failed"}
+    assert complete is False                    # the failed lookup is not hidden
 
 
 async def test_spf_lookup_count_follows_redirect():
     zone = {"r.test": "v=spf1 a mx a:x.test -all"}        # 3, plus the redirect itself
-    count, complete, exceeded = await intel.spf_lookup_count(
+    count, complete, exceeded, unusable = await intel.spf_lookup_count(
         "v=spf1 redirect=r.test", _spf_zone_txt(zone))
     assert (count, complete, exceeded) == (4, True, False)
 
@@ -1702,6 +1715,173 @@ async def test_security_txt_ignores_a_catch_all_html_page():
 
 async def test_security_txt_absent_returns_empty():
     assert await intel.security_txt(_PathClient({}), "x.com") == {}
+
+
+# --------------------------------------------------------------------------- #
+# Email posture: include health, vendor fingerprinting, phishing read-out
+# --------------------------------------------------------------------------- #
+def test_uri_host_reduces_dmarc_uris_and_include_targets_to_a_hostname():
+    assert intel._uri_host("mailto:abc@rep.redsift.cloud!10m") == "rep.redsift.cloud"
+    assert intel._uri_host("https://uriports.com/dmarc/report") == "uriports.com"
+    assert intel._uri_host("_spf.google.com") == "_spf.google.com"
+    assert intel._uri_host("mailto:d@x.com") == "x.com"
+    assert intel._uri_host("") == ""
+
+
+def test_vendor_matching_is_anchored_to_a_domain_boundary():
+    """A lookalike must not borrow a vendor's name — matching is on the URI's
+    host and has to land on a real domain boundary."""
+    assert intel._classify_vendor("mailto:x@notredsift.cloud.evil.com",
+                                  intel.DMARC_REPORT_VENDORS) is None
+    assert intel._classify_vendor("mailto:x@redsift.cloud.evil.com",
+                                  intel.DMARC_REPORT_VENDORS) is None
+    assert intel._classify_vendor("mailto:x@rep.redsift.cloud",
+                                  intel.DMARC_REPORT_VENDORS) == "Red Sift OnDMARC"
+    # An unrecognised vendor yields nothing rather than a wrong label.
+    assert intel._classify_vendor("mailto:x@some-random-host.tld",
+                                  intel.DMARC_REPORT_VENDORS) is None
+
+
+def test_classify_dmarc_and_spf_vendors():
+    dmarc = intel.parse_dmarc(
+        "v=DMARC1; p=reject; rua=mailto:a@rep.redsift.cloud!10m,mailto:dmarc@x.com")
+    assert intel.classify_dmarc_vendors(dmarc) == ["Red Sift OnDMARC"]
+    spf = intel.parse_spf("v=spf1 include:spf.protection.outlook.com "
+                          "include:u123.wl.sendgrid.net include:_spf.salesforce.com "
+                          "include:internal.x.com -all")
+    # Subdomains of a vendor's domain still match; unknown includes are ignored.
+    assert intel.classify_spf_vendors(spf) == ["Microsoft 365", "SendGrid", "Salesforce"]
+    assert intel.classify_spf_vendors(intel.parse_spf("v=spf1 -all")) == []
+
+
+def test_classify_spf_vendors_covers_redirect():
+    spf = intel.parse_spf("v=spf1 redirect=spf.protection.outlook.com")
+    assert intel.classify_spf_vendors(spf) == ["Microsoft 365"]
+
+
+async def test_classify_spf_includes_separates_dead_from_unpublished(monkeypatch):
+    """The three states look identical in a plain TXT lookup but mean very
+    different things — a non-existent target may be registrable, which is a
+    spoofing vector, while one that merely publishes no SPF is only a permerror."""
+    async def fake_status(target, ns):
+        return {"gone.test": ("nxdomain", "com"),
+                "empty.test": ("resolves", None),
+                "slow.test": ("unknown", None)}[target]
+    monkeypatch.setattr(intel, "cname_target_status", fake_status)
+    out = await intel.classify_spf_includes(
+        {"gone.test": "no_spf_record", "empty.test": "no_spf_record",
+         "slow.test": "no_spf_record"}, None)
+    by_target = {i["target"]: i for i in out}
+    assert by_target["gone.test"]["state"] == "nxdomain"
+    assert by_target["gone.test"]["closest_zone"] == "com"
+    assert by_target["empty.test"]["state"] == "no_spf"
+    # An inconclusive resolution must not be reported as either real state.
+    assert by_target["slow.test"]["state"] == "lookup_failed"
+
+
+async def test_classify_spf_includes_does_not_requery_a_failed_lookup(monkeypatch):
+    """Targets whose TXT lookup already failed are inconclusive by definition —
+    no point spending another query to learn the same thing."""
+    calls = []
+
+    async def fake_status(target, ns):
+        calls.append(target)
+        return "resolves", None
+    monkeypatch.setattr(intel, "cname_target_status", fake_status)
+    out = await intel.classify_spf_includes({"broken.test": "lookup_failed"}, None)
+    assert out == [{"target": "broken.test", "state": "lookup_failed",
+                    "closest_zone": None}]
+    assert calls == []
+
+
+async def test_email_security_flags_a_dead_spf_include_as_a_spoofing_vector(monkeypatch):
+    # An empty TXT answer is a definitive "nothing published" (what a real
+    # NXDOMAIN/NoAnswer produces via txt()), not a lookup failure.
+    answers = _email_zone(spf="v=spf1 include:gone.test -all",
+                          extra={("gone.test", "TXT"): []})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+
+    async def fake_status(target, ns):
+        return "nxdomain", "com"
+    monkeypatch.setattr(intel, "cname_target_status", fake_status)
+    out = await intel.email_security("x.test", None)
+    health = out["spf_include_health"]
+    assert health == [{"target": "gone.test", "state": "nxdomain", "closest_zone": "com"}]
+    issue = next(i for i in out["issues"] if "gone.test" in i)
+    assert "NXDOMAIN" in issue and "closest existing zone: com" in issue
+    # Hedged on registrability, exactly as the takeover wording is.
+    assert "if that domain is registrable" in issue
+    assert out["grade"] == "FAIL"          # a permerror is a real defect
+
+
+async def test_email_security_flags_an_include_with_no_spf_record(monkeypatch):
+    # An empty TXT answer is a definitive "nothing published" (what a real
+    # NXDOMAIN/NoAnswer produces via txt()), not a lookup failure.
+    answers = _email_zone(spf="v=spf1 include:empty.test -all",
+                          extra={("empty.test", "TXT"): []})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+
+    async def fake_status(target, ns):
+        return "resolves", None
+    monkeypatch.setattr(intel, "cname_target_status", fake_status)
+    out = await intel.email_security("x.test", None)
+    assert out["spf_include_health"][0]["state"] == "no_spf"
+    assert any("publishes no SPF record" in i for i in out["issues"])
+    # No claim that anyone can hijack it — the name exists.
+    assert not any("registrable" in i for i in out["issues"])
+
+
+async def test_email_security_vendor_detection_does_not_change_the_grade(monkeypatch):
+    """Using a managed DMARC service is good practice, not a finding. Letting it
+    into `issues` would make the grade meaningless — same rule as MTA-STS."""
+    answers = _email_zone(spf="v=spf1 include:spf.protection.outlook.com -all", extra={
+        ("spf.protection.outlook.com", "TXT"): [_FakeTXTRecord("v=spf1 ip4:1.2.3.0/24 -all")],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord(
+            "v=DMARC1; p=reject; rua=mailto:a@rep.redsift.cloud")],
+    })
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    assert out["spf_vendors"] == ["Microsoft 365"]
+    assert out["dmarc_vendors"] == ["Red Sift OnDMARC"]
+    assert out["grade"] == "PASS" and out["issues"] == []
+
+
+def test_phishing_posture_reads_out_each_enforcement_state():
+    enforced = intel.phishing_posture(
+        {"dmarc": "x", "dmarc_parsed": {"p": "reject", "pct": 100,
+                                        "rua": ["mailto:a@rep.redsift.cloud"]},
+         "spf_vendors": ["Microsoft 365"]}, [{"provider": "Proofpoint"}])
+    assert enforced["enforced"] is True
+    assert enforced["monitored_by"] == ["Red Sift OnDMARC"]
+    assert enforced["gateway"] == "Proofpoint"
+    assert "should fail" in enforced["summary"]
+    assert "likely to be detected" in enforced["summary"]
+    assert "Proofpoint" in enforced["summary"]
+    # Describes likelihood, never promises an outcome.
+    assert "will be blocked" not in enforced["summary"]
+
+    monitoring = intel.phishing_posture(
+        {"dmarc": "x", "dmarc_parsed": {"p": "none", "rua": []}}, [])
+    assert monitoring["enforced"] is False
+    assert "monitoring-only" in monitoring["summary"]
+    assert "unlikely to be noticed" in monitoring["summary"]
+
+    absent = intel.phishing_posture({"dmarc": None, "dmarc_parsed": {}}, [])
+    assert "no DMARC published" in absent["summary"]
+
+    partial = intel.phishing_posture(
+        {"dmarc": "x", "dmarc_parsed": {"p": "quarantine", "pct": 20, "rua": []}}, [])
+    assert partial["enforced"] is False       # partial coverage is not enforcement
+    assert "20% of mail" in partial["summary"]
+
+
+def test_phishing_posture_ignores_a_non_gateway_mx():
+    """A mailbox host is not a filtering gateway and must not be reported as one."""
+    p = intel.phishing_posture(
+        {"dmarc": "x", "dmarc_parsed": {"p": "reject", "rua": []}},
+        [{"provider": "Google Workspace"}])
+    assert p["gateway"] is None
+    assert "filtered by" not in p["summary"]
 
 
 class NXDOMAIN(Exception):
@@ -3344,6 +3524,73 @@ def test_write_html_spf_lookup_count_flags_a_confirmed_permerror():
     assert 'class="bad"' in content
     assert "&ge;12/10" in content or "≥12/10" in content
     assert "permerror" in content
+
+
+def _posture_res():
+    return {"email": {"x.com": {
+        "domain": "x.com", "grade": "WARN",
+        "spf": "v=spf1 include:spf.protection.outlook.com include:gone.test -all",
+        "dmarc": "v=DMARC1; p=reject; rua=mailto:a@rep.redsift.cloud",
+        "dkim": True, "dkim_selector": "selector1", "dkim_record": "v=DKIM1; p=k",
+        "spf_parsed": {"includes": ["spf.protection.outlook.com", "gone.test"],
+                       "redirect": None, "all_qualifier": "-", "lookup_count": 3,
+                       "lookup_count_complete": True, "exceeds_lookup_limit": False},
+        "dmarc_parsed": {"p": "reject", "rua": ["mailto:a@rep.redsift.cloud"]},
+        "spf_include_health": [{"target": "gone.test", "state": "nxdomain",
+                                "closest_zone": "com"}],
+        "spf_vendors": ["Microsoft 365"], "dmarc_vendors": ["Red Sift OnDMARC"],
+        "phishing_posture": {"enforced": True, "policy": "reject", "pct": None,
+                             "monitored_by": ["Red Sift OnDMARC"],
+                             "gateway": "Proofpoint", "senders": ["Microsoft 365"],
+                             "summary": "`p=reject` at full coverage — spoofing the exact "
+                                        "domain should fail; aggregate reporting to Red Sift "
+                                        "OnDMARC, so lookalike sending is likely to be "
+                                        "detected."},
+        "issues": ["SPF include:gone.test does not exist (NXDOMAIN)"]}}}
+
+
+def test_write_markdown_email_shows_services_and_phishing_posture():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("x.com")], ["x.com"], _posture_res(), str(path))
+        content = path.read_text()
+    assert "Detected services:" in content
+    assert "senders: Microsoft 365" in content
+    assert "DMARC reporting: Red Sift OnDMARC" in content
+    assert "inbound gateway: Proofpoint" in content
+    assert "**Phishing posture:**" in content
+    assert "likely to be detected" in content
+    # The broken include is flagged where the includes are listed, not only in Issues.
+    assert "`gone.test` (**does not exist**)" in content
+
+
+def test_write_html_email_shows_services_and_phishing_posture():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("x.com")], ["x.com"], _posture_res(), str(path))
+        content = path.read_text()
+    assert "Detected senders:" in content and "Microsoft 365" in content
+    assert "Detected DMARC reporting:" in content and "Red Sift OnDMARC" in content
+    assert "Phishing posture:" in content
+    # Shared posture wording renders its markup rather than leaking backticks.
+    assert "<code>p=reject</code>" in content
+    assert 'class="bad"' in content and "does not exist" in content
+
+
+def test_email_section_unchanged_when_no_analysis_present():
+    """A pre-enrichment result dict must still render — no KeyError, and no empty
+    'Detected services' or posture line."""
+    res = {"email": {"x.com": {"domain": "x.com", "grade": "PASS", "spf": "v=spf1 -all",
+                               "dmarc": None, "dkim": False, "dkim_selector": None,
+                               "dkim_record": None, "spf_parsed": {}, "dmarc_parsed": {},
+                               "issues": []}}}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], res, str(md))
+        report.write_html([Host("x.com")], ["x.com"], res, str(html))
+        assert "Detected services" not in md.read_text()
+        assert "Phishing posture" not in md.read_text()
+        assert "Phishing posture" not in html.read_text()
 
 
 def _takeover_hosts():

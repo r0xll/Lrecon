@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio, html, ipaddress, json, re
 import httpx
 from .common import *
-from .sources import get_resolver, resolve_full
+from .sources import cname_target_status, get_resolver, resolve_full
 from .enrich import enrich_ipinfo
 from .tlsinfo import cert_matches_scope, fetch_cert, in_scope_cert_names
 
@@ -239,13 +239,21 @@ def parse_spf(record: str | None) -> dict:
 
 
 async def spf_lookup_count(record: str | None, txt_lookup,
-                           max_lookups: int = SPF_MAX_LOOKUPS) -> tuple[int, bool, bool]:
+                           max_lookups: int = SPF_MAX_LOOKUPS) -> tuple[int, bool, bool, dict]:
     """Total DNS lookups an SPF evaluation costs, expanding `include:`/`redirect=`.
 
     RFC 7208 §4.6.4 caps a full evaluation at 10 lookups, counting those made
     while evaluating referenced records. Counting only the apex record misses the
     common real-world permerror: a handful of `include:`s that each pull in
-    several more lookups. Returns `(count, complete, exceeded)`.
+    several more lookups. Returns
+    `(count, complete, exceeded, unusable)`.
+
+    `unusable` maps each target the walk could not get an SPF record from to why
+    — `"no_spf_record"` or `"lookup_failed"`. These used to be skipped silently,
+    but an `include:` that resolves to nothing usable is a permerror in its own
+    right, and the caller diagnoses them further (a target whose *name* does not
+    exist is a different and more serious problem than one that simply publishes
+    no SPF).
 
     `txt_lookup` is the caller's async TXT resolver returning `(records, failed)`
     — reused rather than taking a resolver directly so this inherits the caller's
@@ -265,9 +273,10 @@ async def spf_lookup_count(record: str | None, txt_lookup,
     is a lower bound, so over-the-limit stays over the limit).
     """
     if not record:
-        return 0, True, False
+        return 0, True, False, {}
 
     count, complete = 0, True
+    unusable: dict[str, str] = {}
     cache: dict[str, str | None] = {}
     queue = [parse_spf(record)]
     while queue:
@@ -276,7 +285,7 @@ async def spf_lookup_count(record: str | None, txt_lookup,
         if count > max_lookups:
             # A lower bound above the cap is still a definitive permerror, so
             # stop here rather than resolving the rest of the tree.
-            return count, False, True
+            return count, False, True, unusable
         targets = list(p["includes"]) + ([p["redirect"]] if p["redirect"] else [])
         for target in targets:
             norm = target.lower().rstrip(".")
@@ -287,14 +296,230 @@ async def spf_lookup_count(record: str | None, txt_lookup,
                 if failed:
                     complete = False
                     cache[norm] = None
+                    unusable[norm] = "lookup_failed"
                     continue
                 sub = next((t for t in recs if t.lower().startswith("v=spf1")), None)
                 cache[norm] = sub
-            # No SPF record at the target is itself a permerror, but the lookup
-            # that got us here is already counted and there is nothing to expand.
+            # An include: whose target yields no SPF record is a permerror — the
+            # mechanism can never match. Record it; the lookup that got us here
+            # is already counted and there is nothing further to expand.
             if sub:
                 queue.append(parse_spf(sub))
-    return count, complete, count > max_lookups
+            else:
+                unusable.setdefault(norm, "no_spf_record")
+    return count, complete, count > max_lookups, unusable
+
+
+async def classify_spf_includes(unusable: dict, resolver_ns) -> list:
+    """Diagnose the `include:`/`redirect=` targets SPF expansion couldn't use.
+
+    A plain TXT lookup makes three very different situations look alike, so each
+    unusable target gets one follow-up resolution:
+
+      * **nxdomain** — the target's *name* does not exist. A permerror, and the
+        serious case: if that domain is registrable, whoever registers it can
+        publish `v=spf1 +all` and have their mail pass SPF for the domain that
+        includes it. The closest still-existing zone is recorded as evidence.
+      * **no_spf** — the name exists but publishes no SPF record. A permerror;
+        the mechanism can never match, but nobody can hijack it.
+      * **lookup_failed** — timeout/SERVFAIL. Inconclusive, and reported as such
+        rather than being folded into either real state.
+
+    Only the few targets that already failed are re-queried, and dead includes
+    are rare, so this costs almost nothing in practice.
+    """
+    out = []
+    for target, reason in sorted(unusable.items()):
+        if reason == "lookup_failed":
+            out.append({"target": target, "state": "lookup_failed", "closest_zone": None})
+            continue
+        # cname_target_status() asks for A/AAAA, so NoAnswer ("the name exists,
+        # just not with this type") correctly reads as "resolves" for a target
+        # that only ever publishes TXT.
+        status, closest_zone = await cname_target_status(target, resolver_ns)
+        state = {"nxdomain": "nxdomain", "resolves": "no_spf"}.get(status, "lookup_failed")
+        out.append({"target": target, "state": state, "closest_zone": closest_zone})
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Vendor fingerprinting from records lrecon already fetches. Same table idiom as
+# MAIL_PROVIDER_PATTERNS / _IDP_PATTERNS / TAKEOVER_SIGS: (label, substrings).
+#
+# Purely informational — none of this touches the grade. Using a managed DMARC
+# service is good practice, not a finding; folding it into `issues` would make
+# the grade meaningless, the same reasoning that keeps plain MTA-STS absence out.
+# --------------------------------------------------------------------------- #
+
+# Who receives the DMARC aggregate/forensic reports. This is the "is anyone
+# actually watching?" signal: a managed platform means spoofing attempts and
+# lookalike sending are being collected and reviewed, not just policy-enforced.
+DMARC_REPORT_VENDORS = [
+    ("Red Sift OnDMARC",   ["redsift.cloud", "ondmarc.com", "redsift.com"]),
+    ("dmarcian",           ["dmarcian.com", "dmarcian.eu"]),
+    ("Valimail",           ["valimail.com", "vali.email"]),
+    ("Agari",              ["agari.com"]),
+    ("Proofpoint",         ["proofpoint.com", "emaildefense.proofpoint.com"]),
+    ("Mimecast",           ["mimecast.com"]),
+    ("EasyDMARC",          ["easydmarc.com"]),
+    ("URIports",           ["uriports.com"]),
+    ("Postmark",           ["dmarc.postmarkapp.com", "postmarkapp.com"]),
+    ("Fraudmarc",          ["fraudmarc.com"]),
+    ("Netcraft",           ["netcraft.com"]),
+    ("Cloudflare",         ["dmarc-reports.cloudflare.com", "cloudflare.com"]),
+    ("Google",             ["google.com", "googlemail.com"]),
+    ("Microsoft",          ["microsoft.com", "protection.outlook.com"]),
+    ("Skysnag",            ["skysnag.com"]),
+    ("Sendmarc",           ["sendmarc.com"]),
+]
+
+# What the org sends mail through, from its SPF include: targets. For an
+# authorized assessment this is the pretext surface — a target that sends via
+# Docusign or Zendesk gives a phishing lure that fits their normal mail flow.
+SPF_SENDER_VENDORS = [
+    ("Microsoft 365",      ["spf.protection.outlook.com", "protection.outlook.com"]),
+    ("Google Workspace",   ["_spf.google.com", "aspmx.googlemail.com"]),
+    ("SendGrid",           ["sendgrid.net", "sendgrid.com"]),
+    ("Mailgun",            ["mailgun.org", "mailgun.com"]),
+    ("Mailchimp/Mandrill", ["mailchimp.com", "mandrillapp.com", "mcsv.net"]),
+    ("Amazon SES",         ["amazonses.com"]),
+    ("Salesforce",         ["salesforce.com", "exacttarget.com", "pardot.com"]),
+    ("HubSpot",            ["hubspot.com", "hubspotemail.net"]),
+    ("Marketo",            ["mktomail.com", "marketo.com"]),
+    ("Zendesk",            ["zendesk.com"]),
+    ("Freshdesk",          ["freshdesk.com", "freshemail.io"]),
+    ("Intercom",           ["intercom.io", "intercommail.com"]),
+    ("Docusign",           ["docusign.net", "docusign.com"]),
+    ("Atlassian",          ["atlassian.net", "atlassian.com"]),
+    ("ServiceNow",         ["service-now.com"]),
+    ("Postmark",           ["spf.mtasv.net", "postmarkapp.com"]),
+    ("SparkPost",          ["sparkpostmail.com", "messagesystems.com"]),
+    ("Zoho",               ["zoho.com", "zohomail.com"]),
+    ("Klaviyo",            ["klaviyo.com"]),
+    ("Qualtrics",          ["qualtrics.com"]),
+    ("Braze",              ["braze.com"]),
+    ("Adobe",              ["adobe.com", "marketo.com"]),
+]
+
+# Which MAIL_PROVIDER_PATTERNS entries are inbound security gateways rather than
+# mailbox hosts. A gateway is the difference between "mail lands in the inbox"
+# and "mail is scanned, sandboxed and possibly quarantined first".
+MAIL_SECURITY_GATEWAYS = {"Proofpoint", "Mimecast", "Barracuda",
+                          "Cisco Secure Email (IronPort)"}
+
+
+def _classify_vendor(value: str, table) -> str | None:
+    """First vendor whose fingerprint appears in `value`, or None.
+
+    Matched against the URI's host portion, not the whole string, so an
+    attacker-chosen lookalike (`rua=mailto:x@notredsift.cloud.evil.com`) cannot
+    borrow a vendor's name — the label has to sit on a real domain boundary.
+    """
+    host = _uri_host(value)
+    if not host:
+        return None
+    for label, needles in table:
+        for needle in needles:
+            needle = needle.lower().strip(".")
+            if host == needle or host.endswith("." + needle):
+                return label
+    return None
+
+
+def _uri_host(value: str) -> str:
+    """Host portion of a DMARC reporting URI or an SPF include target.
+
+    DMARC `rua=` entries are URIs (`mailto:dmarc@example.com!10m`); include
+    targets are bare hostnames. Both reduce to a hostname to match on.
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    v = v.split("!", 1)[0]                     # drop a DMARC size limit
+    if "://" in v:
+        v = v.split("://", 1)[1]
+    elif v.startswith("mailto:"):
+        v = v[len("mailto:"):]
+    if "@" in v:
+        v = v.rsplit("@", 1)[1]
+    return v.split("/", 1)[0].split(":", 1)[0].strip(".")
+
+
+def classify_dmarc_vendors(dmarc_parsed: dict) -> list:
+    """Managed DMARC platforms receiving this domain's reports, deduped."""
+    out = []
+    for uri in (dmarc_parsed.get("rua") or []) + (dmarc_parsed.get("ruf") or []):
+        vendor = _classify_vendor(uri, DMARC_REPORT_VENDORS)
+        if vendor and vendor not in out:
+            out.append(vendor)
+    return out
+
+
+def classify_spf_vendors(spf_parsed: dict) -> list:
+    """Third-party senders authorised by this domain's SPF, deduped."""
+    out = []
+    targets = list(spf_parsed.get("includes") or [])
+    if spf_parsed.get("redirect"):
+        targets.append(spf_parsed["redirect"])
+    for target in targets:
+        vendor = _classify_vendor(target, SPF_SENDER_VENDORS)
+        if vendor and vendor not in out:
+            out.append(vendor)
+    return out
+
+
+def phishing_posture(entry: dict, mail_infra: list | None = None) -> dict:
+    """What a domain's published email posture means for a phishing assessment.
+
+    Answers the question an operator actually has — "if I send as this domain, or
+    from a lookalike, what happens?" — from the records already collected, and
+    keeps the structured inputs beside the prose so the conclusion can be audited
+    rather than taken on trust.
+
+    Describes likelihood, never guarantees an outcome. No DNS record supports
+    "will be blocked": receivers honour DMARC to varying degrees, and this goes
+    into a client deliverable.
+    """
+    dp = entry.get("dmarc_parsed") or {}
+    policy, pct = dp.get("p"), dp.get("pct")
+    partial = pct is not None and pct < 100
+    enforced = policy in ("quarantine", "reject") and not partial
+    monitored_by = classify_dmarc_vendors(dp)
+    gateway = next((e.get("provider") for e in (mail_infra or [])
+                    if e.get("provider") in MAIL_SECURITY_GATEWAYS), None)
+
+    if not entry.get("dmarc"):
+        spoof = ("no DMARC published — the exact domain can be spoofed outright")
+    elif policy == "none":
+        spoof = ("`p=none` — DMARC is monitoring-only, so the exact domain can "
+                 "still be spoofed")
+    elif enforced:
+        spoof = (f"`p={policy}` at full coverage — spoofing the exact domain should "
+                 f"fail at receivers honouring DMARC")
+    elif partial:
+        spoof = (f"`p={policy}` but `pct={pct}` — enforcement applies to only "
+                 f"{pct}% of mail, so some spoofed mail still lands")
+    else:
+        spoof = f"`p={policy or 'unset'}` — enforcement unclear"
+
+    if monitored_by:
+        watch = (f"aggregate reporting to {', '.join(monitored_by)}, so lookalike "
+                 f"and spoofed sending is likely to be detected and reviewed")
+    elif dp.get("rua"):
+        watch = ("aggregate reporting is configured, so spoofing attempts are "
+                 "being collected")
+    else:
+        watch = ("no aggregate reporting configured — spoofing attempts are "
+                 "unlikely to be noticed by the domain owner")
+
+    parts = [spoof, watch]
+    if gateway:
+        parts.append(f"inbound mail is filtered by {gateway}, which may quarantine "
+                     f"lookalike-domain mail on arrival")
+    return {"enforced": bool(enforced), "policy": policy, "pct": pct,
+            "monitored_by": monitored_by, "gateway": gateway,
+            "senders": entry.get("spf_vendors") or [],
+            "summary": "; ".join(parts) + "."}
 
 
 def parse_dmarc(record: str | None) -> dict:
@@ -375,7 +600,8 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
            "dkim_selectors_checked": list(DKIM_SELECTORS),
            "spf_parsed": {}, "dmarc_parsed": {}, "issues": [],
            "mta_sts": None, "mta_sts_policy": None, "mta_sts_mode": None,
-           "tls_rpt": None, "lookup_errors": []}
+           "tls_rpt": None, "lookup_errors": [],
+           "spf_include_health": [], "spf_vendors": [], "dmarc_vendors": []}
 
     async def txt(name):
         """TXT records for `name`, plus whether the lookup itself failed.
@@ -422,10 +648,31 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
         # receiver spends it. Without this the count is top-level only, and the
         # usual real permerror — a few includes that each pull in several more
         # lookups — goes unreported while the record looks compliant.
-        total, complete, exceeded = await spf_lookup_count(spf, txt)
+        total, complete, exceeded, unusable = await spf_lookup_count(spf, txt)
         out["spf_parsed"]["lookup_count"] = total
         out["spf_parsed"]["lookup_count_complete"] = complete
         out["spf_parsed"]["exceeds_lookup_limit"] = exceeded
+        # Diagnose the include: targets the walk couldn't use. A dead include is
+        # a permerror, and one whose name no longer exists may be registrable —
+        # in which case whoever takes the domain can authorise their own mail.
+        out["spf_include_health"] = await classify_spf_includes(unusable, resolver_ns)
+        for inc in out["spf_include_health"]:
+            if inc["state"] == "nxdomain":
+                out["issues"].append(
+                    f"SPF include:{inc['target']} does not exist (NXDOMAIN) — permerror "
+                    f"(risk); if that domain is registrable, whoever registers it can "
+                    f"publish SPF authorising their own mail for this domain"
+                    + (f" [closest existing zone: {inc['closest_zone']}]"
+                       if inc.get("closest_zone") else ""))
+            elif inc["state"] == "no_spf":
+                out["issues"].append(
+                    f"SPF include:{inc['target']} publishes no SPF record — permerror, "
+                    f"the mechanism can never match")
+            else:
+                out["issues"].append(
+                    f"SPF include:{inc['target']} could not be checked (DNS error) — "
+                    f"inconclusive, not confirmation that it is broken")
+    out["spf_vendors"] = classify_spf_vendors(out["spf_parsed"])
     if out["spf_parsed"].get("exceeds_lookup_limit"):
         out["issues"].append(
             f"SPF exceeds {SPF_MAX_LOOKUPS}-DNS-lookup limit "
@@ -451,6 +698,7 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
         out["issues"].append("No DMARC record (spoofing risk)")
     elif "p=none" in dmarc:
         out["issues"].append("DMARC p=none — monitoring only, no enforcement")
+    out["dmarc_vendors"] = classify_dmarc_vendors(out["dmarc_parsed"])
     dp = out["dmarc_parsed"]
     if dmarc:
         if dp.get("pct") is not None and dp["pct"] < 100:

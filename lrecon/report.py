@@ -59,6 +59,45 @@ def _md_emph_to_html(text: str) -> str:
     return "".join(out)
 
 
+_SPF_INCLUDE_FLAGS = {
+    "nxdomain": ("does not exist", True),
+    "no_spf": ("no SPF record", True),
+    "lookup_failed": ("unchecked", False),
+}
+
+
+def _spf_include_health(e: dict) -> dict:
+    """{target: state} for the includes diagnosed as unusable."""
+    return {i["target"]: i["state"] for i in (e.get("spf_include_health") or [])}
+
+
+def _spf_include_md(target: str, e: dict) -> str:
+    """An include, flagged inline when it's broken — the list of includes is
+    where a reader looks, so the defect belongs there and not only in Issues."""
+    state = _spf_include_health(e).get((target or "").lower().rstrip("."))
+    label, bad = _SPF_INCLUDE_FLAGS.get(state, (None, False))
+    if not label:
+        return f"`{target}`"
+    return f"`{target}` ({'**' + label + '**' if bad else label})"
+
+
+def _email_services(e: dict) -> list:
+    """(kind, names) pairs for the third-party email services a domain reveals.
+
+    Informational: which SaaS the org sends through, and who watches its DMARC
+    reports. Never affects the grade — see phishing_posture()/the MTA-STS note.
+    """
+    out = []
+    if e.get("spf_vendors"):
+        out.append(("senders", e["spf_vendors"]))
+    if e.get("dmarc_vendors"):
+        out.append(("DMARC reporting", e["dmarc_vendors"]))
+    gateway = (e.get("phishing_posture") or {}).get("gateway")
+    if gateway:
+        out.append(("inbound gateway", [gateway]))
+    return out
+
+
 def _mta_sts_text(e: dict) -> str:
     """MTA-STS state in one line. Absence is stated plainly rather than as a
     finding — most domains don't publish it, so it isn't a misconfiguration; a
@@ -551,7 +590,8 @@ def write_markdown(hosts, domains, res, path) -> None:
                           + (f"  ⚠️ {lk_caveat}" if lk_level
                              else f" *({lk_caveat})*" if lk_caveat else ""),
                           f"- **SPF includes ({len(sp.get('includes') or [])}):** "
-                          + (", ".join(f"`{i}`" for i in sp["includes"]) if sp.get("includes") else "none")]
+                          + (", ".join(_spf_include_md(i, e) for i in sp["includes"])
+                             if sp.get("includes") else "none")]
                 if sp.get("ip4") or sp.get("ip6"):
                     nets = (sp.get("ip4") or []) + (sp.get("ip6") or [])
                     lines.append(f"- **SPF IP literals ({len(nets)}):** "
@@ -575,7 +615,15 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"- **TLS-RPT:** "
                          + (f"`{e['tls_rpt']}`" if e.get("tls_rpt")
                             else "not published — no reporting of SMTP TLS failures"))
+            services = _email_services(e)
+            if services:
+                lines.append("- **Detected services:** "
+                             + "; ".join(f"{k}: {', '.join(v)}" for k, v in services))
             lines.append("")
+
+            posture = e.get("phishing_posture") or {}
+            if posture.get("summary"):
+                lines += [f"**Phishing posture:** {posture['summary']}", ""]
 
             issues = e.get("issues") or []
             lines += ["**Issues:**", ""]
@@ -1174,8 +1222,19 @@ def write_html(hosts, domains, res, path) -> None:
                 elif lk_caveat:
                     lk_txt = f'{lk_txt} <span class="note">({esc(lk_caveat)})</span>'
                 inc = sp.get("includes") or []
+                health = _spf_include_health(e)
+
+                def _inc_html(target):
+                    state = health.get((target or "").lower().rstrip("."))
+                    label, bad = _SPF_INCLUDE_FLAGS.get(state, (None, False))
+                    cell = f"<code>{esc(target)}</code>"
+                    if not label:
+                        return cell
+                    cls = "bad" if bad else "note"
+                    return f'{cell} <span class="{cls}">({esc(label)})</span>'
+
                 inc_txt = (f"SPF includes ({len(inc)}): "
-                           + ", ".join(f"<code>{esc(i)}</code>" for i in inc)
+                           + ", ".join(_inc_html(i) for i in inc)
                            if inc else "SPF includes: none")
                 details += [f"SPF policy: {esc(qual)}", f"SPF DNS lookups: {lk_txt}", inc_txt]
             if e.get("dmarc"):
@@ -1197,6 +1256,9 @@ def write_html(hosts, domains, res, path) -> None:
             details.append("MTA-STS: " + _md_emph_to_html(_mta_sts_text(e)))
             details.append("TLS-RPT: " + (f"<code>{esc(e['tls_rpt'])}</code>"
                                           if e.get("tls_rpt") else "not published"))
+            for kind, names in _email_services(e):
+                details.append(f"Detected {esc(kind)}: "
+                               + ", ".join(f"<strong>{esc(n)}</strong>" for n in names))
             issues = e.get("issues") or []
             body += (f'<h4>{esc(d)} <span class="{grade_cls}">{esc(grade)}</span></h4>'
                      f'<div style="overflow-x:auto"><table><tr><th>Mechanism</th>'
@@ -1207,6 +1269,9 @@ def write_html(hosts, domains, res, path) -> None:
                      + ("".join(f"<li>{esc(i)}</li>" for i in issues)
                         if issues else "<li>none</li>")
                      + "</ul>"
+                     + (f'<p><strong>Phishing posture:</strong> '
+                        f'{_md_emph_to_html((e.get("phishing_posture") or {})["summary"])}</p>'
+                        if (e.get("phishing_posture") or {}).get("summary") else "")
                      + (f'<p class="note">DNS lookups failed '
                         f'({esc("; ".join(e["lookup_errors"]))}) — the affected mechanisms '
                         f'are <strong>inconclusive</strong>, not confirmed absent.</p>'

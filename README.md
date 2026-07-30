@@ -385,6 +385,53 @@ raw text it reports a parsed breakdown:
   record isn't enforceable), or it is valid but not enforcing (`mode=testing` /
   `mode=none`). The remedies differ, so the report doesn't collapse them.
 
+**SPF include health.** Expanding `include:`/`redirect=` for the lookup budget
+also reveals targets that yield no usable SPF record, which used to be skipped
+silently. Each one gets a follow-up resolution, because three situations look
+identical in a plain TXT lookup and mean very different things:
+
+| State | Meaning |
+|---|---|
+| **does not exist** (NXDOMAIN) | permerror — and if that domain is registrable, whoever registers it can publish SPF authorising their own mail *for your domain* |
+| **no SPF record** | permerror — the mechanism can never match, but nobody can hijack it |
+| **unchecked** | DNS error — inconclusive, never reported as either of the above |
+
+The NXDOMAIN case reports the **closest still-existing zone** as evidence and
+stops short of asserting the domain is registrable — same discipline as the
+takeover confidence levels, and for the same reason (deciding that needs a
+public-suffix list).
+
+**Detected email services.** Fingerprinted from records lrecon already fetches:
+
+- **Senders** from SPF includes — M365, Google Workspace, SendGrid, Mailgun,
+  Salesforce, Zendesk, Docusign, Atlassian and others. For an authorized
+  assessment this is the pretext surface: a target that sends via Docusign gives
+  a lure that fits their normal mail flow.
+- **DMARC reporting platform** from `rua=`/`ruf=` — Red Sift OnDMARC, dmarcian,
+  Valimail, Proofpoint, EasyDMARC and others. This is the "is anyone actually
+  watching?" signal.
+- **Inbound gateway** from MX — Proofpoint, Mimecast, Barracuda, Cisco.
+
+Matching is anchored to a domain boundary, so a lookalike
+(`rua=mailto:x@notredsift.cloud.evil.com`) cannot borrow a vendor's name. All of
+it is **informational and never moves the grade** — using a DMARC platform is
+good practice, not a finding.
+
+**Phishing posture read-out.** The above is synthesised into one line per domain
+answering the question an operator actually has — *if I send as this domain, or
+from a lookalike, what happens?* For example:
+
+> `p=reject` at full coverage — spoofing the exact domain should fail at
+> receivers honouring DMARC; aggregate reporting to Red Sift OnDMARC, so
+> lookalike and spoofed sending is likely to be detected and reviewed; inbound
+> mail is filtered by Proofpoint, which may quarantine lookalike-domain mail on
+> arrival.
+
+It describes likelihood and never guarantees an outcome — no DNS record supports
+"will be blocked", since receivers honour DMARC to varying degrees. The
+structured inputs (`enforced`, `monitored_by`, `gateway`, `senders`) are kept
+beside the sentence so the conclusion can be audited rather than taken on trust.
+
 **DNS zone transfer (AXFR).** One query per authoritative nameserver, reusing
 the NS list the DNS snapshot already collected. A server that answers hands over
 every record in the zone at once — including internal-only names no amount of
