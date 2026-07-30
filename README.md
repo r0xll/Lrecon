@@ -299,6 +299,79 @@ actually contributing or whether the other CT sources are carrying the run.
 crt.sh itself prefers a direct Postgres query over its flaky HTTP frontend when
 `psql` is available — see [Optional backends](#optional-backends-projectdiscovery--psql).
 
+**crt.sh resilience.** crt.sh is the single flakiest source in the pipeline, so it
+gets three layers of defense:
+
+- The **direct-Postgres tier is time-boxed** (8s connect / 12s total). Raw TCP to
+  port 5432 is blocked outright in some sandboxed environments — Claude Code's own
+  containers included, same restriction that affects classic WHOIS/port 43 — and a
+  blocked connect there *hangs* rather than refusing. Without a short budget that
+  first tier stalls every domain before the HTTP tier ever runs, which looks
+  exactly like "crt.sh is broken." Use `--no-pd` to skip the tier entirely.
+- The **HTTP tier alternates two query forms** across retries (`?q=%.domain` and
+  `?identity=%.domain`). Both cover the same pattern but take different paths
+  through crt.sh's backend, and in practice one returns data while the other is
+  502-ing. Retries are status-aware (429/5xx retried, other 4xx fail fast), and a
+  `200` carrying a truncated/non-JSON body is treated as a failure to retry, not
+  as an empty result.
+- **Failures are legible**: the per-attempt statuses are logged, so an empty
+  crt.sh result tells you *why* instead of vanishing silently. Cert Spotter, OTX,
+  Anubis, Wayback, and Shodan DNS continue to cover the run regardless.
+
+Note that lrecon deliberately does **not** send `exclude=expired`. It shrinks the
+result set (fewer planner timeouts) but measured against `example.com` it dropped
+77 names to 20 — and expired certificates are exactly where forgotten
+dev/staging hostnames live, which is the point of CT enumeration.
+
+**Certificate-name scoping.** CT names are matched on the label boundary, not with
+a bare suffix test: `%.example.com` legitimately returns names like
+`m.testexample.com`, and a plain `endswith()` would pull that unrelated
+third-party host into the engagement scope. Certificate `rfc822Name` subjects
+(e.g. `someone@example.com`) are dropped too — they're not hosts to scan.
+
+**Cloud storage exposure with object detail.** A public bucket is only actionable
+if you know what's *in* it, so `--buckets` parses the listing response it already
+fetched (no extra requests, no downloads) and reports:
+
+- a **direct link** to each bucket and to **every object key**, per provider
+  (S3 / GCS / Azure URL forms), so findings are one click from verification;
+- **object count, total size, and a truncation flag** when the provider capped the
+  listing;
+- **sensitive-looking objects flagged and listed first** — credentials/config
+  (`.env`, `.env.production`, `web.config`), database/source dumps (`.sql`,
+  `db.sql.gz`, `.bak`), keys and secret stores (`.pem`, `id_rsa`, `.kdbx`,
+  `.aws/credentials`), infra state (`.tfstate`, `.kubeconfig`), and archives.
+  Variant suffix forms are matched deliberately (`config.yml.bak`,
+  `settings.ini.old`), since those are the highest-value keys in practice, while
+  static assets (images, CSS, fonts, video) are not flagged.
+
+A public bucket holding sensitive-looking objects is promoted to a **critical**
+entry point (from high) and the finding names the top offending keys, so the
+entry-points table alone is enough to triage. lrecon lists but never downloads
+object contents — fetch only what your ROE permits.
+
+**Email security posture with the full records.** The report shows the **verbatim
+SPF, DMARC, and DKIM records** (and which DKIM selector matched) rather than only a
+grade, so a reviewer can audit the mechanism without re-querying DNS. Alongside the
+raw text it reports a parsed breakdown:
+
+- **SPF** — the `all` qualifier (`-`/`~`/`?`/`+`), `include:` targets, `ip4:`/`ip6:`
+  literals, `redirect=`, and the **DNS-lookup count against RFC 7208's limit of
+  10**. Exceeding it is a `permerror` that can make receivers ignore SPF entirely —
+  a real, commonly-missed finding — and the deprecated `ptr` mechanism is flagged.
+  The count **expands `include:`/`redirect=` targets**, because §4.6.4's budget
+  covers every lookup a receiver makes during the whole evaluation; counting only
+  the apex record would miss the usual cause of a real permerror (a few includes
+  that each pull in several more lookups). Expansion stops as soon as the limit is
+  passed, so a pathological record cannot fan out — an over-limit figure is
+  reported as "at least" that many. If a lookup inside an include fails, the count
+  is labelled incomplete rather than being presented as confirmed compliance.
+- **DMARC** — `p`, `sp`, `pct`, `rua`, `ruf`, `adkim`, `aspf`, `fo`, with issues
+  raised for `pct<100` (partial enforcement), `sp=none` (subdomains unprotected
+  despite an enforced `p=`), and a missing `rua=` (no aggregate reporting).
+- **DKIM** — the matched selector and its record, or the explicit list of selectors
+  probed so a "not found" reads as inconclusive rather than absent.
+
 **Unique-IP enrichment.** Enrichment runs once per distinct IP, not per subdomain.
 On CDN-fronted targets where hundreds of hosts share a few IPs this cuts API calls
 and wall time dramatically, and respects Shodan's ~1 req/s limit.

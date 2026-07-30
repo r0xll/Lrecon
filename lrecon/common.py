@@ -73,7 +73,7 @@ def log(msg: str) -> None:
 __all__ = [
     "log", "Host", "Person", "RateLimiter", "load_keys",
     "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "WEB_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
-    "non_web_ports",
+    "non_web_ports", "human_bytes",
     "_HAVE_DNS", "_HAVE_RICH", "_console",
     "Progress", "SpinnerColumn", "BarColumn", "TextColumn",
     "TimeElapsedColumn", "MofNCompleteColumn",
@@ -98,6 +98,22 @@ TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 389, 443, 445,
 # Shodan/InternetDB/naabu outside it) is a non-HTTP service the probe never
 # looks at, so it needs a human to go check it by hand.
 WEB_PORTS = {80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443}
+
+
+def human_bytes(n) -> str:
+    """Byte count as a short human-readable string ("4.2 MB"). Returns "—" for
+    None/unknown so report tables can use it directly."""
+    if n is None:
+        return "—"
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "—"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return f"{int(n)} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
 
 
 def non_web_ports(ports: list) -> list:

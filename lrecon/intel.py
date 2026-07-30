@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, ipaddress, json, re
+import asyncio, html, ipaddress, json, re
 import httpx
 from .common import *
 from .sources import get_resolver, resolve_full
@@ -163,39 +163,252 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
 # --------------------------------------------------------------------------- #
 DKIM_SELECTORS = ["default", "google", "selector1", "selector2", "k1", "dkim", "mail"]
 
+# SPF mechanisms that each cost a DNS lookup against RFC 7208 §4.6.4's limit of
+# 10. Exceeding it is a permerror — receivers may stop evaluating SPF entirely,
+# which silently undoes the whole record. `ip4:`/`ip6:`/`all` cost nothing.
+_SPF_LOOKUP_MECHANISMS = ("include:", "a:", "mx:", "ptr:", "exists:", "redirect=")
+SPF_MAX_LOOKUPS = 10
+
+
+def parse_spf(record: str | None) -> dict:
+    """Break an SPF record into the parts an operator actually reviews. Raw text
+    is always kept by the caller; this is additive structure, best-effort by
+    design — a malformed record yields empty lists rather than raising."""
+    out = {"all_qualifier": None, "includes": [], "redirect": None,
+           "ip4": [], "ip6": [], "a": [], "mx": [], "ptr": False, "exists": [],
+           "lookup_count": 0, "top_level_lookup_count": 0, "mechanisms": [],
+           "exceeds_lookup_limit": False, "lookup_count_complete": True}
+    if not record:
+        return out
+    for token in record.split():
+        low = token.lower()
+        if low == "v=spf1":
+            continue
+        out["mechanisms"].append(token)
+        if low.endswith("all") and len(low) <= 4:
+            out["all_qualifier"] = low[0] if low[0] in "+-~?" else "+"
+        elif low.startswith("include:"):
+            out["includes"].append(token.split(":", 1)[1])
+        elif low.startswith("redirect="):
+            out["redirect"] = token.split("=", 1)[1]
+        elif low.startswith("ip4:"):
+            out["ip4"].append(token.split(":", 1)[1])
+        elif low.startswith("ip6:"):
+            out["ip6"].append(token.split(":", 1)[1])
+        elif low.startswith("a:") or low == "a":
+            out["a"].append(token.split(":", 1)[1] if ":" in token else "a")
+        elif low.startswith("mx:") or low == "mx":
+            out["mx"].append(token.split(":", 1)[1] if ":" in token else "mx")
+        elif low.startswith("ptr"):
+            out["ptr"] = True
+        elif low.startswith("exists:"):
+            out["exists"].append(token.split(":", 1)[1])
+    # Bare `a` / `mx` cost a lookup too, hence counting tokens not just prefixes.
+    out["lookup_count"] = sum(
+        1 for t in out["mechanisms"]
+        if t.lower().startswith(_SPF_LOOKUP_MECHANISMS) or t.lower() in ("a", "mx", "ptr"))
+    out["top_level_lookup_count"] = out["lookup_count"]
+    # RFC 7208 §4.6.4's budget of 10 spans the *whole* evaluation, including the
+    # lookups made inside every `include:`/`redirect=` target. This function is
+    # deliberately I/O-free, so its count is complete only when the record
+    # delegates to nothing; otherwise it is a lower bound and the caller must
+    # run spf_lookup_count() to get the real figure. `exceeds_lookup_limit` is
+    # still sound either way — a top-level count already over 10 is definitely a
+    # permerror; expansion can only push a passing record over, never under.
+    out["lookup_count_complete"] = not (out["includes"] or out["redirect"])
+    out["exceeds_lookup_limit"] = out["lookup_count"] > SPF_MAX_LOOKUPS
+    return out
+
+
+async def spf_lookup_count(record: str | None, txt_lookup,
+                           max_lookups: int = SPF_MAX_LOOKUPS) -> tuple[int, bool, bool]:
+    """Total DNS lookups an SPF evaluation costs, expanding `include:`/`redirect=`.
+
+    RFC 7208 §4.6.4 caps a full evaluation at 10 lookups, counting those made
+    while evaluating referenced records. Counting only the apex record misses the
+    common real-world permerror: a handful of `include:`s that each pull in
+    several more lookups. Returns `(count, complete, exceeded)`.
+
+    `txt_lookup` is the caller's async TXT resolver returning `(records, failed)`
+    — reused rather than taking a resolver directly so this inherits the caller's
+    TCP-retry and NXDOMAIN handling, and so tests can stub it.
+
+    Termination without a visited-set: every queued target was reached through a
+    mechanism that itself cost a counted lookup, so the queue can never hold more
+    entries than `count`, and we stop the moment `count` exceeds the limit. An
+    `include:` cycle therefore ends after ~11 lookups instead of looping. Because
+    duplicate paths are counted rather than collapsed, the figure matches what a
+    receiver actually spends; a per-domain cache keeps the DNS traffic to one
+    query per distinct target.
+
+    Failure is reported, never guessed: if a TXT lookup inside the expansion
+    fails, `complete` comes back False so the caller can decline to claim
+    compliance. `exceeded=True` is definitive regardless of `complete` (the count
+    is a lower bound, so over-the-limit stays over the limit).
+    """
+    if not record:
+        return 0, True, False
+
+    count, complete = 0, True
+    cache: dict[str, str | None] = {}
+    queue = [parse_spf(record)]
+    while queue:
+        p = queue.pop(0)
+        count += p["lookup_count"]
+        if count > max_lookups:
+            # A lower bound above the cap is still a definitive permerror, so
+            # stop here rather than resolving the rest of the tree.
+            return count, False, True
+        targets = list(p["includes"]) + ([p["redirect"]] if p["redirect"] else [])
+        for target in targets:
+            norm = target.lower().rstrip(".")
+            if norm in cache:
+                sub = cache[norm]
+            else:
+                recs, failed = await txt_lookup(target)
+                if failed:
+                    complete = False
+                    cache[norm] = None
+                    continue
+                sub = next((t for t in recs if t.lower().startswith("v=spf1")), None)
+                cache[norm] = sub
+            # No SPF record at the target is itself a permerror, but the lookup
+            # that got us here is already counted and there is nothing to expand.
+            if sub:
+                queue.append(parse_spf(sub))
+    return count, complete, count > max_lookups
+
+
+def parse_dmarc(record: str | None) -> dict:
+    """Tag=value breakdown of a DMARC record (p/sp/pct/rua/ruf/adkim/aspf/fo)."""
+    out = {"p": None, "sp": None, "pct": None, "rua": [], "ruf": [],
+           "adkim": None, "aspf": None, "fo": None}
+    if not record:
+        return out
+    for part in record.split(";"):
+        if "=" not in part:
+            continue
+        tag, _, val = part.strip().partition("=")
+        tag, val = tag.strip().lower(), val.strip()
+        if tag in ("p", "sp", "adkim", "aspf", "fo"):
+            out[tag] = val.lower() if tag in ("p", "sp") else val
+        elif tag == "pct":
+            try:
+                out["pct"] = int(val)
+            except ValueError:
+                pass
+        elif tag in ("rua", "ruf"):
+            out[tag] = [u.strip() for u in val.split(",") if u.strip()]
+    return out
+
 
 async def email_security(domain: str, resolver_ns) -> dict:
+    """
+    SPF/DKIM/DMARC posture for a domain. The full verbatim records are kept
+    (`spf`, `dmarc`, `dkim_record`) alongside a parsed breakdown
+    (`spf_parsed`, `dmarc_parsed`) and the matched DKIM selector, so a reviewer
+    can audit *why* a grade was assigned without re-querying DNS.
+    """
     if not _HAVE_DNS:
         return {}
     res = get_resolver(resolver_ns)
-    out = {"domain": domain, "spf": None, "dmarc": None, "dkim": False, "issues": []}
+    out = {"domain": domain, "spf": None, "dmarc": None, "dkim": False,
+           "dkim_selector": None, "dkim_record": None,
+           "dkim_selectors_checked": list(DKIM_SELECTORS),
+           "spf_parsed": {}, "dmarc_parsed": {}, "issues": [],
+           "lookup_errors": []}
 
     async def txt(name):
-        try:
-            return ["".join(s.decode(errors="ignore") for s in rr.strings)
-                    for rr in await res.resolve(name, "TXT")]
-        except Exception:
-            return []
+        """TXT records for `name`, plus whether the lookup itself failed.
 
-    spf = next((t for t in await txt(domain) if "v=spf1" in t), None)
+        Returns (records, failed). The distinction matters for the report: an
+        apex TXT set that times out is NOT the same as a domain publishing no
+        SPF, and reporting "No SPF record" for a failed lookup would put a false
+        finding in a client deliverable.
+
+        Retries over TCP when the UDP attempt fails, because a real corporate
+        apex often carries enough SaaS verification records to exceed UDP's
+        512-byte limit — the truncated-response case, where SPF is exactly what
+        goes missing.
+        """
+        for kwargs in ({}, {"tcp": True}):
+            try:
+                answer = await res.resolve(name, "TXT", **kwargs)
+                return ["".join(s.decode(errors="ignore") for s in rr.strings)
+                        for rr in answer], False
+            except Exception as e:
+                # NXDOMAIN / NoAnswer are real "not published" answers, not
+                # failures — no point retrying those over TCP.
+                if type(e).__name__ in ("NXDOMAIN", "NoAnswer"):
+                    return [], False
+                last = e
+        out["lookup_errors"].append(f"{name} TXT: {type(last).__name__}")
+        return [], True
+
+    spf_records, spf_failed = await txt(domain)
+    spf = next((t for t in spf_records if "v=spf1" in t), None)
     out["spf"] = spf
-    if not spf:
+    out["spf_parsed"] = parse_spf(spf)
+    if not spf and spf_failed:
+        out["issues"].append("SPF lookup failed (inconclusive — DNS error, not "
+                             "confirmation that SPF is absent)")
+    elif not spf:
         out["issues"].append("No SPF record (spoofing risk)")
     elif "+all" in spf:
         out["issues"].append("SPF +all — permits any sender (critical)")
     elif "~all" not in spf and "-all" not in spf:
         out["issues"].append("SPF missing hard/soft fail (~all/-all)")
+    if spf:
+        # Expand include:/redirect= so the lookup budget is measured the way a
+        # receiver spends it. Without this the count is top-level only, and the
+        # usual real permerror — a few includes that each pull in several more
+        # lookups — goes unreported while the record looks compliant.
+        total, complete, exceeded = await spf_lookup_count(spf, txt)
+        out["spf_parsed"]["lookup_count"] = total
+        out["spf_parsed"]["lookup_count_complete"] = complete
+        out["spf_parsed"]["exceeds_lookup_limit"] = exceeded
+    if out["spf_parsed"].get("exceeds_lookup_limit"):
+        out["issues"].append(
+            f"SPF exceeds {SPF_MAX_LOOKUPS}-DNS-lookup limit "
+            f"({'≥' if not out['spf_parsed']['lookup_count_complete'] else ''}"
+            f"{out['spf_parsed']['lookup_count']}, includes expanded) — permerror, "
+            f"SPF may be ignored (risk)")
+    elif not out["spf_parsed"].get("lookup_count_complete"):
+        out["issues"].append(
+            "SPF lookup count incomplete (a DNS lookup inside an include: failed) "
+            "— cannot confirm the record stays within "
+            f"{SPF_MAX_LOOKUPS} lookups")
+    if out["spf_parsed"].get("ptr"):
+        out["issues"].append("SPF uses deprecated ptr mechanism (RFC 7208 discourages)")
 
-    dmarc = next((t for t in await txt(f"_dmarc.{domain}") if "v=DMARC1" in t), None)
+    dmarc_records, dmarc_failed = await txt(f"_dmarc.{domain}")
+    dmarc = next((t for t in dmarc_records if "v=DMARC1" in t), None)
     out["dmarc"] = dmarc
-    if not dmarc:
+    out["dmarc_parsed"] = parse_dmarc(dmarc)
+    if not dmarc and dmarc_failed:
+        out["issues"].append("DMARC lookup failed (inconclusive — DNS error, not "
+                             "confirmation that DMARC is absent)")
+    elif not dmarc:
         out["issues"].append("No DMARC record (spoofing risk)")
     elif "p=none" in dmarc:
         out["issues"].append("DMARC p=none — monitoring only, no enforcement")
+    dp = out["dmarc_parsed"]
+    if dmarc:
+        if dp.get("pct") is not None and dp["pct"] < 100:
+            out["issues"].append(
+                f"DMARC pct={dp['pct']} — policy applied to only {dp['pct']}% of mail")
+        if dp.get("sp") == "none" and dp.get("p") in ("quarantine", "reject"):
+            out["issues"].append("DMARC sp=none — subdomains unprotected despite enforced p=")
+        if not dp.get("rua"):
+            out["issues"].append("DMARC has no rua= aggregate reporting address")
 
     for sel in DKIM_SELECTORS:
-        if any("v=DKIM1" in t or "k=rsa" in t for t in await txt(f"{sel}._domainkey.{domain}")):
+        recs, _ = await txt(f"{sel}._domainkey.{domain}")
+        match = next((t for t in recs if "v=DKIM1" in t or "k=rsa" in t), None)
+        if match:
             out["dkim"] = True
+            out["dkim_selector"] = sel
+            out["dkim_record"] = match
             break
     if not out["dkim"]:
         out["issues"].append("No DKIM on common selectors (inconclusive)")
@@ -765,6 +978,81 @@ def bucket_candidates(keywords) -> list:
     return sorted(names)
 
 
+# Object keys worth calling out in a public bucket — the ones that make a
+# listing a red-team finding rather than a pile of static assets: credentials,
+# configs, source/database dumps, archives, keys/certs, infra state.
+#
+# Extensions are matched either at the end of the key OR followed by another
+# suffix, because the highest-value files in the wild are usually the *variant*
+# forms: `.env.production`, `.env.local`, `config.yml.bak`, `db.sql.gz`,
+# `settings.ini.old`. Anchoring strictly to end-of-string misses exactly those.
+_INTERESTING_OBJECT_RE = re.compile(
+    r"(\.(sql|bak|backup|dump|db|sqlite3?|env|ini|cfg|conf|config|ya?ml|pem|key|"
+    r"ppk|pfx|p12|crt|kdbx|tfstate|kubeconfig|htpasswd|ovpn|rdp|jks|keystore|"
+    r"csv|xlsx?|docx?|pst|zip|tar|t?gz|tgz|rar|7z|war|jar|old|swp|orig)"
+    r"($|[.\-_/]))|"
+    r"(password|passwd|secret|credential|token|apikey|api[-_]?key|private[-_]?key|"
+    r"\.git/|\.svn/|id_rsa|id_dsa|id_ecdsa|\.ssh/|\.aws/|\.npmrc|\.pypirc|"
+    r"backup|dump|database|shadow|kdbx)",
+    re.IGNORECASE)
+
+
+def _bucket_object_url(provider: str, name: str, key: str) -> str:
+    from urllib.parse import quote
+    path = quote(key, safe="/")
+    if provider == "s3":
+        return f"https://{name}.s3.amazonaws.com/{path}"
+    if provider == "gcs":
+        return f"https://storage.googleapis.com/{name}/{path}"
+    if provider == "azure":
+        return f"https://{name}.blob.core.windows.net/{path}"
+    return path
+
+
+def _parse_bucket_listing(provider: str, name: str, body: str) -> dict:
+    """Pull object keys/sizes out of a public bucket's listing XML so the
+    report can show *what* is exposed, with direct links — read-only, from the
+    listing response already in hand (no extra requests). S3 and GCS share the
+    <Contents><Key>/<Size> shape; Azure uses <Blob><Name>/<Content-Length>.
+    Returns {objects, object_count, interesting, bytes, truncated}; objects is
+    capped for display, interesting keeps the security-relevant keys."""
+    if provider == "azure":
+        blocks = re.findall(r"<Blob>(.*?)</Blob>", body, re.DOTALL)
+        key_re, size_re = r"<Name>(.*?)</Name>", r"<Content-Length>(\d+)</Content-Length>"
+        truncated = bool(re.search(r"<NextMarker>\s*\S", body))
+    else:
+        blocks = re.findall(r"<Contents>(.*?)</Contents>", body, re.DOTALL)
+        key_re, size_re = r"<Key>(.*?)</Key>", r"<Size>(\d+)</Size>"
+        truncated = "<IsTruncated>true</IsTruncated>" in body
+
+    objects = []
+    total_bytes = 0
+    for blk in blocks:
+        km = re.search(key_re, blk, re.DOTALL)
+        if not km:
+            continue
+        # The listing is XML, so metacharacters in a real key arrive escaped:
+        # an object named `R&D.sql` comes back as `R&amp;D.sql`. Decode once here,
+        # before the placeholder test, the interesting-key regex and the URL
+        # build — otherwise the link is percent-encoded from the *escaped* text
+        # (`R%26amp%3BD.sql`, a 404) and an entity mid-name can hide a sensitive
+        # suffix from the regex. Strip before unescaping so that insignificant
+        # XML whitespace goes but a deliberately encoded space (`&#32;`) stays.
+        key = html.unescape(km.group(1).strip())
+        if not key or key.endswith("/"):        # skip Azure/GCS folder placeholders
+            continue
+        sm = re.search(size_re, blk)
+        size = int(sm.group(1)) if sm else None
+        if size:
+            total_bytes += size
+        objects.append({"key": key, "url": _bucket_object_url(provider, name, key),
+                        "size": size, "interesting": bool(_INTERESTING_OBJECT_RE.search(key))})
+
+    interesting = [o for o in objects if o["interesting"]][:50]
+    return {"object_count": len(objects), "objects": objects[:100],
+            "interesting": interesting, "bytes": total_bytes, "truncated": truncated}
+
+
 async def bucket_enum(client, keywords) -> list:
     out = []
     names = bucket_candidates(keywords)
@@ -784,8 +1072,13 @@ async def bucket_enum(client, keywords) -> list:
                         public = r.status_code == 200 and ("<ListBucketResult" in r.text
                                                            or "<EnumerationResults" in r.text
                                                            or "<Contents" in r.text)
-                        out.append({"name": name, "provider": provider, "url": url,
-                                    "status": r.status_code, "public": public})
+                        entry = {"name": name, "provider": provider, "url": url,
+                                 "status": r.status_code, "public": public}
+                        if public:
+                            # Parse the listing we already fetched so the report
+                            # can surface the exposed files + direct links.
+                            entry.update(_parse_bucket_listing(provider, name, r.text))
+                        out.append(entry)
                 except Exception:
                     pass
     await asyncio.gather(*(check(n) for n in names))
@@ -879,8 +1172,23 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
 
     for b in buckets:
         if b["public"]:
-            out.append({"type": "public-bucket", "target": b["name"], "severity": "high",
-                       "summary": f"{b['provider']} bucket publicly listable at {b['url']}",
+            # Fold the listing detail into the finding so the entry-points
+            # table alone is actionable — an operator shouldn't have to
+            # cross-reference the Cloud-storage section to know whether a
+            # public bucket holds credentials or just static assets.
+            n_obj = b.get("object_count")
+            obj_note = ""
+            if n_obj:
+                obj_note = f", {n_obj} object(s)" + ("+ (truncated)" if b.get("truncated") else "")
+            interesting = b.get("interesting") or []
+            if interesting:
+                keys = ", ".join(o["key"] for o in interesting[:5])
+                more = f" +{len(interesting) - 5} more" if len(interesting) > 5 else ""
+                obj_note += f" — sensitive-looking: {keys}{more}"
+            sev = "critical" if interesting else "high"
+            out.append({"type": "public-bucket", "target": b["name"], "severity": sev,
+                       "summary": f"{b['provider']} bucket publicly listable at "
+                                  f"{b['url']}{obj_note}",
                        "attck": "T1530"})
 
     for n in (nuclei or []):

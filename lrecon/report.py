@@ -3,10 +3,46 @@ import asyncio, csv, json
 from datetime import datetime, timezone
 from pathlib import Path
 from .common import *
+from .intel import DKIM_SELECTORS, SPF_MAX_LOOKUPS
 
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
+def _md_code(value) -> str:
+    """A DNS record as inline Markdown code, safe inside a table cell: records
+    can contain `|` (rare) and are long enough to need the pipe escaped so the
+    row doesn't break. Missing records render as an em dash, not empty."""
+    if not value:
+        return "— *(not published)*"
+    return "`" + str(value).replace("|", "\\|") + "`"
+
+
+def _spf_lookups(sp: dict) -> tuple[str, str, str]:
+    """`(count, caveat, level)` for the SPF DNS-lookup budget, where `level` is
+    `"bad"` for a confirmed permerror, `"warn"` for a caveat that blocks a
+    compliance claim, and `""` for a clean count.
+
+    RFC 7208 §4.6.4's limit of 10 covers the lookups made inside every
+    `include:`/`redirect=` target, so the figure is only meaningful with the
+    caveat attached: a bare `n/10` would claim a complete accounting even when a
+    nested lookup failed or expansion stopped early at the limit.
+    """
+    n = sp.get("lookup_count", 0)
+    complete = sp.get("lookup_count_complete", True)
+    exceeded = bool(sp.get("exceeds_lookup_limit"))
+    # Counting stops as soon as the cap is passed, so an over-limit figure is a
+    # lower bound — definitive as a verdict, but mark the number as "at least".
+    count = f"{'≥' if exceeded and not complete else ''}{n}/{SPF_MAX_LOOKUPS}"
+    if exceeded:
+        return count, "exceeds limit (permerror)", "bad"
+    if not complete:
+        return count, "incomplete — an include: lookup failed, compliance unconfirmed", "warn"
+    if sp.get("includes") or sp.get("redirect"):
+        return count, "includes expanded", ""
+    return count, "", ""
+
+
+
 def write_csv(hosts, path) -> int:
     """
     Flat target list for client scope confirmation — one row per
@@ -352,24 +388,109 @@ def write_markdown(hosts, domains, res, path) -> None:
     buckets = res.get("buckets") or []
     if buckets:
         lines += ["## Cloud storage exposure", "",
-                  "| Bucket | Provider | Status | Public listing |", "|---|---|---|---|"]
+                  "| Bucket | Provider | Status | Public listing | Objects | Sensitive | Size |",
+                  "|---|---|---|---|---|---|---|"]
         for b in sorted(buckets, key=lambda x: not x["public"]):
-            lines.append(f"| {b['name']} | {b['provider']} | {b['status']} | "
-                         f"{'YES' if b['public'] else 'no'} |")
+            n_obj = b.get("object_count")
+            n_int = len(b.get("interesting") or [])
+            objs = (f"{n_obj}{'+' if b.get('truncated') else ''}"
+                    if n_obj is not None else "—")
+            lines.append(f"| [{b['name']}]({b['url']}) | {b['provider']} | {b['status']} | "
+                         f"{'YES' if b['public'] else 'no'} | {objs} | "
+                         f"{n_int or '—'} | {human_bytes(b.get('bytes')) if b.get('bytes') else '—'} |")
+
+        # Per-bucket object detail — the actual red-team payload of this
+        # section: direct links to what is exposed, sensitive-looking files
+        # first, so the operator can triage without re-enumerating by hand.
+        for b in [x for x in buckets if x.get("public") and x.get("objects")]:
+            lines += ["", f"### `{b['name']}` ({b['provider']}) — "
+                          f"{b.get('object_count', 0)} object(s)"
+                          f"{', listing truncated by the provider' if b.get('truncated') else ''}", "",
+                      f"Listing: <{b['url']}>", ""]
+            interesting = b.get("interesting") or []
+            if interesting:
+                lines += ["**Sensitive-looking objects** (credentials/config/dumps/keys):", ""]
+                for o in interesting[:25]:
+                    lines.append(f"- [`{o['key']}`]({o['url']}) — {human_bytes(o.get('size'))}")
+                if len(interesting) > 25:
+                    lines.append(f"- …and {len(interesting) - 25} more")
+                lines.append("")
+            others = [o for o in b["objects"] if not o.get("interesting")]
+            if others:
+                lines += [f"<details><summary>Other objects ({len(others)})</summary>", ""]
+                for o in others[:50]:
+                    lines.append(f"- [`{o['key']}`]({o['url']}) — {human_bytes(o.get('size'))}")
+                if len(others) > 50:
+                    lines.append(f"- …and {len(others) - 50} more")
+                lines += ["", "</details>", ""]
+
         if any(b["public"] for b in buckets):
-            lines += ["", "> Public-listable buckets are a data-exposure finding — "
-                      "enumerate contents (read-only) to assess sensitivity per ROE.", ""]
+            lines += ["", "> Public-listable buckets are a data-exposure finding. Object links "
+                      "above come from the bucket's own listing response — lrecon does not "
+                      "download contents; fetch only what your ROE permits.", ""]
         else:
             lines.append("")
 
     email = res.get("email") or {}
     if email:
-        lines += ["## Email security posture", "",
-                  "| Domain | Grade | Issues |", "|---|---|---|"]
+        lines += ["## Email security posture", ""]
         for d, e in email.items():
-            issues = "; ".join(e.get("issues", [])) or "none"
-            lines.append(f"| {d} | {e.get('grade','?')} | {issues} |")
-        lines += ["", "> SPF/DKIM/DMARC gaps enable email spoofing and strengthen "
+            sp = e.get("spf_parsed") or {}
+            dp = e.get("dmarc_parsed") or {}
+            lines += [f"### {d} — **{e.get('grade','?')}**", ""]
+
+            # Verbatim records first: the evidence a reviewer audits.
+            lines += ["| Mechanism | Record |", "|---|---|"]
+            lines.append(f"| SPF | {_md_code(e.get('spf'))} |")
+            lines.append(f"| DMARC | {_md_code(e.get('dmarc'))} |")
+            dkim_label = (f"DKIM (`{e['dkim_selector']}`)" if e.get("dkim_selector") else "DKIM")
+            lines.append(f"| {dkim_label} | {_md_code(e.get('dkim_record'))} |")
+            lines.append("")
+
+            # Parsed breakdown — the analysis on top of the raw records.
+            if e.get("spf"):
+                q = sp.get("all_qualifier")
+                qual = {"-": "-all (hard fail)", "~": "~all (soft fail)",
+                        "?": "?all (neutral)", "+": "+all (pass-any!)"}.get(q, "no all mechanism")
+                lk_count, lk_caveat, lk_level = _spf_lookups(sp)
+                lines += [f"- **SPF policy:** {qual}",
+                          f"- **SPF DNS lookups:** {lk_count}"
+                          + (f"  ⚠️ {lk_caveat}" if lk_level
+                             else f" *({lk_caveat})*" if lk_caveat else ""),
+                          f"- **SPF includes ({len(sp.get('includes') or [])}):** "
+                          + (", ".join(f"`{i}`" for i in sp["includes"]) if sp.get("includes") else "none")]
+                if sp.get("ip4") or sp.get("ip6"):
+                    nets = (sp.get("ip4") or []) + (sp.get("ip6") or [])
+                    lines.append(f"- **SPF IP literals ({len(nets)}):** "
+                                 + ", ".join(f"`{n}`" for n in nets[:12])
+                                 + (f" +{len(nets) - 12} more" if len(nets) > 12 else ""))
+                if sp.get("redirect"):
+                    lines.append(f"- **SPF redirect:** `{sp['redirect']}`")
+            if e.get("dmarc"):
+                lines += [f"- **DMARC policy:** `p={dp.get('p') or '?'}`"
+                          + (f", `sp={dp['sp']}`" if dp.get("sp") else "")
+                          + (f", `pct={dp['pct']}`" if dp.get("pct") is not None else "")
+                          + (f", `adkim={dp['adkim']}`" if dp.get("adkim") else "")
+                          + (f", `aspf={dp['aspf']}`" if dp.get("aspf") else ""),
+                          f"- **DMARC aggregate reports (rua):** "
+                          + (", ".join(f"`{u}`" for u in dp["rua"]) if dp.get("rua") else "none")]
+            if not e.get("dkim"):
+                lines.append(f"- **DKIM:** not found on common selectors "
+                             f"({', '.join(e.get('dkim_selectors_checked') or DKIM_SELECTORS)}) "
+                             f"— inconclusive, a custom selector may exist")
+            lines.append("")
+
+            issues = e.get("issues") or []
+            lines += ["**Issues:**", ""]
+            lines += [f"- {i}" for i in issues] if issues else ["- none"]
+            lines.append("")
+            if e.get("lookup_errors"):
+                lines += [f"> DNS lookups failed for this domain "
+                          f"({'; '.join(e['lookup_errors'])}) — the affected mechanisms are "
+                          f"**inconclusive**, not confirmed absent. Re-run with "
+                          f"`--resolvers` pointing at a resolver that can return large "
+                          f"TXT sets before reporting these as findings.", ""]
+        lines += ["> SPF/DKIM/DMARC gaps enable email spoofing and strengthen "
                   "phishing pretext (relevant if the SOW covers social engineering).", ""]
 
     fp = res.get("favicon_pivots") or {}
@@ -710,23 +831,118 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- Cloud storage exposure ----
     if buckets:
-        rows = "".join(
-            f'<tr><td>{esc(b["name"])}</td><td>{esc(b["provider"])}</td><td>{esc(b["status"])}</td>'
-            f'<td>{"YES" if b["public"] else "no"}</td></tr>'
-            for b in sorted(buckets, key=lambda x: not x["public"]))
+        def _bucket_row(b):
+            n_obj = b.get("object_count")
+            n_int = len(b.get("interesting") or [])
+            objs = f'{n_obj}{"+" if b.get("truncated") else ""}' if n_obj is not None else "—"
+            pub = ('<strong class="bad">YES</strong>' if b["public"] else "no")
+            sens = f'<strong class="bad">{n_int}</strong>' if n_int else "—"
+            return (f'<tr><td><a href="{esc(b["url"])}" target="_blank" rel="noopener">'
+                    f'{esc(b["name"])}</a></td>'
+                    f'<td>{esc(b["provider"])}</td><td>{esc(b["status"])}</td>'
+                    f'<td>{pub}</td><td>{objs}</td><td>{sens}</td>'
+                    f'<td>{esc(human_bytes(b.get("bytes")) if b.get("bytes") else None)}</td></tr>')
+
+        rows = "".join(_bucket_row(b) for b in sorted(buckets, key=lambda x: not x["public"]))
         body = (f'{_html_export_button("t-buckets", "buckets.csv")}'
+                f'<div style="overflow-x:auto">'
                 f'<table id="t-buckets"><tr><th>Bucket</th><th>Provider</th><th>Status</th>'
-                f'<th>Public listing</th></tr>{rows}</table>')
+                f'<th>Public listing</th><th>Objects</th><th>Sensitive</th><th>Size</th></tr>'
+                f'{rows}</table></div>')
+
+        # Per-bucket object detail with direct links — sensitive-looking files
+        # flagged and listed first.
+        for b in [x for x in buckets if x.get("public") and x.get("objects")]:
+            def _obj_row(o):
+                flag = ' <span class="badge">sensitive</span>' if o.get("interesting") else ""
+                return (f'<tr><td><a href="{esc(o["url"])}" target="_blank" rel="noopener">'
+                        f'<code>{esc(o["key"])}</code></a>{flag}</td>'
+                        f'<td>{esc(human_bytes(o.get("size")))}</td></tr>')
+            ordered = ((b.get("interesting") or [])
+                       + [o for o in b["objects"] if not o.get("interesting")])
+            obj_rows = "".join(_obj_row(o) for o in ordered[:150])
+            more = (f'<p class="note">Showing {min(len(ordered), 150)} of '
+                    f'{b.get("object_count", len(ordered))} object(s)'
+                    f'{" — listing truncated by the provider" if b.get("truncated") else ""}.</p>'
+                    if len(ordered) > 150 or b.get("truncated") else "")
+            body += (f'<h4>{esc(b["name"])} <span class="count">'
+                     f'{b.get("object_count", 0)}</span></h4>'
+                     f'<p class="note">Listing: <a href="{esc(b["url"])}" target="_blank" '
+                     f'rel="noopener">{esc(b["url"])}</a></p>'
+                     f'<div style="overflow-x:auto"><table><tr><th>Object</th><th>Size</th></tr>'
+                     f'{obj_rows}</table></div>{more}')
+
+        if any(b["public"] for b in buckets):
+            body += ('<p class="note">Object links come from each bucket\'s own listing '
+                     'response — lrecon does not download contents; fetch only what your '
+                     'ROE permits.</p>')
         sections.append(_html_section("buckets", "Cloud storage exposure", len(buckets), body))
 
     # ---- Email security posture ----
     if email:
-        rows = "".join(
-            f'<tr><td>{esc(d)}</td><td>{esc(e.get("grade"))}</td>'
-            f'<td>{esc("; ".join(e.get("issues", [])) or "none")}</td></tr>'
-            for d, e in email.items())
-        body = (f'<table id="t-email"><tr><th>Domain</th><th>Grade</th><th>Issues</th></tr>{rows}</table>'
-                f'<p class="note">SPF/DKIM/DMARC gaps enable email spoofing.</p>')
+        body = ""
+        for d, e in email.items():
+            sp = e.get("spf_parsed") or {}
+            dp = e.get("dmarc_parsed") or {}
+            grade = e.get("grade") or "?"
+            grade_cls = "bad" if grade == "FAIL" else ("warn" if grade == "WARN" else "good")
+
+            def _rec(label, value):
+                shown = (f'<code>{esc(value)}</code>' if value
+                         else '<em>— not published</em>')
+                return f'<tr><td>{label}</td><td style="word-break:break-all">{shown}</td></tr>'
+
+            dkim_label = ("DKIM (<code>%s</code>)" % esc(e["dkim_selector"])
+                          if e.get("dkim_selector") else "DKIM")
+            recs = (_rec("SPF", e.get("spf")) + _rec("DMARC", e.get("dmarc"))
+                    + _rec(dkim_label, e.get("dkim_record")))
+
+            details = []
+            if e.get("spf"):
+                q = sp.get("all_qualifier")
+                qual = {"-": "-all (hard fail)", "~": "~all (soft fail)",
+                        "?": "?all (neutral)", "+": "+all (pass-any!)"}.get(q, "no all mechanism")
+                lk_count, lk_caveat, lk_level = _spf_lookups(sp)
+                lk_txt = esc(lk_count)
+                if lk_level:
+                    lk_txt = (f'<strong class="{lk_level}">{lk_txt} — '
+                              f'{esc(lk_caveat)}</strong>')
+                elif lk_caveat:
+                    lk_txt = f'{lk_txt} <span class="note">({esc(lk_caveat)})</span>'
+                inc = sp.get("includes") or []
+                inc_txt = (f"SPF includes ({len(inc)}): "
+                           + ", ".join(f"<code>{esc(i)}</code>" for i in inc)
+                           if inc else "SPF includes: none")
+                details += [f"SPF policy: {esc(qual)}", f"SPF DNS lookups: {lk_txt}", inc_txt]
+            if e.get("dmarc"):
+                pol = f"<code>p={esc(dp.get('p') or '?')}</code>"
+                for tag in ("sp", "pct", "adkim", "aspf"):
+                    if dp.get(tag) is not None:
+                        pol += f" <code>{tag}={esc(dp[tag])}</code>"
+                details.append(f"DMARC policy: {pol}")
+                details.append("DMARC rua: " + (", ".join(f"<code>{esc(u)}</code>"
+                                                          for u in dp["rua"])
+                                                if dp.get("rua") else "none"))
+            if not e.get("dkim"):
+                details.append("DKIM: not found on common selectors ("
+                               + esc(", ".join(e.get("dkim_selectors_checked")
+                                               or DKIM_SELECTORS))
+                               + ") — inconclusive")
+            issues = e.get("issues") or []
+            body += (f'<h4>{esc(d)} <span class="{grade_cls}">{esc(grade)}</span></h4>'
+                     f'<div style="overflow-x:auto"><table><tr><th>Mechanism</th>'
+                     f'<th>Record</th></tr>{recs}</table></div>'
+                     + ("<ul>" + "".join(f"<li>{x}</li>" for x in details) + "</ul>"
+                        if details else "")
+                     + "<p><strong>Issues:</strong></p><ul>"
+                     + ("".join(f"<li>{esc(i)}</li>" for i in issues)
+                        if issues else "<li>none</li>")
+                     + "</ul>"
+                     + (f'<p class="note">DNS lookups failed '
+                        f'({esc("; ".join(e["lookup_errors"]))}) — the affected mechanisms '
+                        f'are <strong>inconclusive</strong>, not confirmed absent.</p>'
+                        if e.get("lookup_errors") else ""))
+        body += '<p class="note">SPF/DKIM/DMARC gaps enable email spoofing.</p>'
         sections.append(_html_section("email", "Email security posture", len(email), body))
 
     # ---- Favicon pivots ----
@@ -843,6 +1059,13 @@ tr:nth-child(even) {{ background: #fafafa; }}
 .sev-info {{ background: #bdc3c7; color: #333; }}
 .portflag {{ background: #e67e22; color: #fff; padding: 0 5px; border-radius: 3px;
             font-weight: 600; cursor: help; }}
+.bad {{ color: #c0392b; }}
+.warn {{ color: #e67e22; }}
+.good {{ color: #1e8449; }}
+h4 {{ margin: 1.1rem 0 .4rem; font-size: 14px; }}
+.badge {{ display: inline-block; background: #c0392b; color: #fff; padding: 0 5px;
+         border-radius: 3px; font-size: 10px; font-weight: 700; margin-left: .3rem;
+         text-transform: uppercase; letter-spacing: .02em; }}
 @media (prefers-color-scheme: dark) {{
   :root {{ color-scheme: dark; }}
   body {{ background: #16181c; color: #e6e6e6; }}
@@ -862,6 +1085,9 @@ tr:nth-child(even) {{ background: #fafafa; }}
   code {{ background: #2a2d33; }}
   tr:nth-child(even) {{ background: #1c1f24; }}
   .note {{ color: #aaa; }}
+  .bad {{ color: #ff8a80; }}
+  .warn {{ color: #ffb74d; }}
+  .good {{ color: #81c784; }}
 }}
 @media print {{
   .toolbar {{ display: none; }}

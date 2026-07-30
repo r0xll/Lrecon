@@ -152,7 +152,10 @@ async def run(domains, args, keys) -> list:
         breakdown = "  ".join(f"{s}={per_source[s]}" for s in sorted(per_source)) or "none"
         log(f"[+] {len(hosts)} unique subdomains  |  by source: {breakdown}")
         if per_source.get("crtsh", 0) == 0:
-            log("[!] crt.sh returned 0 (down/rate-limited?) — other CT sources covering")
+            log("[!] crt.sh returned 0 — its frontend 502s/times out intermittently under "
+                "load; both query forms were retried (see the crt.sh lines above for the "
+                "per-attempt statuses). Other CT sources (certspotter/OTX) cover this; "
+                "--no-pd skips the direct-Postgres tier if it is being slow.")
 
         # ---- VirusTotal domain intelligence (opt-in --vt; needs VT key) ----
         # Explicit flag even with a key configured — VT's free tier is
