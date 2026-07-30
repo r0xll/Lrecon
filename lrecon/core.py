@@ -487,7 +487,7 @@ async def run(domains, args, keys) -> list:
         email = {}
         if not args.passive_only:
             for d in domains:
-                email[d] = await email_security(d, ns)
+                email[d] = await email_security(d, ns, client)
                 g = email[d].get("grade")
                 if g:
                     log(f"[+] email {d}: {g} ({len(email[d].get('issues', []))} issue(s))")
@@ -516,6 +516,33 @@ async def run(domains, args, keys) -> list:
                             f"{len(unmanaged)} unrecognized host(s) — review")
                     else:
                         log(f"[!] mail infra {d}: no managed provider recognized — possible self-hosted MTA")
+
+        # ---- DNS zone transfer (AXFR) ----
+        # One query per authoritative nameserver, reusing the NS list the DNS
+        # snapshot above already collected. A server that answers hands over
+        # every internal name in the zone at once, so this is critical when it
+        # lands — and cheap when it doesn't.
+        axfr = {}
+        if not args.passive_only:
+            for d in domains:
+                ns_names = (dns_records.get(d) or {}).get("ns") or []
+                result = await zone_transfer(d, ns_names, ns)
+                axfr[d] = result
+                if result["transferred"]:
+                    total = sum(result["transferred"].values())
+                    log(f"[!] AXFR {d}: zone transfer ALLOWED by "
+                        f"{', '.join(result['transferred'])} — {total} record(s) "
+                        f"disclosed (critical)")
+                elif result["refused"] and not result["errors"]:
+                    log(f"[+] AXFR {d}: refused by all {len(result['refused'])} "
+                        f"nameserver(s) — correctly restricted")
+                elif result["refused"] or result["errors"]:
+                    # Never call an unreachable nameserver a refusal: that would
+                    # report a blocked network path as a clean result.
+                    parts = ([f"{len(result['refused'])} refused"] if result["refused"] else []) \
+                        + ([f"{len(result['errors'])} unreachable"] if result["errors"] else [])
+                    log(f"[!] AXFR {d}: {', '.join(parts)} — inconclusive for the "
+                        f"unreachable one(s), not evidence that transfers are refused")
 
         gh_limiter = RateLimiter(per_second=0.2)              # code search ~10/min; shared below
         github_findings = []
@@ -673,6 +700,7 @@ async def run(domains, args, keys) -> list:
     # not-passive-only and uses probe_client (self-signed certs common on
     # auth endpoints). Feeds both entry_points and the dossier.
     auth_surfaces = []
+    security_txts = []
     if not args.passive_only:
         live = [h for h in host_list if h.http_status and not h.wildcard]
         results = await asyncio.gather(*[auth_surface(probe_client, h.subdomain) for h in live])
@@ -681,9 +709,21 @@ async def run(domains, args, keys) -> list:
             idps = ", ".join(sorted({a.get("idp") or "unknown" for a in auth_surfaces}))
             log(f"[+] auth-surface: {len(auth_surfaces)} host(s) expose OIDC/SSO discovery ({idps})")
 
+        # security.txt (RFC 9116) on the same live hosts — a file published
+        # deliberately, so this is discovery. It names the disclosure channel a
+        # report should go to, and its Policy/Canonical URLs often point at
+        # hosts nothing else surfaced.
+        st = await asyncio.gather(*[security_txt(probe_client, h.subdomain) for h in live])
+        security_txts = [s for s in st if s]
+        if security_txts:
+            n_expired = sum(1 for s in security_txts if s.get("expired"))
+            log(f"[+] security.txt: {len(security_txts)} host(s) publish one"
+                + (f", {n_expired} expired" if n_expired else ""))
+
     # ---- Entry-point summary (red-team signal: what to chase first) ----
     entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings,
-                                          nuclei, dorks, auth_surfaces, whois=whois)
+                                          nuclei, dorks, auth_surfaces, whois=whois,
+                                          axfr=axfr)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
@@ -702,6 +742,7 @@ async def run(domains, args, keys) -> list:
             "breach": breach, "asn": asn_info, "favicon_pivots": favicon_pivots,
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
-            "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs}
+            "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs,
+            "axfr": axfr, "security_txt": security_txts}
 
 

@@ -1351,6 +1351,319 @@ async def test_email_security_flags_pct_sp_and_missing_rua(monkeypatch):
     assert "rua=" in joined
 
 
+# --------------------------------------------------------------------------- #
+# SMTP transport security (MTA-STS / TLS-RPT)
+# --------------------------------------------------------------------------- #
+def _email_zone(spf="v=spf1 -all", extra=None):
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord(spf)],
+        ("_dmarc.x.test", "TXT"): [_FakeTXTRecord("v=DMARC1; p=reject; rua=mailto:d@x.test")],
+        ("default._domainkey.x.test", "TXT"): [_FakeTXTRecord("v=DKIM1; p=k")],
+    }
+    answers.update(extra or {})
+    return answers
+
+
+class _PolicyClient:
+    """Serves (or refuses) the MTA-STS policy file."""
+    def __init__(self, body=None, status=200):
+        self.body, self.status, self.calls = body, status, []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        if self.body is None:
+            raise Exception("unreachable")
+        return _FakeRespText(self.status, self.body)
+
+
+async def test_email_security_reads_mta_sts_and_tls_rpt(monkeypatch):
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=20260101")],
+        ("_smtp._tls.x.test", "TXT"): [_FakeTXTRecord("v=TLSRPTv1; rua=mailto:t@x.test")],
+    })
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    client = _PolicyClient("version: STSv1\nmode: enforce\nmx: mail.x.test\nmax_age: 604800\n")
+    out = await intel.email_security("x.test", None, client)
+    assert out["mta_sts"].startswith("v=STSv1")
+    assert out["tls_rpt"].startswith("v=TLSRPTv1")
+    assert out["mta_sts_mode"] == "enforce"
+    assert out["mta_sts_policy"]["mx"] == ["mail.x.test"]
+    assert client.calls == ["https://mta-sts.x.test/.well-known/mta-sts.txt"]
+    assert out["grade"] == "PASS" and out["issues"] == []
+
+
+async def test_email_security_absent_mta_sts_is_reported_not_raised_as_an_issue(monkeypatch):
+    """Most domains publish no MTA-STS. Treating that as an issue would push
+    nearly every domain to WARN and make the grade meaningless, so absence is a
+    field, not a finding."""
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(_email_zone()))
+    out = await intel.email_security("x.test", None, _PolicyClient())
+    assert out["mta_sts"] is None and out["tls_rpt"] is None
+    assert not any("MTA-STS" in i for i in out["issues"])
+    assert out["grade"] == "PASS"
+
+
+async def test_email_security_flags_published_but_broken_mta_sts(monkeypatch):
+    """A record with no reachable policy file *is* a misconfiguration: senders
+    fall back to strippable opportunistic TLS."""
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None, _PolicyClient(body=None))
+    assert out["mta_sts_policy"] is None
+    assert any("policy file is unreachable" in i for i in out["issues"])
+    assert out["grade"] == "WARN"
+
+
+async def test_email_security_flags_non_enforcing_mta_sts_modes(monkeypatch):
+    for mode, phrase in (("testing", "mode=testing"), ("none", "mode=none")):
+        answers = _email_zone(extra={
+            ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+        monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+        out = await intel.email_security(
+            "x.test", None, _PolicyClient(f"version: STSv1\nmode: {mode}\n"))
+        assert out["mta_sts_mode"] == mode
+        assert any(phrase in i for i in out["issues"]), mode
+
+
+async def test_email_security_without_a_client_skips_the_policy_fetch(monkeypatch):
+    """The client is optional so callers that only want DNS keep working."""
+    answers = _email_zone(extra={
+        ("_mta-sts.x.test", "TXT"): [_FakeTXTRecord("v=STSv1; id=1")]})
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    assert out["mta_sts"].startswith("v=STSv1")
+    assert out["mta_sts_policy"] is None and out["mta_sts_mode"] is None
+    assert not any("MTA-STS" in i for i in out["issues"])   # nothing was checked
+
+
+def test_mta_sts_report_wording_covers_every_state():
+    assert "not published" in report._mta_sts_text({})
+    assert "unreachable" in report._mta_sts_text({"mta_sts": "v=STSv1"})
+    enforce = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": {"mode": "enforce"},
+                                    "mta_sts_mode": "enforce"})
+    assert "enforce" in enforce and "must use validated TLS" in enforce
+    testing = report._mta_sts_text({"mta_sts": "v=STSv1", "mta_sts_policy": {"mode": "testing"},
+                                    "mta_sts_mode": "testing"})
+    assert "not enforcing" in testing
+
+
+def test_md_emph_to_html_renders_shared_wording_safely():
+    """Both writers share one MTA-STS string, so the converter must handle its
+    markup and escape everything else."""
+    assert report._md_emph_to_html("a **bold** and `code`") == \
+        "a <strong>bold</strong> and <code>code</code>"
+    assert report._md_emph_to_html("<script>x</script>") == \
+        "&lt;script&gt;x&lt;/script&gt;"
+    assert report._md_emph_to_html("**<b>**") == "<strong>&lt;b&gt;</strong>"
+
+
+# --------------------------------------------------------------------------- #
+# DNS zone transfer (AXFR)
+# --------------------------------------------------------------------------- #
+class _NSResolver:
+    """Resolves nameserver hostnames to IPs; unknown names fail."""
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+    async def resolve(self, name, rtype, **kwargs):
+        if rtype == "A" and name in self.mapping:
+            return [self.mapping[name]]
+        raise Exception(f"no {rtype} for {name}")
+
+
+class _FakeZone:
+    """Stands in for dns.zone.Zone — nodes are relative labels."""
+    def __init__(self, origin):
+        self.origin, self.nodes = origin, {}
+
+
+def _patch_xfr(monkeypatch, nodes_by_ip=None, raises=None):
+    """Patch dnspython's AXFR entry point. `nodes_by_ip` populates the zone for
+    a server that allows the transfer; `raises` simulates refusal/timeout."""
+    monkeypatch.setattr(intel, "_HAVE_XFR", True)
+    monkeypatch.setattr(intel.dns.zone, "Zone", _FakeZone)
+    monkeypatch.setattr(intel.dns.message, "make_query", lambda *a, **k: object())
+
+    async def fake_xfr(where, zone, query, **kwargs):
+        if raises and where in raises:
+            raise raises[where]
+        for label in (nodes_by_ip or {}).get(where, []):
+            zone.nodes[_Label(label)] = object()
+    monkeypatch.setattr(intel.dns.asyncquery, "inbound_xfr", fake_xfr)
+
+
+class _Label:
+    def __init__(self, text):
+        self._t = text
+
+    def to_text(self):
+        return self._t
+
+    def __hash__(self):
+        return hash(self._t)
+
+    def __eq__(self, other):
+        return isinstance(other, _Label) and other._t == self._t
+
+
+async def test_zone_transfer_reports_a_successful_axfr(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver",
+                        lambda ns: _NSResolver({"ns1.x.test": "10.0.0.1"}))
+    _patch_xfr(monkeypatch, nodes_by_ip={"10.0.0.1": ["@", "www", "internal-vpn"]})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["transferred"] == {"ns1.x.test": 3}
+    assert out["records"] == ["internal-vpn.x.test", "www.x.test", "x.test"]
+    assert out["errors"] == {} and out["truncated"] is False
+
+
+class TransferError(Exception):
+    """Stands in for dns.query.TransferError — the server answered and declined."""
+
+
+class Timeout(Exception):
+    """Stands in for dns.exception.Timeout — no answer at all."""
+
+
+async def test_zone_transfer_separates_refusal_from_unreachable(monkeypatch):
+    """A server that answers and declines is correctly configured; one we never
+    reached tells us nothing. Folding the second into the first would report a
+    blocked network path as "transfers refused" — a false negative on a critical
+    check, and exactly what a live run against Cloudflare-hosted NS produces."""
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _NSResolver(
+        {"ns1.x.test": "10.0.0.1", "ns2.x.test": "10.0.0.2"}))
+    _patch_xfr(monkeypatch, raises={"10.0.0.1": TransferError("REFUSED"),
+                                    "10.0.0.2": Timeout("blocked")})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test", "ns2.x.test"], None)
+    assert out["transferred"] == {}
+    assert set(out["attempted"]) == {"ns1.x.test", "ns2.x.test"}
+    assert out["refused"] == {"ns1.x.test": "TransferError"}
+    assert out["errors"] == {"ns2.x.test": "Timeout"}
+
+
+async def test_zone_transfer_unknown_failure_is_inconclusive_not_a_refusal(monkeypatch):
+    """Default to "we don't know" for an unrecognised exception: claiming a
+    refusal we can't prove is the dangerous direction."""
+    monkeypatch.setattr(intel, "get_resolver",
+                        lambda ns: _NSResolver({"ns1.x.test": "10.0.0.1"}))
+    _patch_xfr(monkeypatch, raises={"10.0.0.1": Exception("something odd")})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["refused"] == {}
+    assert out["errors"] == {"ns1.x.test": "Exception"}
+
+
+async def test_zone_transfer_unresolvable_nameserver_is_an_error_not_a_pass(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _NSResolver({}))
+    _patch_xfr(monkeypatch)
+    out = await intel.zone_transfer("x.test", ["ghost.x.test"], None)
+    assert out["attempted"] == []
+    assert out["errors"] == {"ghost.x.test": "nameserver did not resolve"}
+
+
+async def test_zone_transfer_caps_stored_records_but_keeps_the_exact_count(monkeypatch):
+    monkeypatch.setattr(intel, "get_resolver",
+                        lambda ns: _NSResolver({"ns1.x.test": "10.0.0.1"}))
+    labels = [f"h{i:04d}" for i in range(intel.AXFR_RECORD_CAP + 25)]
+    _patch_xfr(monkeypatch, nodes_by_ip={"10.0.0.1": labels})
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["transferred"]["ns1.x.test"] == len(labels)      # exact count kept
+    assert len(out["records"]) == intel.AXFR_RECORD_CAP         # storage capped
+    assert out["truncated"] is True
+
+
+async def test_zone_transfer_no_nameservers_or_no_dnspython_is_empty(monkeypatch):
+    assert (await intel.zone_transfer("x.test", [], None))["attempted"] == []
+    monkeypatch.setattr(intel, "_HAVE_XFR", False)
+    out = await intel.zone_transfer("x.test", ["ns1.x.test"], None)
+    assert out["transferred"] == {} and out["attempted"] == []
+
+
+def test_successful_axfr_is_a_critical_entry_point():
+    cf = {"detected": False, "candidates": {}}
+    axfr = {"x.com": {"transferred": {"ns1.x.com": 42}, "attempted": ["ns1.x.com"],
+                      "records": [], "errors": {}, "truncated": False}}
+    eps = intel.summarize_entry_points([], cf, [], {}, [], [], axfr=axfr)
+    assert [e["type"] for e in eps] == ["dns-zone-transfer"]
+    assert eps[0]["severity"] == "critical"
+    assert "42 record(s)" in eps[0]["summary"]
+    # A refusal must not produce an entry point.
+    refused = {"x.com": {"transferred": {}, "attempted": ["ns1.x.com"], "errors": {}}}
+    assert intel.summarize_entry_points([], cf, [], {}, [], [], axfr=refused) == []
+
+
+# --------------------------------------------------------------------------- #
+# security.txt (RFC 9116)
+# --------------------------------------------------------------------------- #
+_SECURITY_TXT = """# our policy
+Contact: mailto:security@x.com
+Contact: https://x.com/report
+Expires: 2030-01-01T00:00:00Z
+Policy: https://internal-portal.x.com/vdp
+Acknowledgments: https://x.com/thanks
+Preferred-Languages: en
+"""
+
+
+class _PathClient:
+    """Serves specific paths; everything else 404s. Records what was requested."""
+    def __init__(self, by_path):
+        self.by_path, self.calls = by_path, []
+
+    async def get(self, url, **kwargs):
+        from urllib.parse import urlparse
+        self.calls.append(url)
+        # Exact-path match: "/.well-known/security.txt" also *ends with*
+        # "/security.txt", which would hide the fallback ordering.
+        body = self.by_path.get(urlparse(url).path)
+        return _FakeRespText(200, body) if body is not None else _FakeRespText(404, "")
+
+
+async def test_security_txt_parsed_from_well_known_path():
+    client = _PathClient({"/.well-known/security.txt": _SECURITY_TXT})
+    out = await intel.security_txt(client, "x.com")
+    assert out["host"] == "x.com"
+    assert out["contact"] == ["mailto:security@x.com", "https://x.com/report"]
+    # The Policy URL points at a host nothing else surfaced — the reason to parse it.
+    assert out["policy"] == ["https://internal-portal.x.com/vdp"]
+    assert out["expired"] is False
+    assert client.calls == ["https://x.com/.well-known/security.txt"]
+
+
+async def test_security_txt_falls_back_to_the_legacy_root_path():
+    client = _PathClient({"/security.txt": _SECURITY_TXT})
+    out = await intel.security_txt(client, "x.com")
+    assert out["url"].endswith("/security.txt")
+    assert len(client.calls) == 2                 # well-known tried first
+
+
+async def test_security_txt_flags_an_expired_policy():
+    body = _SECURITY_TXT.replace("2030-01-01", "2020-01-01")
+    out = await intel.security_txt(_PathClient({"/.well-known/security.txt": body}), "x.com")
+    assert out["expired"] is True
+
+
+async def test_security_txt_unparseable_expires_is_neither_state():
+    body = _SECURITY_TXT.replace("2030-01-01T00:00:00Z", "whenever")
+    out = await intel.security_txt(_PathClient({"/.well-known/security.txt": body}), "x.com")
+    assert out["expired"] is None                 # not False — we don't know
+
+
+async def test_security_txt_ignores_a_catch_all_html_page():
+    """A wildcard route returning the app's index page for every path must not
+    be reported as a published security.txt."""
+    html_page = "<html><body>Page not found</body></html>"
+    assert await intel.security_txt(
+        _PathClient({"/.well-known/security.txt": html_page}), "x.com") == {}
+    # Nor a 200 that simply has no Contact field.
+    assert await intel.security_txt(
+        _PathClient({"/.well-known/security.txt": "Expires: 2030-01-01T00:00:00Z"}),
+        "x.com") == {}
+
+
+async def test_security_txt_absent_returns_empty():
+    assert await intel.security_txt(_PathClient({}), "x.com") == {}
+
+
 class NXDOMAIN(Exception):
     """Stands in for dns.resolver.NXDOMAIN — matched by class name."""
 
@@ -3007,6 +3320,91 @@ def test_cert_section_absent_when_no_certs_read():
         report.write_html([Host("a.x.com")], ["x.com"], {}, str(html))
         assert "TLS certificates" not in md.read_text()
         assert "TLS certificates" not in html.read_text()
+
+
+def _axfr_res(allowed=True):
+    if allowed:
+        return {"axfr": {"x.com": {"transferred": {"ns1.x.com": 3},
+                                   "attempted": ["ns1.x.com", "ns2.x.com"],
+                                   "refused": {"ns2.x.com": "TransferError"},
+                                   "records": ["x.com", "www.x.com", "internal-vpn.x.com"],
+                                   "errors": {"ns3.x.com": "Timeout"},
+                                   "truncated": False}}}
+    return {"axfr": {"x.com": {"transferred": {}, "attempted": ["ns1.x.com"],
+                               "refused": {"ns1.x.com": "TransferError"},
+                               "records": [], "errors": {}, "truncated": False}}}
+
+
+def test_write_markdown_axfr_section_shows_disclosure_and_inconclusive():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("a.x.com")], ["x.com"], _axfr_res(), str(path))
+        content = path.read_text()
+    assert "DNS zone transfer (AXFR)" in content
+    assert "transfer ALLOWED" in content
+    assert "internal-vpn.x.com" in content
+    # An unreachable nameserver must read as inconclusive, never as a refusal.
+    assert "not conclusive" in content and "Timeout" in content
+    assert "unreachable, not a refusal" in content
+
+
+def test_write_markdown_axfr_refusal_reads_as_correct_not_as_a_finding():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("a.x.com")], ["x.com"], _axfr_res(allowed=False), str(path))
+        content = path.read_text()
+    assert "refused by 1 nameserver(s) (correctly restricted)" in content
+    assert "ALLOWED" not in content
+
+
+def test_write_html_axfr_section_counts_only_allowed_transfers():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("a.x.com")], ["x.com"], _axfr_res(), str(path))
+        content = path.read_text()
+    assert "DNS zone transfer (AXFR)" in content
+    assert "transfer ALLOWED" in content and "refused" in content
+    assert "internal-vpn.x.com" in content
+
+
+def test_axfr_section_absent_when_never_attempted():
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("a.x.com")], ["x.com"], {}, str(md))
+        report.write_html([Host("a.x.com")], ["x.com"], {}, str(html))
+        assert "zone transfer" not in md.read_text().lower()
+        assert "zone transfer" not in html.read_text().lower()
+
+
+def _stxt_res():
+    return {"security_txt": [
+        {"host": "x.com", "url": "https://x.com/.well-known/security.txt",
+         "contact": ["mailto:security@x.com"], "expires": ["2020-01-01T00:00:00Z"],
+         "policy": ["https://internal-portal.x.com/vdp"], "expired": True},
+    ]}
+
+
+def test_write_markdown_security_txt_flags_expired():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.md"
+        report.write_markdown([Host("x.com")], ["x.com"], _stxt_res(), str(path))
+        content = path.read_text()
+    assert "security.txt (RFC 9116)" in content
+    assert "mailto:security@x.com" in content
+    assert "expired" in content
+    assert "internal-portal.x.com" in content
+
+
+def test_write_html_security_txt_links_contact_and_policy():
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("x.com")], ["x.com"], _stxt_res(), str(path))
+        content = path.read_text()
+    assert "security.txt (RFC 9116)" in content
+    assert 'href="https://internal-portal.x.com/vdp"' in content
+    assert "expired" in content
+    # A non-URL contact must not become a broken anchor.
+    assert 'href="mailto:security@x.com"' not in content
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():

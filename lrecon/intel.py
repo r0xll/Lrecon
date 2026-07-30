@@ -320,7 +320,33 @@ def parse_dmarc(record: str | None) -> dict:
     return out
 
 
-async def email_security(domain: str, resolver_ns) -> dict:
+async def _fetch_mta_sts_policy(client, domain: str) -> dict | None:
+    """Fetch and parse the MTA-STS policy file. RFC 8461 fixes its location at
+    `https://mta-sts.{domain}/.well-known/mta-sts.txt`, so this is a single GET
+    of a standards-defined endpoint the domain publishes on purpose."""
+    try:
+        r = await client.get(f"https://mta-sts.{domain}/.well-known/mta-sts.txt",
+                             timeout=10, follow_redirects=True)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    policy = {"mx": []}
+    for line in (r.text or "")[:8000].splitlines():
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key, val = key.strip().lower(), val.strip()
+        if key == "mode":
+            policy["mode"] = val.lower()
+        elif key == "mx":
+            policy["mx"].append(val.lower())
+        elif key in ("version", "max_age"):
+            policy[key] = val
+    return policy or None
+
+
+async def email_security(domain: str, resolver_ns, client=None) -> dict:
     """
     SPF/DKIM/DMARC posture for a domain. The full verbatim records are kept
     (`spf`, `dmarc`, `dkim_record`) alongside a parsed breakdown
@@ -334,7 +360,8 @@ async def email_security(domain: str, resolver_ns) -> dict:
            "dkim_selector": None, "dkim_record": None,
            "dkim_selectors_checked": list(DKIM_SELECTORS),
            "spf_parsed": {}, "dmarc_parsed": {}, "issues": [],
-           "lookup_errors": []}
+           "mta_sts": None, "mta_sts_policy": None, "mta_sts_mode": None,
+           "tls_rpt": None, "lookup_errors": []}
 
     async def txt(name):
         """TXT records for `name`, plus whether the lookup itself failed.
@@ -431,6 +458,37 @@ async def email_security(domain: str, resolver_ns) -> dict:
     if not out["dkim"]:
         out["issues"].append("No DKIM on common selectors (inconclusive)")
 
+    # ---- SMTP transport security: MTA-STS + TLS-RPT ----
+    # SPF/DKIM/DMARC authenticate the *message*; MTA-STS protects the
+    # *connection* by telling senders to require TLS with a valid certificate
+    # for this domain. Without it, STARTTLS is strippable by an active network
+    # attacker and mail silently downgrades to plaintext.
+    #
+    # Deliberately NOT raising an issue for plain absence: most domains publish
+    # no MTA-STS, and adding that to `issues` would push nearly every domain to
+    # WARN and make the grade meaningless. Absence is reported as a field; only
+    # a *misconfigured* policy (published but unreachable, or not enforcing) is
+    # an issue, since that is a real defect rather than a feature not adopted.
+    sts_records, _ = await txt(f"_mta-sts.{domain}")
+    out["mta_sts"] = next((t for t in sts_records if "v=STSv1" in t), None)
+    tlsrpt_records, _ = await txt(f"_smtp._tls.{domain}")
+    out["tls_rpt"] = next((t for t in tlsrpt_records if "v=TLSRPTv1" in t), None)
+    out["mta_sts_policy"] = None
+    out["mta_sts_mode"] = None
+    if out["mta_sts"] and client is not None:
+        policy = await _fetch_mta_sts_policy(client, domain)
+        out["mta_sts_policy"] = policy
+        out["mta_sts_mode"] = (policy or {}).get("mode")
+        if not policy:
+            out["issues"].append(
+                "MTA-STS record published but the policy file is unreachable — "
+                "senders fall back to opportunistic (strippable) TLS")
+        elif out["mta_sts_mode"] == "testing":
+            out["issues"].append(
+                "MTA-STS mode=testing — TLS failures are reported, not enforced")
+        elif out["mta_sts_mode"] == "none":
+            out["issues"].append("MTA-STS mode=none — the policy is explicitly disabled")
+
     sev = len([i for i in out["issues"] if "risk" in i or "critical" in i])
     out["grade"] = "FAIL" if sev else ("WARN" if out["issues"] else "PASS")
     return out
@@ -473,6 +531,97 @@ async def dns_lookup(domain: str, resolver_ns) -> dict:
         out["txt"] = ["".join(s.decode(errors="ignore") for s in r.strings) for r in txt]
     if soa:
         out["soa"] = str(soa[0].mname).rstrip(".").lower()
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# DNS zone transfer (AXFR) — a misconfiguration check, not an exploit. An
+# authoritative server that answers AXFR to the world hands over the entire
+# zone: every internal hostname, every staging/admin record that was never
+# meant to be enumerable, in one query. That collapses subdomain discovery
+# completely, which is why it's a critical finding when it lands.
+#
+# One DNS query per nameserver against the domain's own authoritative servers —
+# the same touch tier as dns_lookup() above, and gated the same way.
+#
+# Note: AXFR is TCP/53, which sandboxed environments block outright (the same
+# class of restriction already documented for WHOIS port 43 and crt.sh's
+# Postgres replica on 5432). A blocked transfer is reported as an error per
+# nameserver, never as "no transfer allowed" — those are different facts.
+# --------------------------------------------------------------------------- #
+try:
+    import dns.asyncquery, dns.message, dns.zone
+    _HAVE_XFR = True
+except Exception:                                  # pragma: no cover - env dependent
+    _HAVE_XFR = False
+
+AXFR_RECORD_CAP = 500          # names kept for the report; the count is exact
+
+# Whether a failed transfer means "the server answered and declined" or "we
+# never got an answer". Only the first is evidence that transfers are actually
+# restricted; a timeout says nothing about the server's policy. Anything
+# unrecognised is treated as inconclusive on purpose — claiming a refusal we
+# cannot prove would turn a blocked network path into a clean bill of health.
+_XFR_REFUSED_NAMES = ("TransferError", "XFRRefused", "NoAnswer", "FormError",
+                      "Refused", "NotAuthoritative", "NoNS")
+_XFR_UNREACHABLE_NAMES = ("Timeout", "TimeoutError", "ConnectionRefusedError",
+                          "ConnectionResetError", "ConnectionError", "OSError",
+                          "EOFError", "CancelledError", "gaierror")
+
+
+async def zone_transfer(domain: str, ns_names, resolver_ns) -> dict:
+    """Attempt AXFR against each of the domain's authoritative nameservers.
+
+    Returns {attempted, transferred: {ns: record_count}, refused, records,
+    errors, truncated}. `transferred` being non-empty is the finding.
+
+    `refused` and `errors` are kept apart deliberately: a server that answers
+    and declines is correctly configured, while one we could not reach tells us
+    nothing. Folding the second into the first would report a blocked network
+    path as "transfers refused" — a false negative on a critical check.
+    """
+    out = {"attempted": [], "transferred": {}, "refused": {}, "records": [],
+           "errors": {}, "truncated": False}
+    if not (_HAVE_DNS and _HAVE_XFR) or not ns_names:
+        return out
+    res = get_resolver(resolver_ns)
+
+    for ns_name in ns_names:
+        ns = str(ns_name).rstrip(".").lower()
+        ips = []
+        for rtype in ("A", "AAAA"):
+            try:
+                ips = [str(r) for r in await res.resolve(ns, rtype)]
+            except Exception:
+                continue
+            if ips:
+                break
+        if not ips:
+            out["errors"][ns] = "nameserver did not resolve"
+            continue
+        out["attempted"].append(ns)
+        try:
+            zone = dns.zone.Zone(domain)
+            query = dns.message.make_query(domain, "AXFR")
+            await dns.asyncquery.inbound_xfr(ips[0], zone, query,
+                                             timeout=5, lifetime=20)
+        except Exception as e:
+            kind = type(e).__name__
+            if kind in _XFR_REFUSED_NAMES:
+                out["refused"][ns] = kind
+            else:
+                out["errors"][ns] = kind
+            continue
+        names = []
+        for node in zone.nodes:
+            label = node.to_text() if hasattr(node, "to_text") else str(node)
+            names.append(domain if label in ("@", "") else f"{label}.{domain}")
+        out["transferred"][ns] = len(names)
+        for fqdn in sorted(set(names))[:AXFR_RECORD_CAP]:
+            if fqdn not in out["records"]:
+                out["records"].append(fqdn)
+        if len(set(names)) > AXFR_RECORD_CAP:
+            out["truncated"] = True
     return out
 
 
@@ -607,6 +756,69 @@ async def auth_surface(client, host: str) -> dict:
     return {"host": host, "idp": _fingerprint_idp(oidc, final_url),
             "issuer": oidc.get("issuer"), "oidc_config_url": url,
             "endpoints": endpoints}
+
+
+# security.txt (RFC 9116) — a file the organization publishes deliberately, so
+# reading it is discovery, not probing. Two uses in an assessment: it names the
+# disclosure channel a report should actually go to, and its Policy / Canonical /
+# Acknowledgments URLs routinely point at internal or otherwise undiscovered
+# hosts. An `Expires` date in the past means the contact information is, per the
+# RFC, no longer to be trusted — worth flagging to the client.
+_SECURITY_TXT_PATHS = ("/.well-known/security.txt", "/security.txt")
+_SECURITY_TXT_FIELDS = ("contact", "expires", "policy", "encryption",
+                        "acknowledgments", "canonical", "preferred-languages",
+                        "hiring", "csaf")
+
+
+async def security_txt(client, host: str) -> dict:
+    """Fetch and parse security.txt for one host, or {} if not published.
+
+    Tries the RFC 9116 well-known location first, then the legacy root path that
+    predates it and is still in the wild. Multi-valued fields (Contact, Policy,
+    ...) keep every entry, since the extra URLs are the interesting part.
+    """
+    for path in _SECURITY_TXT_PATHS:
+        url = f"https://{host}{path}"
+        try:
+            r = await client.get(url, timeout=15, follow_redirects=True)
+        except Exception:
+            continue
+        if r.status_code != 200:
+            continue
+        body = (r.text or "")[:20000]
+        # Guard against a catch-all returning an HTML page for every path.
+        if "<html" in body[:400].lower() or "contact:" not in body.lower():
+            continue
+        fields = defaultdict(list)
+        for line in body.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, sep, val = line.partition(":")
+            key, val = key.strip().lower(), val.strip()
+            if sep and val and key in _SECURITY_TXT_FIELDS:
+                fields[key].append(val)
+        if not fields.get("contact"):
+            continue
+        out = {"host": host, "url": url, **{k: v for k, v in fields.items()}}
+        out["expired"] = _security_txt_expired(fields.get("expires"))
+        return out
+    return {}
+
+
+def _security_txt_expired(expires) -> bool | None:
+    """True/False if the Expires field parses, None if absent or unparseable —
+    an unparseable date must not be reported as either state."""
+    if not expires:
+        return None
+    raw = expires[0].strip().replace("Z", "+00:00")
+    try:
+        when = datetime.fromisoformat(raw)
+    except Exception:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when < datetime.now(timezone.utc)
 
 
 
@@ -1165,7 +1377,8 @@ def _cve_severity(cvss, has_poc: bool = False) -> str:
 
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
-                           dorks=None, auth_surfaces=None, whois=None) -> list:
+                           dorks=None, auth_surfaces=None, whois=None,
+                           axfr=None) -> list:
     """
     Pull the findings that represent a likely initial-access vector out of the
     full result set into one ranked list, so they're stated explicitly instead
@@ -1186,6 +1399,16 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
             out.append({"type": "subdomain-takeover", "target": h.subdomain, "severity": sev,
                        "summary": h.takeover, "attck": "T1584.001",
                        "confidence": h.takeover_confidence})
+
+    for domain, result in (axfr or {}).items():
+        if not (result or {}).get("transferred"):
+            continue
+        servers = ", ".join(result["transferred"])
+        total = sum(result["transferred"].values())
+        out.append({"type": "dns-zone-transfer", "target": domain, "severity": "critical",
+                    "summary": f"AXFR allowed by {servers} — {total} record(s) of the "
+                               f"zone disclosed, including any internal-only names",
+                    "attck": "T1590.002"})
 
     if cf.get("detected"):
         for ip, v in cf.get("candidates", {}).items():

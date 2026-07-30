@@ -32,6 +32,48 @@ def _by_takeover_confidence(hosts: list) -> list:
         h.takeover_confidence, 3), h.subdomain))
 
 
+def _axfr_has_result(r) -> bool:
+    """Whether an AXFR attempt produced anything worth a section — including a
+    nameserver that never resolved, which is a gap in its own right."""
+    r = r or {}
+    return bool(r.get("attempted") or r.get("transferred")
+                or r.get("refused") or r.get("errors"))
+
+
+def _md_emph_to_html(text: str) -> str:
+    """Render the small Markdown subset used in shared status strings (`code`
+    and **bold**) as HTML, escaping everything else. Lets both writers share one
+    source of wording instead of maintaining two copies that can drift."""
+    import html as _html, re as _re
+    out, pos = [], 0
+    for m in _re.finditer(r"\*\*(.+?)\*\*|`(.+?)`", text):
+        out.append(_html.escape(text[pos:m.start()]))
+        if m.group(1) is not None:
+            out.append(f"<strong>{_html.escape(m.group(1))}</strong>")
+        else:
+            out.append(f"<code>{_html.escape(m.group(2))}</code>")
+        pos = m.end()
+    out.append(_html.escape(text[pos:]))
+    return "".join(out)
+
+
+def _mta_sts_text(e: dict) -> str:
+    """MTA-STS state in one line. Absence is stated plainly rather than as a
+    finding — most domains don't publish it, so it isn't a misconfiguration; a
+    published-but-broken or non-enforcing policy is, and reads as such here."""
+    if not e.get("mta_sts"):
+        return "not published — SMTP TLS is downgradeable (STARTTLS stripping)"
+    mode = e.get("mta_sts_mode")
+    if not e.get("mta_sts_policy"):
+        return "record published but **policy file unreachable** — senders fall back to " \
+               "opportunistic TLS"
+    if mode == "enforce":
+        return "`mode=enforce` — senders must use validated TLS"
+    if mode in ("testing", "none"):
+        return f"**`mode={mode}`** — published but not enforcing"
+    return f"policy published (`mode={mode or 'unspecified'}`)"
+
+
 CERT_EXPIRY_SOON_DAYS = 30
 
 
@@ -524,6 +566,10 @@ def write_markdown(hosts, domains, res, path) -> None:
                 lines.append(f"- **DKIM:** not found on common selectors "
                              f"({', '.join(e.get('dkim_selectors_checked') or DKIM_SELECTORS)}) "
                              f"— inconclusive, a custom selector may exist")
+            lines.append(f"- **MTA-STS:** {_mta_sts_text(e)}")
+            lines.append(f"- **TLS-RPT:** "
+                         + (f"`{e['tls_rpt']}`" if e.get("tls_rpt")
+                            else "not published — no reporting of SMTP TLS failures"))
             lines.append("")
 
             issues = e.get("issues") or []
@@ -538,6 +584,52 @@ def write_markdown(hosts, domains, res, path) -> None:
                           f"TXT sets before reporting these as findings.", ""]
         lines += ["> SPF/DKIM/DMARC gaps enable email spoofing and strengthen "
                   "phishing pretext (relevant if the SOW covers social engineering).", ""]
+
+    axfr = res.get("axfr") or {}
+    if any(_axfr_has_result(v) for v in axfr.values()):
+        lines += ["## DNS zone transfer (AXFR)", ""]
+        for domain, r in axfr.items():
+            r = r or {}
+            if r.get("transferred"):
+                for ns_host, count in r["transferred"].items():
+                    lines.append(f"- **{domain}** — ⚠️ **transfer ALLOWED** by `{ns_host}`: "
+                                 f"{count} record(s) disclosed")
+                shown = r.get("records") or []
+                if shown:
+                    lines += ["", "<details><summary>Disclosed names "
+                              f"({len(shown)} shown{', capped' if r.get('truncated') else ''})"
+                              "</summary>", ""]
+                    lines += [f"- `{n}`" for n in shown[:200]]
+                    lines += ["", "</details>", ""]
+            elif r.get("refused"):
+                lines.append(f"- {domain} — refused by {len(r['refused'])} "
+                             f"nameserver(s) (correctly restricted)")
+            # Top-level bullets naming the domain: a nested item would lose its
+            # list context after the <details> block above.
+            for ns_host, err in (r.get("errors") or {}).items():
+                lines.append(f"- {domain} — `{ns_host}`: **not conclusive** ({err}) "
+                             f"— unreachable, not a refusal")
+        lines += ["", "> A nameserver answering AXFR hands over every record in the zone "
+                  "in one query, including internal-only names that no amount of "
+                  "brute-forcing would surface. Restrict transfers to authorised "
+                  "secondaries. An inconclusive result is a reachability problem, not "
+                  "evidence that transfers are refused.", ""]
+
+    stxt = res.get("security_txt") or []
+    if stxt:
+        lines += ["## security.txt (RFC 9116)", "",
+                  "| Host | Contact | Expires | Policy |", "|---|---|---|---|"]
+        for s in stxt:
+            contact = ", ".join(s.get("contact") or [])[:120] or "—"
+            exp = ", ".join(s.get("expires") or []) or "—"
+            if s.get("expired"):
+                exp += " ⚠️ **expired**"
+            policy = ", ".join(s.get("policy") or [])[:120] or "—"
+            lines.append(f"| `{s['host']}` | {contact} | {exp} | {policy} |")
+        lines += ["", "> Names the disclosure channel a report should go to. The "
+                  "`Policy`/`Canonical`/`Acknowledgments` URLs are worth following — they "
+                  "routinely point at hosts nothing else surfaced. Per RFC 9116 an expired "
+                  "`Expires` means the contact details should no longer be relied on.", ""]
 
     certs = res.get("certs") or []
     if certs:
@@ -877,6 +969,69 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<p class="note">Feeds password-spray candidate lists (T1110.003).</p>')
         sections.append(_html_section("breach", "Credential / breach exposure", n_breach, body))
 
+    # ---- DNS zone transfer (AXFR) ----
+    axfr = res.get("axfr") or {}
+    allowed = {d: r for d, r in axfr.items() if (r or {}).get("transferred")}
+    if any(_axfr_has_result(r) for r in axfr.values()):
+        rows = ""
+        for d, r in axfr.items():
+            r = r or {}
+            for ns_host, count in (r.get("transferred") or {}).items():
+                rows += (f'<tr><td>{esc(d)}</td><td>{esc(ns_host)}</td>'
+                         f'<td><strong class="bad">transfer ALLOWED</strong></td>'
+                         f'<td>{count} record(s)</td></tr>')
+            for ns_host, why in (r.get("refused") or {}).items():
+                rows += (f'<tr><td>{esc(d)}</td><td>{esc(ns_host)}</td>'
+                         f'<td><span class="good">refused</span></td>'
+                         f'<td>{esc(why)}</td></tr>')
+            for ns_host, err in (r.get("errors") or {}).items():
+                rows += (f'<tr><td>{esc(d)}</td><td>{esc(ns_host)}</td>'
+                         f'<td class="note">not conclusive</td>'
+                         f'<td>{esc(err)} — unreachable, not a refusal</td></tr>')
+        names = ""
+        for d, r in allowed.items():
+            shown = (r.get("records") or [])[:200]
+            if shown:
+                names += (f'<h4>{esc(d)} — disclosed names</h4><div style="overflow-x:auto">'
+                          + ", ".join(f"<code>{esc(n)}</code>" for n in shown) + "</div>")
+        body = (f'{_html_export_button("t-axfr", "zone_transfer.csv")}'
+                f'<table id="t-axfr"><tr><th>Domain</th><th>Nameserver</th>'
+                f'<th>Result</th><th>Detail</th></tr>{rows}</table>{names}'
+                f'<p class="note">A nameserver answering AXFR hands over every record in '
+                f'the zone in one query, including internal-only names no brute-force would '
+                f'surface. Restrict transfers to authorised secondaries. An inconclusive '
+                f'result is a reachability problem, not evidence that transfers are '
+                f'refused.</p>')
+        sections.append(_html_section("axfr", "DNS zone transfer (AXFR)",
+                                      len(allowed), body))
+
+    # ---- security.txt ----
+    stxt = res.get("security_txt") or []
+    if stxt:
+        def _st_row(s):
+            exp = ", ".join(s.get("expires") or []) or "—"
+            exp_cell = (f'<strong class="bad">{esc(exp)} (expired)</strong>'
+                        if s.get("expired") else esc(exp))
+            def _links(key):
+                vals = s.get(key) or []
+                return ", ".join(f'<a href="{_h.escape(v)}" target="_blank" '
+                                 f'rel="noopener">{esc(v)}</a>'
+                                 if v.startswith("http") else esc(v) for v in vals) or "—"
+            return (f'<tr><td>{esc(s["host"])}</td><td>{_links("contact")}</td>'
+                    f'<td>{exp_cell}</td><td>{_links("policy")}</td></tr>')
+
+        body = (f'{_html_export_button("t-stxt", "security_txt.csv")}'
+                f'<div style="overflow-x:auto"><table id="t-stxt">'
+                f'<tr><th>Host</th><th>Contact</th><th>Expires</th><th>Policy</th></tr>'
+                + "".join(_st_row(s) for s in stxt) + '</table></div>'
+                f'<p class="note">Names the disclosure channel a report should go to. The '
+                f'Policy/Canonical/Acknowledgments URLs are worth following — they routinely '
+                f'point at hosts nothing else surfaced. Per RFC 9116 an expired '
+                f'<code>Expires</code> means the contact details should no longer be relied '
+                f'on.</p>')
+        sections.append(_html_section("securitytxt", "security.txt (RFC 9116)",
+                                      len(stxt), body))
+
     # ---- TLS certificates ----
     certs = res.get("certs") or []
     if certs:
@@ -1032,6 +1187,11 @@ def write_html(hosts, domains, res, path) -> None:
                                + esc(", ".join(e.get("dkim_selectors_checked")
                                                or DKIM_SELECTORS))
                                + ") — inconclusive")
+            # Reuse the Markdown wording, converting its ** emphasis to <strong>
+            # so the two writers can't drift apart on what MTA-STS state means.
+            details.append("MTA-STS: " + _md_emph_to_html(_mta_sts_text(e)))
+            details.append("TLS-RPT: " + (f"<code>{esc(e['tls_rpt'])}</code>"
+                                          if e.get("tls_rpt") else "not published"))
             issues = e.get("issues") or []
             body += (f'<h4>{esc(d)} <span class="{grade_cls}">{esc(grade)}</span></h4>'
                      f'<div style="overflow-x:auto"><table><tr><th>Mechanism</th>'

@@ -371,6 +371,35 @@ raw text it reports a parsed breakdown:
   despite an enforced `p=`), and a missing `rua=` (no aggregate reporting).
 - **DKIM** — the matched selector and its record, or the explicit list of selectors
   probed so a "not found" reads as inconclusive rather than absent.
+- **MTA-STS + TLS-RPT** — SPF/DKIM/DMARC authenticate the *message*; MTA-STS
+  (RFC 8461) protects the *connection*, telling senders to require TLS with a
+  valid certificate. Without it STARTTLS is strippable by an active network
+  attacker and mail silently downgrades to plaintext. lrecon reads the
+  `_mta-sts` and `_smtp._tls` records and fetches the policy file to report the
+  actual `mode`. Plain absence is reported as a field, **not** raised as an
+  issue — most domains publish no MTA-STS, and treating that as a finding would
+  push nearly every domain to WARN and make the grade useless. A published but
+  *broken* policy is a real defect and does raise one: an unreachable policy
+  file, `mode=testing`, or `mode=none`.
+
+**DNS zone transfer (AXFR).** One query per authoritative nameserver, reusing
+the NS list the DNS snapshot already collected. A server that answers hands over
+every record in the zone at once — including internal-only names no amount of
+brute-forcing would surface — so a successful transfer is a **critical** entry
+point (T1590.002). The report keeps the three outcomes distinct per nameserver:
+**allowed** (the finding, with the disclosed names), **refused** (correct
+configuration), and **not conclusive** (we couldn't reach it). That last
+distinction matters — reporting an unreachable nameserver as "transfers refused"
+would be a false negative. AXFR is TCP/53, which some sandboxed environments
+block outright, and a blocked attempt lands in the inconclusive bucket rather
+than being mistaken for a pass.
+
+**security.txt (RFC 9116).** Read from the live hosts already probed. Useful two
+ways: it names the disclosure channel a report should actually go to, and its
+`Policy`/`Canonical`/`Acknowledgments` URLs routinely point at hosts nothing else
+surfaced. An `Expires` date in the past is flagged — per the RFC the contact
+details should no longer be relied on. A catch-all route that returns the app's
+index page for every path is not mistaken for a published file.
 
 **Unique-IP enrichment.** Enrichment runs once per distinct IP, not per subdomain.
 On CDN-fronted targets where hundreds of hosts share a few IPs this cuts API calls
