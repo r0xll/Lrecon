@@ -4133,6 +4133,324 @@ def test_parse_hunter_response_skips_entries_without_a_value():
     assert ppl == []
 
 
+def test_people_report_separates_individuals_from_shared_mailboxes():
+    """'How many of our users are exposed' is a headcount question, and info@ is
+    not headcount — so the two must be counted separately in the deliverable."""
+    res = {"people": [Person(email="jane.doe@x.com", name="Jane Doe", source={"website"}),
+                      Person(email="info@x.com", source={"website"}),
+                      Person(email="bob@x.com", source={"hunter"})]}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], res, str(md))
+        report.write_html([Host("x.com")], ["x.com"], res, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    assert "People OSINT" in md_text
+    assert "2 individual-looking address(es)" in md_text and "1 shared/role" in md_text
+    assert "jane.doe@x.com" in md_text and "website" in md_text
+    assert "<b>2</b> individual" in html_text and "<b>1</b> shared/role" in html_text
+    # Individuals sort ahead of the shared mailboxes in both writers.
+    assert md_text.index("bob@x.com") < md_text.index("info@x.com")
+
+
+async def test_vt_ip_history_is_enriched_and_flags_origin_candidates():
+    """A list of past IPs and dates says a domain moved, not what it moved
+    between — and an old non-Cloudflare address is the red-team payload."""
+    from lrecon import vt as _vt
+    vt_intel = {"x.com": {"ip_history": [
+        {"ip": "104.16.0.1", "first_seen": "2026-01-01T00:00:00+00:00"},   # Cloudflare
+        {"ip": "203.0.113.9", "first_seen": "2024-01-01T00:00:00+00:00"},  # old origin
+        {"ip": "198.51.100.5", "first_seen": "2023-01-01T00:00:00+00:00"}, # still live
+    ]}}
+    payloads = {"104.16.0.1": {"org": "AS13335 Cloudflare, Inc.", "country": "US"},
+                "203.0.113.9": {"org": "AS64496 Colo Provider", "country": "DE",
+                                "hostname": "old.colo.example"},
+                "198.51.100.5": {"asn": {"asn": "AS64497", "name": "Cloud Co"}, "country": "US"}}
+    seen = []
+
+    async def fake_ipinfo(client, ip, token):
+        seen.append(ip)
+        return payloads[ip]
+
+    import lrecon.vt
+    orig = lrecon.vt.enrich_ipinfo
+    lrecon.vt.enrich_ipinfo = fake_ipinfo
+    try:
+        # Live set includes a Cloudflare address, so the domain is fronted today.
+        n = await _vt.enrich_ip_history(None, vt_intel, None, CF_FALLBACK,
+                                        {"x.com": {"198.51.100.5", "104.16.0.9"}})
+    finally:
+        lrecon.vt.enrich_ipinfo = orig
+    assert n == 3 and sorted(seen) == sorted(payloads)          # one lookup per unique IP
+    rows = {r["ip"]: r for r in vt_intel["x.com"]["ip_history"]}
+    assert rows["104.16.0.1"]["org"] == "Cloudflare, Inc." and rows["104.16.0.1"]["cloudflare"]
+    assert rows["104.16.0.1"]["origin_candidate"] is False       # behind the CDN
+    assert rows["198.51.100.5"]["origin_candidate"] is False     # still live, nothing stale
+    assert rows["198.51.100.5"]["asn"] == "AS64497"              # keyed ipinfo shape
+    origin = rows["203.0.113.9"]
+    assert origin["origin_candidate"] is True
+    assert origin["asn"] == "AS64496" and origin["org"] == "Colo Provider"
+    assert origin["rdns"] == "old.colo.example"
+
+
+async def test_vt_ip_history_enrichment_is_a_no_op_without_history():
+    from lrecon import vt as _vt
+    assert await _vt.enrich_ip_history(None, {"x.com": {}}, None, [], {}) == 0
+
+
+async def _enrich_with_stub(vt_intel, live_by_domain, nets=CF_FALLBACK):
+    """enrich_ip_history with IPinfo stubbed out — these cases are about the
+    origin-candidate logic, not the lookup."""
+    import lrecon.vt
+    from lrecon import vt as _vt
+
+    async def fake_ipinfo(client, ip, token):
+        return {}
+    orig = lrecon.vt.enrich_ipinfo
+    lrecon.vt.enrich_ipinfo = fake_ipinfo
+    try:
+        return await _vt.enrich_ip_history(None, vt_intel, None, nets, live_by_domain)
+    finally:
+        lrecon.vt.enrich_ipinfo = orig
+
+
+async def test_origin_candidates_need_the_domain_to_be_fronted_today():
+    """A domain that isn't behind a CDN has no origin to bypass — every past
+    address of one is an ordinary hosting change, not a lead."""
+    vt_intel = {"x.com": {"ip_history": [{"ip": "203.0.113.9"}]}}
+    await _enrich_with_stub(vt_intel, {"x.com": {"198.51.100.5"}})   # no CF in the live set
+    assert vt_intel["x.com"]["origin_check"] == "not_fronted"
+    assert vt_intel["x.com"]["ip_history"][0]["origin_candidate"] is False
+
+
+async def test_origin_candidates_are_skipped_when_fronted_state_is_unknown():
+    """--passive-only skips resolution, so there are no live IPs to compare
+    against. Flagging everything there would invent leads out of missing data."""
+    vt_intel = {"x.com": {"ip_history": [{"ip": "203.0.113.9"}]}}
+    await _enrich_with_stub(vt_intel, {})
+    assert vt_intel["x.com"]["origin_check"] == "unknown"
+    assert vt_intel["x.com"]["ip_history"][0]["origin_candidate"] is False
+
+
+async def test_one_domains_live_ip_does_not_hide_anothers_stale_record():
+    """In a multi-domain scope a shared address is live for one domain and stale
+    for another; a pooled live set silently suppressed the second."""
+    vt_intel = {"a.com": {"ip_history": [{"ip": "203.0.113.9"}]},
+                "b.com": {"ip_history": [{"ip": "203.0.113.9"}]}}
+    await _enrich_with_stub(vt_intel, {"a.com": {"104.16.0.1"},              # fronted, stale
+                                       "b.com": {"104.16.0.1", "203.0.113.9"}})  # still live
+    assert vt_intel["a.com"]["ip_history"][0]["origin_candidate"] is True
+    assert vt_intel["b.com"]["ip_history"][0]["origin_candidate"] is False
+
+
+def test_report_says_why_the_origin_check_did_not_run():
+    """An empty column reads as a clean result; for a domain lrecon couldn't
+    assess, it isn't one."""
+    res = {"vt": {"skipped.com": {"origin_check": "unknown",
+                                  "ip_history": [{"ip": "203.0.113.9", "first_seen": "2024"}]},
+                  "plain.com": {"origin_check": "not_fronted",
+                                "ip_history": [{"ip": "198.51.100.5", "first_seen": "2024"}]}}}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], res, str(md))
+        report.write_html([Host("x.com")], ["x.com"], res, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    for text in (md_text, html_text):
+        assert "not run" in text and "skipped.com" in text
+        assert "not a clean result" in text
+        assert "not applicable" in text and "plain.com" in text
+
+
+def test_vt_history_renders_org_and_origin_candidates():
+    res = {"vt": {"x.com": {"reputation": 0, "ip_history": [
+        {"ip": "203.0.113.9", "first_seen": "2024-01-01", "asn": "AS64496",
+         "org": "Colo Provider", "country": "DE", "origin_candidate": True},
+        {"ip": "104.16.0.1", "first_seen": "2026-01-01", "asn": "AS13335",
+         "org": "Cloudflare, Inc.", "country": "US", "cloudflare": True},
+    ]}}}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], res, str(md))
+        report.write_html([Host("x.com")], ["x.com"], res, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    for text in (md_text, html_text):
+        assert "Colo Provider" in text and "AS64496" in text
+        assert "origin candidate" in text
+        assert "Host" in text                  # the how-to-verify note
+    assert "**origin candidate**" in md_text
+    assert 'class="bad">origin candidate' in html_text
+
+
+class _FakeEnumClient:
+    """Returns a canned response per URL substring."""
+    def __init__(self, routes):
+        self.routes, self.calls = routes, []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        for frag, resp in self.routes.items():
+            if frag in url:
+                return resp
+        return _FakeRespText(404, "")
+
+
+async def test_wayback_uses_https_because_http_is_never_followed():
+    """The original URL was http://, web.archive.org 301s to https, and the
+    shared enum client is follow_redirects=False — so this source returned zero
+    hosts on every target ever scanned."""
+    c = _FakeEnumClient({"web.archive.org": _FakeResp(
+        200, [["original"], ["https://a.x.com/p"], ["http://b.x.com/"], ["https://z.other.com/"]])})
+    out = await sources.enum_wayback(c, "x.com")
+    assert out == {"a.x.com", "b.x.com"}
+    assert c.calls and c.calls[0].startswith("https://")
+    assert not getattr(out, "failed", False)
+
+
+async def test_blocked_sources_are_reported_as_failed_not_empty():
+    """0 hosts from a working source is a fact about the target; 0 from a
+    blocked one is a fact about lrecon. The counts alone can't tell them apart."""
+    otx = await sources.enum_otx(_FakeEnumClient(
+        {"otx.alienvault.com": _FakeRespText(429, "")}), "x.com")
+    assert otx == set() and otx.failed and "429" in otx.detail
+
+    anubis = await sources.enum_anubis(_FakeEnumClient(
+        {"jldc.me": _FakeRespText(403, "")}), "x.com")
+    assert anubis == set() and anubis.failed and "403" in anubis.detail
+
+    wayback = await sources.enum_wayback(_FakeEnumClient(
+        {"web.archive.org": _FakeRespText(503, "")}), "x.com")
+    assert wayback == set() and wayback.failed
+
+
+async def test_a_source_with_genuinely_nothing_is_not_marked_failed():
+    """The whole point of the distinction — an empty 200 is a real answer."""
+    out = await sources.enum_wayback(_FakeEnumClient(
+        {"web.archive.org": _FakeResp(200, [["original"]])}), "x.com")
+    assert out == set() and not out.failed
+
+
+async def test_passive_enum_separates_failed_sources_from_empty_ones(monkeypatch):
+    async def ok(client, domain):
+        return {"a.x.com"}
+
+    async def blocked(client, domain):
+        return sources.SourceSet(failed=True, detail="HTTP 403 — blocked")
+
+    async def empty(client, domain):
+        return sources.SourceSet()
+
+    monkeypatch.setattr(sources, "enum_certspotter", ok)
+    monkeypatch.setattr(sources, "enum_otx", blocked)
+    monkeypatch.setattr(sources, "enum_anubis", empty)
+    monkeypatch.setattr(sources, "enum_wayback", empty)
+    monkeypatch.setattr(sources, "enum_subfinder", lambda d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_crtsh_best",
+                        lambda c, d, use_psql=True: asyncio.sleep(0, result=set()))
+    _hs, per_source, failed = await sources.passive_enum(None, ["x.com"], {})
+    assert per_source["certspotter"] == 1
+    assert list(failed) == ["otx"]                 # not anubis/wayback, which merely found nothing
+    assert "403" in failed["otx"]
+
+
+async def test_a_source_that_worked_for_one_domain_is_not_marked_failed(monkeypatch):
+    """One domain's 403 shouldn't indict a source that answered for another."""
+    calls = {"n": 0}
+
+    async def flaky(client, domain):
+        calls["n"] += 1
+        if domain == "bad.com":
+            return sources.SourceSet(failed=True, detail="HTTP 403")
+        return {"a.good.com"}
+
+    for name in ("enum_certspotter", "enum_anubis", "enum_wayback"):
+        monkeypatch.setattr(sources, name, lambda c, d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_otx", flaky)
+    monkeypatch.setattr(sources, "enum_subfinder", lambda d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_crtsh_best",
+                        lambda c, d, use_psql=True: asyncio.sleep(0, result=set()))
+    _hs, per_source, failed = await sources.passive_enum(None, ["good.com", "bad.com"], {})
+    assert per_source["otx"] == 1
+    assert "otx" not in failed
+
+
+def test_extract_emails_keeps_only_in_scope_addresses():
+    """A vendor's address in a footer is that vendor's exposure, not the
+    client's — collecting it would put out-of-scope people in a deliverable."""
+    page = """<a href="mailto:Jane.Doe@x.com">Jane</a> info@x.com
+              press@eu.x.com  vendor@other.com  <img src="logo@2x.png">"""
+    assert people.extract_emails(page, "x.com") == {
+        "jane.doe@x.com", "info@x.com", "press@eu.x.com"}
+    # Not a subdomain — the label boundary matters here as much as in enum.
+    assert people.extract_emails("a@notx.com", "x.com") == set()
+    assert people.extract_emails("", "x.com") == set()
+
+
+def test_split_role_accounts_separates_shared_mailboxes_from_people():
+    """A shared mailbox is exposure worth reporting but nobody to phish, so the
+    counts must not be merged."""
+    staff, roles = people.split_role_accounts(
+        {"jane.doe@x.com", "info@x.com", "noreply@x.com", "bob@x.com"})
+    assert staff == ["bob@x.com", "jane.doe@x.com"]
+    assert roles == ["info@x.com", "noreply@x.com"]
+
+
+class _FakeSiteClient:
+    """Serves canned page bodies keyed by path; 404s everything else."""
+    def __init__(self, pages):
+        self.pages, self.calls = pages, []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(url)
+        path = "/" + url.split("://", 1)[1].split("/", 1)[1] if "/" in url.split("://", 1)[1] else "/"
+        body = self.pages.get(path)
+        return _FakeRespText(200 if body is not None else 404, body or "")
+
+
+async def test_scrape_site_emails_reads_the_targets_own_contact_pages():
+    c = _FakeSiteClient({"/": "hello", "/contact": "reach jane.doe@x.com or info@x.com",
+                         "/about": "bob@x.com and a partner at vendor@other.com"})
+    hosts = [Host("x.com", http_status=200, scheme="https")]
+    out = await people.scrape_site_emails(c, "x.com", hosts)
+    assert out == {"jane.doe@x.com", "info@x.com", "bob@x.com"}
+
+
+async def test_scrape_site_emails_skips_hosts_that_are_not_live_or_in_scope():
+    c = _FakeSiteClient({"/contact": "a@x.com"})
+    hosts = [Host("dead.x.com"),                                  # never probed
+             Host("wild.x.com", http_status=200, wildcard=True),  # wildcard
+             Host("y.com", http_status=200)]                      # out of scope
+    assert await people.scrape_site_emails(c, "x.com", hosts) == set()
+    assert c.calls == []
+
+
+async def test_scrape_site_emails_is_bounded():
+    """Contact-page discovery, not a crawl — the cost has to stay predictable."""
+    c = _FakeSiteClient({})
+    hosts = [Host(f"h{i}.x.com", http_status=200, scheme="https") for i in range(20)]
+    await people.scrape_site_emails(c, "x.com", hosts, max_hosts=2, max_pages=3)
+    assert len(c.calls) == 6
+
+
+def test_hunter_error_detail_surfaces_hunters_own_explanation():
+    """A bare 'HTTP 4xx' throws away the only part of the response that says
+    what to do about it."""
+    payload = {"errors": [{"id": "forbidden", "details": "You have exhausted your credits"}]}
+    assert "exhausted your credits" in people._hunter_error_detail(payload)
+    assert people._hunter_error_detail({}) == ""
+    assert people._hunter_error_detail(None) == ""
+
+
+async def test_hunter_reports_a_200_with_no_emails(capsys):
+    """A credit-exhausted account and a domain with nothing indexed both return
+    200 + zero emails; silence would read as 'no exposure'."""
+    class _C:
+        async def get(self, url, **kwargs):
+            return _FakeResp(200, {"data": {"pattern": None, "emails": [],
+                                            "meta": {"results": 0}}})
+    pattern, ppl = await people.hunter_domain_search(_C(), "x.com", "k")
+    assert ppl == []
+    assert "200 but no emails returned" in capsys.readouterr().err.replace("\n", "")
+
+
 def test_extract_emails_from_text_matches_finds_addresses_at_domain():
     items = [{"text_matches": [{"fragment": "contact John.Smith@x.com or Jane@x.com for access"}]},
              {"text_matches": [{"fragment": "unrelated bob@other.com"}]}]

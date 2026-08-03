@@ -82,6 +82,46 @@ def _spf_include_md(target: str, e: dict) -> str:
     return f"`{target}` ({'**' + label + '**' if bad else label})"
 
 
+def _split_people_by_kind(people: list) -> tuple:
+    """(individuals, shared mailboxes). "How many of our users are exposed" is a
+    headcount question, and `info@`/`noreply@` are not headcount."""
+    from .people import ROLE_LOCALPARTS
+    staff = [p for p in people if p.email.partition("@")[0] not in ROLE_LOCALPARTS]
+    roles = [p for p in people if p.email.partition("@")[0] in ROLE_LOCALPARTS]
+    return staff, roles
+
+
+def _vt_origin_check_notes(vt: dict) -> list:
+    """Why a domain has no origin candidates, when the reason isn't "none exist".
+
+    An empty column reads as a clean result, and for a domain lrecon couldn't
+    assess it isn't one — the check simply didn't run.
+    """
+    unknown = sorted(d for d, v in vt.items() if v.get("origin_check") == "unknown")
+    not_fronted = sorted(d for d, v in vt.items() if v.get("origin_check") == "not_fronted")
+    out = []
+    if unknown:
+        out.append(f"> Origin-candidate check **not run** for {', '.join(unknown)} — no live "
+                   f"IPs to compare against (`--passive-only` skips resolution), so whether "
+                   f"the domain is CDN-fronted is unknown. Absence of candidates here is not "
+                   f"a clean result.")
+    if not_fronted:
+        out.append(f"> Origin-candidate check **not applicable** to "
+                   f"{', '.join(not_fronted)} — not Cloudflare-fronted today, so a former "
+                   f"address is a hosting change rather than a bypassable origin.")
+    return out + [""] if out else []
+
+
+def _vt_history_note(r: dict) -> str:
+    """What a hosting-history row means, in a word. Blank when it means nothing
+    in particular — a note on every row is a note on none of them."""
+    if r.get("origin_candidate"):
+        return "**origin candidate**"
+    if r.get("cloudflare"):
+        return "Cloudflare"
+    return "—"
+
+
 def _email_services(e: dict) -> list:
     """(kind, names) pairs for the third-party email services a domain reveals.
 
@@ -399,11 +439,23 @@ def write_markdown(hosts, domains, res, path) -> None:
         any_history = any(v.get("ip_history") for v in vt.values())
         if any_history:
             lines += ["**Historical IP resolutions (hosting history)** — newest first:", "",
-                      "| Domain | IP | First seen |", "|---|---|---|"]
+                      "| Domain | IP | First seen | ASN | Org | Country | Note |",
+                      "|---|---|---|---|---|---|---|"]
             for d, v in vt.items():
                 for r in (v.get("ip_history") or [])[:20]:
-                    lines.append(f"| {d} | {r['ip']} | {r.get('first_seen') or '—'} |")
+                    lines.append(f"| {d} | `{r['ip']}` | {r.get('first_seen') or '—'} "
+                                 f"| {r.get('asn') or '—'} | {r.get('org') or '—'} "
+                                 f"| {r.get('country') or '—'} | {_vt_history_note(r)} |")
             lines.append("")
+            if any(r.get("origin_candidate") for v in vt.values()
+                   for r in (v.get("ip_history") or [])):
+                lines += ["> **Origin candidates** are addresses a *currently Cloudflare-fronted* "
+                          "domain used to answer on directly — not Cloudflare themselves, and no "
+                          "longer live for that domain. Worth a fetch with the target's `Host` "
+                          "header to see whether the origin still serves there behind the CDN. "
+                          "Treat as a lead: a shared host or a reassigned cloud address looks "
+                          "the same from here.", ""]
+            lines += _vt_origin_check_notes(vt)
         lines += ["> Free-tier VirusTotal domain intelligence — passive DNS history VT has "
                   "observed, not a live scan. A high malicious/suspicious vote count on a "
                   "client-owned domain is usually a false positive from prior compromise or "
@@ -497,6 +549,28 @@ def write_markdown(hosts, domains, res, path) -> None:
             for sub, ps in list(diff["new_ports"].items())[:20]:
                 lines.append(f"- **{sub}** newly-open ports: {', '.join(map(str, ps))}")
         lines.append("")
+
+    people = res.get("people") or []
+    if people:
+        staff, roles = _split_people_by_kind(people)
+        lines += ["## People OSINT (user enumeration)", "",
+                  f"**{len(staff)} individual-looking address(es)** and **{len(roles)} "
+                  f"shared/role mailbox(es)** discovered. The split matters because a shared "
+                  f"mailbox is exposure worth fixing but is not a person to phish or spray. "
+                  f"Treat the first figure as a floor on exposed addresses rather than a "
+                  f"headcount: only mailboxes matching lrecon's known role names are moved "
+                  f"to the second column, so a mailing list or an alias still counts as "
+                  f"individual until someone reads the list.", "",
+                  "| Email | Name | Position | Kind | SMTP | Source |",
+                  "|---|---|---|---|---|---|"]
+        for p in staff + roles:
+            kind = "shared/role" if p in roles else "individual"
+            lines.append(f"| `{p.email}` | {p.name or '—'} | {p.position or '—'} | {kind} "
+                         f"| {p.smtp_status or '—'} | {', '.join(sorted(p.source)) or '—'} |")
+        lines += ["", "> Company-affiliated OSINT, not personal accounts. Addresses sourced "
+                  "`website` were published by the target on its own pages. A `generated` "
+                  "source is a pattern-applied guess, not an observed address — verify "
+                  "before use.", ""]
 
     breach = res.get("breach") or {}
     if breach:
@@ -900,14 +974,34 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<table id="t-vt"><tr><th>Domain</th><th>Reputation</th>'
                 f'<th>VT malicious/suspicious votes</th><th>Creation date</th>'
                 f'<th>Last modified</th></tr>{rows}</table>')
+        def _hist_note_html(r: dict) -> str:
+            if r.get("origin_candidate"):
+                return '<strong class="bad">origin candidate</strong>'
+            return "Cloudflare" if r.get("cloudflare") else "—"
+
         history_rows = "".join(
-            f"<tr><td>{esc(d)}</td><td>{esc(r['ip'])}</td><td>{esc(r.get('first_seen'))}</td></tr>"
+            f"<tr><td>{esc(d)}</td><td><code>{esc(r['ip'])}</code></td>"
+            f"<td>{esc(r.get('first_seen'))}</td><td>{esc(r.get('asn') or '—')}</td>"
+            f"<td>{esc(r.get('org') or '—')}</td><td>{esc(r.get('country') or '—')}</td>"
+            f"<td>{_hist_note_html(r)}</td></tr>"
             for d, v in vt.items() for r in (v.get("ip_history") or [])[:20])
         if history_rows:
             body += (f'<p><b>Historical IP resolutions (hosting history)</b> — newest first:</p>'
                      f'{_html_export_button("t-vt-history", "vt_ip_history.csv")}'
                      f'<table id="t-vt-history"><tr><th>Domain</th><th>IP</th>'
-                     f'<th>First seen</th></tr>{history_rows}</table>')
+                     f'<th>First seen</th><th>ASN</th><th>Org</th><th>Country</th>'
+                     f'<th>Note</th></tr>{history_rows}</table>')
+            if any(r.get("origin_candidate") for v in vt.values()
+                   for r in (v.get("ip_history") or [])):
+                body += ('<p class="note"><b>Origin candidates</b> are addresses a <i>currently '
+                         'Cloudflare-fronted</i> domain used to answer on directly — not '
+                         'Cloudflare themselves, and no longer live for that domain. Worth a '
+                         'fetch with the target\'s Host header to see whether the origin still '
+                         'serves there behind the CDN. Treat as a lead: a shared host or a '
+                         'reassigned cloud address looks the same from here.</p>')
+            for note in _vt_origin_check_notes(vt):
+                if note:
+                    body += f'<p class="note">{esc(note.lstrip("> ")).replace("**", "")}</p>'
         body += ('<p class="note">Free-tier VirusTotal domain intelligence — passive DNS '
                  'history VT has observed, not a live scan. A high malicious/suspicious vote '
                  'count on a client-owned domain is usually a false positive from prior '
@@ -1022,17 +1116,26 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- People OSINT / enumerated users ----
     if people:
+        staff, roles = _split_people_by_kind(people)
+        role_emails = {p.email for p in roles}
         rows = "".join(
             f"<tr><td>{esc(p.email)}</td><td>{esc(p.name)}</td><td>{esc(p.position)}</td>"
+            f"<td>{'shared/role' if p.email in role_emails else 'individual'}</td>"
             f"<td>{esc(p.confidence)}</td><td>{'yes' if p.generated else ''}</td>"
             f"<td>{esc(p.smtp_status)}</td><td>{esc(', '.join(sorted(p.source)))}</td></tr>"
-            for p in people)
+            for p in staff + roles)
         body = (f'{_html_export_button("t-people", "users.csv")}'
+                f'<p><b>{len(staff)}</b> individual-looking address(es), <b>{len(roles)}</b> '
+                f'shared/role mailbox(es). Only known role names are split out, so a mailing '
+                f'list or alias still counts as individual — treat the first figure as a '
+                f'floor on exposed addresses, not a headcount.</p>'
                 f'<table id="t-people"><tr><th>Email</th><th>Name</th><th>Position</th>'
-                f'<th>Confidence</th><th>Generated</th><th>SMTP status</th><th>Source</th></tr>'
+                f'<th>Kind</th><th>Confidence</th><th>Generated</th><th>SMTP status</th>'
+                f'<th>Source</th></tr>'
                 f'{rows}</table>'
                 f'<p class="note">Company-affiliated OSINT, not personal accounts. '
-                f'"Generated" = pattern-applied guess, not directly observed.</p>')
+                f'Addresses sourced <code>website</code> were published by the target on its '
+                f'own pages. "Generated" = pattern-applied guess, not directly observed.</p>')
         sections.append(_html_section("people", "People OSINT (user enumeration)", len(people), body))
 
     # ---- Credential / breach exposure ----

@@ -89,9 +89,9 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | DNS records | apex A/AAAA/MX/NS/SOA snapshot + mail infrastructure ID (provider/ASN/org per MX host) | DNS only |
 | WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status; falls back to classic WHOIS (port 43), then to `--vt`'s cached WHOIS text, for TLDs/environments where RDAP has nothing (always on) | none (third-party registry) |
 | Auth surface | passive OIDC/SSO discovery — reads each live host's `/.well-known/openid-configuration` and fingerprints the identity provider (Okta, Entra/Azure AD, Auth0, Ping, ADFS, Google, Keycloak). Discovery only: no login/credential probing (not run under `--passive-only`) | yes (one GET/host) |
-| People OSINT | company email enumeration: Hunter.io, GitHub commit history, RocketReach (opt-in, keyed) | none (API) |
+| People OSINT | company email enumeration: website scrape (keyless), Hunter.io, GitHub commit history, RocketReach | website scrape only |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
-| VirusTotal domain intel | historical IP/hosting resolutions, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
+| VirusTotal domain intel | historical IP/hosting resolutions enriched with ASN/org + origin candidates, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
 | Email verify | SMTP RCPT-TO probe of discovered emails (opt-in, `--verify-emails`) | yes, mail infra |
 | CVE | NVD CPE->CVE resolution (opt-in, cached) | none (API) |
 | Diff | change vs previous run snapshot | none |
@@ -317,6 +317,22 @@ gets three layers of defense:
 - **Failures are legible**: the per-attempt statuses are logged, so an empty
   crt.sh result tells you *why* instead of vanishing silently. Cert Spotter, OTX,
   Anubis, Wayback, and Shodan DNS continue to cover the run regardless.
+
+### When a source contributes 0
+
+The `by source:` line reports what each source found, and `0` used to mean two
+very different things — "this domain has no hosts here" and "this source is
+blocked". Sources that fail now say so on their own line, because only the first
+of those is a fact about the target:
+
+| Source | Status |
+|---|---|
+| **Wayback CDX** | working. It previously returned nothing on *every* target: the URL was `http://`, `web.archive.org` 301s to HTTPS, and the shared enum client does not follow redirects. Fixed. |
+| **OTX** | answers anonymous callers `429 — "Anonymous access to this endpoint is limited. Please authenticate."` Effectively no longer keyless; kept for anyone fronting it with credentials. |
+| **Anubis** | `jldc.me` now 301s to `jonlu.ca`, which blocks automated clients with a 403. Effectively unavailable. |
+
+A source that works for one domain in the scope is not reported as failed
+because it 403'd on another.
 
 Note that lrecon deliberately does **not** send `exclude=expired`. It shrinks the
 result set (fewer planner timeouts) but measured against `example.com` it dropped
@@ -614,16 +630,37 @@ longer looks hung.
 ## People OSINT (user enumeration)
 
 Builds a red-team phishing/password-spray candidate list — **company-affiliated
-data only**, never personal accounts or personal contact info. Runs automatically
-whenever a Hunter.io, RocketReach, or GitHub key is configured (same "presence of
-a key = opt-in" convention as the rest of lrecon's keyed enrichment); output goes
-to `<out>.users.csv` and the `people` block in the JSON.
+data only**, never personal accounts or personal contact info. Output goes to
+`<out>.users.csv`, a People section in the Markdown/HTML reports, and the
+`people` block in the JSON.
 
 | Source | What it gives you | Notes |
 |---|---|---|
+| **Website scrape** | addresses the target published on its own pages | **keyless**, runs on any active scope |
 | **Hunter.io** | known company emails + the detected naming pattern (e.g. `{first}.{last}`) | official domain-search API |
 | **GitHub** | company emails leaked in public commit/code history | reuses your `GITHUB_TOKEN`; shares the code-search rate limit with `--github` dorking |
 | **RocketReach** | name + title (no email) via their official search API | see caveat below |
+
+The keyed sources follow the usual "presence of a key = opt-in" convention. The
+website scrape needs no key and runs on any active scope, because otherwise a
+scope with no API keys produced an empty people list that read as *"nobody is
+exposed"* when in truth nothing had been looked at. It fetches a short list of
+likely contact paths (`/`, `/contact`, `/about`, `/team`, `/imprint`, …) on a few
+in-scope live hosts — contact-page discovery, not a crawl — and is skipped under
+`--passive-only` since it touches the target. Only addresses **at the in-scope
+domain** are kept: a vendor's address in a footer is that vendor's exposure, and
+collecting it would put out-of-scope people in a client deliverable.
+
+**Individuals vs shared mailboxes.** The report counts them separately, because
+"how many of our users are exposed" is a headcount question and `info@`/`noreply@`
+is not headcount. Only mailboxes matching lrecon's known role names are split
+out, so a mailing list or alias still counts as individual — read the first
+figure as a floor on exposed addresses rather than a verified headcount.
+
+**When a keyed source returns nothing, it says why.** Hunter answers both "this
+domain has nothing indexed" and "your account is out of credits" with a `200` and
+an empty list; lrecon logs the distinction (including Hunter's own error text)
+instead of letting an exhausted account read as a clean result.
 
 **No LinkedIn scraping.** lrecon does not scrape LinkedIn (or RocketReach's site)
 directly — that would mean defeating anti-automation measures and violating
@@ -861,7 +898,27 @@ paid tool like DomainTools normally provides; **`--vt`** gets you the
 closest free equivalent via VirusTotal's official public API v3:
 
 - **Historical IP resolutions** (hosting history) — every domain→IP passive-DNS
-  resolution VT has observed, newest first, each with a first-seen date.
+  resolution VT has observed, newest first, each with a first-seen date, **plus
+  ASN / org / country / rDNS per address**. A bare list of IPs and dates says a
+  domain moved, not what it moved between; the org is what makes the history
+  readable — a former colo or cloud tenancy is a very different story from a
+  former CDN. One IPinfo lookup per unique address, deduped across domains, and
+  keyless (IPinfo answers unauthenticated at a lower rate limit).
+- **Origin candidates** — an address a **currently Cloudflare-fronted** domain
+  used to answer on directly is flagged: a plausible unproxied origin, the same
+  thing the [Cloudflare origin phase](#cloudflare-origin-exposure) hunts for,
+  reached through passive history instead of active probing. Three conditions
+  all have to hold — the domain is CDN-fronted *today* (decided per domain from
+  its own live IPs), the historical address is not itself Cloudflare, and it is
+  not still live *for that domain*. Without the first, every past address of an
+  unproxied domain becomes an "origin", which is just a hosting change with a
+  scary label; without the third, a shared IP in a multi-domain scope lets one
+  domain's live set hide another's stale record. When a domain has no live IPs
+  (`--passive-only` skips resolution) the check does not run, and the report
+  says so rather than showing an empty column that reads as clean. Verify a
+  candidate by fetching the IP with the target's `Host` header — it is a lead,
+  not a conclusion, since a shared host or a reassigned cloud address looks
+  identical from the outside.
 - **WHOIS mirror, cached DNS records, reputation/detection stats** — VT's own
   domain snapshot, useful as a cross-check against the RDAP data above.
 

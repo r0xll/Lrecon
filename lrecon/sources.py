@@ -167,51 +167,116 @@ async def enum_certspotter(client, domain: str) -> set:
     return out
 
 
+class SourceSet(set):
+    """Hosts a source found, plus whether the source actually worked.
+
+    A blocked, rate-limited or relocated source returns an empty set — exactly
+    what a working source with nothing to say returns. The per-source
+    attribution line then reads `otx=0` for both, which is the difference
+    between a fact about the target and a fact about lrecon being broken.
+    Carrying the outcome alongside the hosts keeps the two apart.
+
+    Subclasses `set` so every existing consumer (`isinstance(res, set)`, set
+    comparisons in tests, iteration) keeps working untouched.
+    """
+    def __init__(self, *args, failed: bool = False, detail: str | None = None):
+        super().__init__(*args)
+        self.failed = failed
+        self.detail = detail
+
+
+def _source_failed(source: str, domain: str, detail: str) -> SourceSet:
+    log(f"[!] {source} {domain}: {detail}")
+    return SourceSet(failed=True, detail=detail)
+
+
+def _exc_detail(e: Exception) -> str:
+    """Exception text that still says something when str(e) is empty.
+
+    httpx's timeout exceptions stringify to "", so a bare str(e) produced
+    `wayback github.com: ` — a failure notice naming no failure.
+    """
+    return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
 async def enum_otx(client, domain: str) -> set:
-    """AlienVault OTX passive DNS — keyless."""
-    out = set()
+    """AlienVault OTX passive DNS.
+
+    No longer keyless in practice: the endpoint now answers anonymous callers
+    with 429 "Anonymous access to this endpoint is limited. Please
+    authenticate." It is kept because it still works for anyone with OTX
+    credentials in front of it, and reports the refusal rather than looking
+    like a domain with no passive DNS.
+    """
     url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
     try:
         r = await client.get(url, timeout=30)
-        if r.status_code == 200:
-            for rec in r.json().get("passive_dns", []):
-                h = rec.get("hostname", "").strip().lower()
-                if h.endswith(domain):
-                    out.add(h)
+        if r.status_code == 429:
+            return _source_failed("otx", domain,
+                                  "HTTP 429 — OTX now rate-limits/refuses anonymous "
+                                  "access to passive DNS; not a sign the domain is clean")
+        if r.status_code != 200:
+            return _source_failed("otx", domain, f"HTTP {r.status_code}")
+        out = SourceSet()
+        for rec in r.json().get("passive_dns", []):
+            h = rec.get("hostname", "").strip().lower()
+            if h.endswith(domain):
+                out.add(h)
+        return out
     except Exception as e:
-        log(f"[!] otx {domain}: {e}")
-    return out
+        return _source_failed("otx", domain, _exc_detail(e))
 
 
 async def enum_anubis(client, domain: str) -> set:
-    """jldc.me Anubis subdomain DB — keyless."""
-    out = set()
+    """jldc.me Anubis subdomain DB — keyless.
+
+    jldc.me 301s to jonlu.ca, which sits behind bot protection and answers 403,
+    so this source is effectively unavailable to automation. Kept (rather than
+    deleted) because the redirect target may reopen, and because reporting the
+    403 tells an operator to stop expecting hosts from it.
+    """
     try:
-        r = await client.get(f"https://jldc.me/anubis/subdomains/{domain}", timeout=30)
-        if r.status_code == 200:
-            for n in r.json():
-                n = n.strip().lower()
-                if n.endswith(domain):
-                    out.add(n)
+        r = await client.get(f"https://jldc.me/anubis/subdomains/{domain}",
+                             timeout=30, follow_redirects=True)
+        if r.status_code == 403:
+            return _source_failed("anubis", domain,
+                                  "HTTP 403 — jldc.me now redirects to jonlu.ca, which "
+                                  "blocks automated clients; source unavailable")
+        if r.status_code != 200:
+            return _source_failed("anubis", domain, f"HTTP {r.status_code}")
+        out = SourceSet()
+        for n in r.json():
+            n = n.strip().lower()
+            if n.endswith(domain):
+                out.add(n)
+        return out
     except Exception as e:
-        log(f"[!] anubis {domain}: {e}")
-    return out
+        return _source_failed("anubis", domain, _exc_detail(e))
 
 
 async def enum_wayback(client, domain: str) -> set:
-    out = set()
-    url = (f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
+    """Wayback CDX index — keyless.
+
+    HTTPS is required, not cosmetic: web.archive.org answers plain HTTP with a
+    301 to the same URL over TLS, and the shared enum client is
+    `follow_redirects=False`, so the old `http://` URL never returned a single
+    host on any target. `follow_redirects=True` is belt-and-braces for the
+    archive's own internal redirects.
+    """
+    url = (f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
            f"&output=json&fl=original&collapse=urlkey&limit=10000")
     try:
-        r = await client.get(url, timeout=45)
-        if r.status_code == 200:
-            for row in r.json()[1:]:
-                host = row[0].split("//")[-1].split("/")[0].split(":")[0].lower()
-                if host.endswith(domain):
-                    out.add(host)
+        r = await client.get(url, timeout=45, follow_redirects=True)
+        if r.status_code != 200:
+            return _source_failed("wayback", domain, f"HTTP {r.status_code}")
+        out = SourceSet()
+        for row in r.json()[1:]:
+            host = row[0].split("//")[-1].split("/")[0].split(":")[0].lower()
+            if host.endswith(domain):
+                out.add(host)
+        return out
     except Exception as e:
-        log(f"[!] wayback {domain}: {e}")
-    return out
+        return _source_failed("wayback", domain, _exc_detail(e))
 
 
 async def enum_shodan_dns(client, domain: str, key: str) -> set:
@@ -244,10 +309,16 @@ async def enum_subfinder(domain: str) -> set:
 
 async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict, dict]:
     """
-    Returns (host_sources, per_source_counts):
+    Returns (host_sources, per_source_counts, failed_sources):
       host_sources: {hostname -> set(source_names)}
       per_source_counts: {source_name -> count of in-scope hosts it found}
+      failed_sources: {source_name -> why it didn't work}
     Every source is fanned out across every domain concurrently.
+
+    `failed_sources` exists because a count of 0 is ambiguous on its own: it
+    means "this domain has no hosts here" for a working source and "this source
+    is blocked" for a broken one, and only the first is a finding about the
+    target.
     """
     jobs = []                                       # (source_name, coroutine)
     for d in domains:
@@ -266,15 +337,24 @@ async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict
 
     host_sources: dict = defaultdict(set)
     per_source: dict = defaultdict(int)
+    failed: dict = {}
     for (src, _), res in zip(jobs, results):
+        if isinstance(res, BaseException):
+            failed.setdefault(src, str(res))
+            continue
         if isinstance(res, set):
+            if getattr(res, "failed", False):
+                failed.setdefault(src, res.detail or "source unavailable")
             in_scope = {n for n in res if any(n.endswith(d) for d in domains)}
             per_source[src] += len(in_scope)
             for n in in_scope:
                 host_sources[n].add(src)
+    # A source that worked for one domain isn't broken, whatever it did on
+    # another — don't let one domain's failure indict the whole source.
+    failed = {s: why for s, why in failed.items() if not per_source.get(s)}
     for d in domains:                               # seed apexes
         host_sources[d].add("seed")
-    return host_sources, per_source
+    return host_sources, per_source, failed
 
 
 
