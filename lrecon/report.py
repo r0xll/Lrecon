@@ -818,8 +818,8 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append("")
 
     lines += ["## Attack surface", "",
-              "| Subdomain | IP(s) | ASN / Org | Open Ports | Tech | HTTP | CVEs |",
-              "|---|---|---|---|---|---|---|"]
+              "| Subdomain | IP(s) | ASN / Org | Country | Open Ports | Tech | HTTP | CVEs |",
+              "|---|---|---|---|---|---|---|---|"]
     for h in hosts:
         if h.wildcard:
             continue
@@ -829,7 +829,8 @@ def write_markdown(hosts, domains, res, path) -> None:
         tech = h.server or h.powered_by or (h.cpes[0] if h.cpes else "—")
         http = f"{h.scheme} {h.http_status}" if h.http_status else "—"
         v = ", ".join(h.vulns[:5]) + ("…" if len(h.vulns) > 5 else "") if h.vulns else "—"
-        lines.append(f"| {h.subdomain} | {ips} | {asn_org} | {ports} | {tech} | {http} | {v} |")
+        lines.append(f"| {h.subdomain} | {ips} | {asn_org} | {host_countries(h)} | {ports} "
+                     f"| {tech} | {http} | {v} |")
     if any(non_web_ports(h.ports) for h in hosts if not h.wildcard):
         lines.append("")
         lines.append("> **Bold** ports are non-web services (SSH, RDP, databases, etc.) — the "
@@ -863,6 +864,40 @@ def _html_section(section_id: str, title: str, count, body_html: str, open_defau
     return (f'<details class="section" id="{section_id}"{open_attr}>'
             f'<summary>{title}{badge}</summary>'
             f'<div class="section-body">{body_html}</div></details>')
+
+
+def _html_filter_toolbar(table_id: str) -> str:
+    """Row counter + reset for a filterable table.
+
+    The counter is not decoration: a filtered table looks exactly like a short
+    one, and reading "12 hosts" off a table that is silently hiding 300 is the
+    same class of mistake as a blocked source reporting 0.
+    """
+    return (f'<div class="filterbar"><span class="filtercount" '
+            f'data-for="{table_id}"></span>'
+            f'<button class="export-btn" type="button" '
+            f'onclick="resetFilters(\'{table_id}\')">Reset filters</button></div>')
+
+
+def _html_filter_row(columns: list) -> str:
+    cells = "".join(
+        f'<th class="filter-th"><input type="text" class="filter-input" '
+        f'placeholder="{c}" aria-label="Filter by {c}"></th>' for c in columns)
+    return f'<tr class="filter-row">{cells}</tr>'
+
+
+def host_countries(h) -> str:
+    """Every country a host's addresses sit in, not just the first one.
+
+    `Host.country` is first-IP-wins, so a host balanced across regions reports
+    one of them and looks like a single-country asset — which is exactly the
+    wrong answer for the scoping and data-residency questions this column gets
+    read for. The per-IP map is preferred when populated; `country` is the
+    fallback for hosts enriched before it existed, or via a path that had no
+    per-IP breakdown.
+    """
+    seen = sorted({c for c in (getattr(h, "ip_country", None) or {}).values() if c})
+    return ", ".join(seen) or (h.country or "—")
 
 
 def _html_export_button(table_id: str, filename: str) -> str:
@@ -1443,13 +1478,22 @@ def write_html(hosts, domains, res, path) -> None:
         rows.append(
             f"<tr><td>{esc(h.subdomain)}</td><td>{', '.join(h.ips) or '—'}</td>"
             f"<td>{esc(((h.asn or '') + ' ' + (h.org or '')).strip())[:40] or '—'}</td>"
+            f"<td>{esc(host_countries(h))}</td>"
             f"<td>{_format_ports_html(h.ports)}</td>"
             f"<td>{esc(h.server or h.powered_by or None)}</td>"
             f"<td>{(str(h.http_status) if h.http_status else '—')}</td>"
             f"<td>{esc(cves)}</td></tr>")
+    as_cols = ["Subdomain", "IP(s)", "ASN/Org", "Country", "Open Ports", "Tech", "HTTP", "CVEs"]
     body = (f'{_html_export_button("t-attacksurface", "attack_surface.csv")}'
-            f'<table id="t-attacksurface"><tr><th>Subdomain</th><th>IP(s)</th><th>ASN/Org</th>'
-            f'<th>Open Ports</th><th>Tech</th><th>HTTP</th><th>CVEs</th></tr>{"".join(rows)}</table>')
+            f'{_html_filter_toolbar("t-attacksurface")}'
+            f'<table id="t-attacksurface" data-filterable="1">'
+            f'<tr>{"".join(f"<th>{c}</th>" for c in as_cols)}</tr>'
+            f'{_html_filter_row(as_cols)}'
+            f'{"".join(rows)}</table>'
+            '<p class="note">Type in a column box to narrow the table; prefix with '
+            '<code>!</code> to exclude instead (<code>!403</code> hides the 403s). Empty '
+            'cells show as <code>—</code>, so <code>!—</code> under CVEs leaves only hosts '
+            'that have one. Export CSV writes exactly the rows on screen.</p>')
     if any_nonweb:
         body += ('<p class="note">Highlighted ports are non-web services (SSH, RDP, databases, '
                 'etc.) — the HTTP probe never touches them, so they need a manual look.</p>')
@@ -1514,6 +1558,16 @@ th, td {{ border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-a
 th {{ background: #f4f4f4; position: sticky; top: 0; }}
 code {{ background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }}
 tr:nth-child(even) {{ background: #fafafa; }}
+.filterbar {{ display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; }}
+.filtercount {{ font-size: .8rem; color: #666; }}
+/* Sits directly under the sticky header so the inputs stay reachable while
+   scrolling a long table. 1.9rem is the header's own height. */
+th.filter-th {{ position: sticky; top: 1.9rem; background: #f4f4f4; padding: 2px 4px; }}
+.filter-input {{ font: inherit; font-size: 12px; width: 100%; box-sizing: border-box;
+                padding: 2px 4px; border: 1px solid #ccc; border-radius: 3px;
+                background: #fff; color: inherit; font-weight: 400; }}
+.filter-input:focus {{ outline: 2px solid #b31b1b; outline-offset: -1px; }}
+tr.filter-row {{ background: #f4f4f4 !important; }}
 .note {{ color: #555; font-style: italic; }}
 .sev {{ display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px;
        font-weight: 700; letter-spacing: .02em; }}
@@ -1549,6 +1603,11 @@ h4 {{ margin: 1.1rem 0 .4rem; font-size: 14px; }}
   th, td {{ border-color: #3a3d44; }}
   code {{ background: #2a2d33; }}
   tr:nth-child(even) {{ background: #1c1f24; }}
+  .filtercount {{ color: #999; }}
+  th.filter-th {{ background: #23262c; }}
+  tr.filter-row {{ background: #23262c !important; }}
+  .filter-input {{ background: #16181c; border-color: #555; color: #e6e6e6; }}
+  .filter-input:focus {{ outline-color: #ff8a80; }}
   .note {{ color: #aaa; }}
   .bad {{ color: #ff8a80; }}
   .warn {{ color: #ffb74d; }}
@@ -1582,7 +1641,13 @@ exactly what's rendered on this page, which may be truncated for display.</p>
 function exportTableToCSV(tableId, filename) {{
   var table = document.getElementById(tableId);
   if (!table) return;
-  var rows = Array.prototype.slice.call(table.querySelectorAll('tr'));
+  var rows = Array.prototype.slice.call(table.querySelectorAll('tr'))
+    // The filter row is UI, not data, and a hidden row is one the operator
+    // has deliberately excluded — exporting either produces a file that
+    // doesn't match what is on screen.
+    .filter(function(row) {{
+      return !row.classList.contains('filter-row') && row.style.display !== 'none';
+    }});
   var csv = rows.map(function(row) {{
     var cells = Array.prototype.slice.call(row.querySelectorAll('th,td'));
     return cells.map(function(cell) {{
@@ -1599,6 +1664,55 @@ function exportTableToCSV(tableId, filename) {{
 function toggleAllSections(open) {{
   document.querySelectorAll('details.section').forEach(function(d) {{ d.open = open; }});
 }}
+// Live column filters. Substring, case-insensitive, all columns ANDed; a
+// leading '!' negates so rows can be excluded as well as selected.
+function _filterTerm(raw) {{
+  var v = raw.trim().toLowerCase();
+  if (!v) return null;
+  if (v.charAt(0) === '!') {{
+    var rest = v.slice(1).trim();
+    return rest ? {{negate: true, text: rest}} : null;
+  }}
+  return {{negate: false, text: v}};
+}}
+function applyFilters(table) {{
+  var inputs = Array.prototype.slice.call(table.querySelectorAll('.filter-input'));
+  var terms = inputs.map(function(i) {{ return _filterTerm(i.value); }});
+  var body = Array.prototype.slice.call(table.querySelectorAll('tr')).filter(function(r) {{
+    return !r.classList.contains('filter-row') && !r.querySelector('th');
+  }});
+  var shown = 0;
+  body.forEach(function(row) {{
+    var cells = row.querySelectorAll('td');
+    var keep = terms.every(function(term, i) {{
+      if (!term || !cells[i]) return true;
+      var hit = cells[i].textContent.toLowerCase().indexOf(term.text) !== -1;
+      return term.negate ? !hit : hit;
+    }});
+    row.style.display = keep ? '' : 'none';
+    if (keep) shown++;
+  }});
+  var counter = document.querySelector('.filtercount[data-for="' + table.id + '"]');
+  if (counter) {{
+    counter.textContent = shown === body.length
+      ? ('showing all ' + body.length + ' row(s)')
+      : ('showing ' + shown + ' of ' + body.length + ' row(s) — filtered');
+  }}
+}}
+function resetFilters(tableId) {{
+  var table = document.getElementById(tableId);
+  if (!table) return;
+  table.querySelectorAll('.filter-input').forEach(function(i) {{ i.value = ''; }});
+  applyFilters(table);
+}}
+document.addEventListener('DOMContentLoaded', function() {{
+  document.querySelectorAll('table[data-filterable]').forEach(function(table) {{
+    table.querySelectorAll('.filter-input').forEach(function(input) {{
+      input.addEventListener('input', function() {{ applyFilters(table); }});
+    }});
+    applyFilters(table);
+  }});
+}});
 </script>
 </body></html>"""
     Path(path).write_text(doc)

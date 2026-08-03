@@ -65,6 +65,8 @@ def apply_ipinfo(h: Host, data: dict, ip: str | None = None) -> None:
                 h.ip_org[ip] = org
     h.rdns = h.rdns or data.get("hostname")
     h.country = h.country or data.get("country")
+    if ip and data.get("country"):
+        h.ip_country[ip] = data["country"]
 
 
 def apply_ports(h: Host, data: dict, src: str) -> None:

@@ -266,11 +266,25 @@ Per run, `<out>.*`:
   breach/GitHub/bucket exposure, nuclei findings, email posture, domain registration (WHOIS/RDAP),
   VirusTotal domain intelligence & IP/hosting history, DNS records, mail infrastructure,
   search-engine dork hits, Cloudflare origin exposure, subdomain-takeover leads, favicon pivots,
-  full attack-surface table, CVE hits.
+  full attack-surface table (with per-host country), CVE hits.
 - **`<out>.html`** — self-contained styled HTML report for client sharing. Same section
   coverage as the Markdown report, each in a collapsible panel (expand/collapse-all
   toggle, light/dark/print styles) with a client-side "Export CSV" button per table —
   no server, no external JS/CSS, works fully offline from the file.
+
+  The **attack-surface table is filterable in place**, which is what makes it usable
+  on a scope with hundreds of rows. Each column has a box under its header:
+
+  | Type | Effect |
+  |---|---|
+  | `nginx` in **Tech** | keep only rows whose Tech contains `nginx` |
+  | `!403` in **HTTP** | *remove* the 403s — a leading `!` negates |
+  | `!—` in **CVEs** | only hosts that have a CVE (empty cells render as `—`) |
+
+  Filters across columns are ANDed, matching is case-insensitive substring, and a
+  `showing N of M` counter sits above the table so a filtered view is never mistaken
+  for a short one. **Export CSV writes exactly the rows on screen** — filter, then
+  export, and the file matches what you were looking at.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
   favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people,
   auth_surface).
