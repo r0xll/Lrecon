@@ -89,7 +89,8 @@ async def vt_ip_history(client, domain: str, api_key: str, limit: int = 20) -> l
     return []
 
 
-async def enrich_ip_history(client, vt_intel: dict, ipinfo_token, cf_nets, live_ips) -> int:
+async def enrich_ip_history(client, vt_intel: dict, ipinfo_token, cf_nets,
+                            live_by_domain: dict | None = None) -> int:
     """Attach ASN/org/country to each historical IP, and mark origin candidates.
 
     A bare list of past IPs and dates is close to unusable on an engagement: it
@@ -98,13 +99,28 @@ async def enrich_ip_history(client, vt_intel: dict, ipinfo_token, cf_nets, live_
     history worth reading — a former colo or cloud tenancy is a very different
     story from a former CDN.
 
-    The red-team payload is `origin_candidate`: a historical IP that is *not*
-    Cloudflare and is no longer in the domain's live set. If the domain sits
-    behind Cloudflare today, an address it used to answer on is a plausible
-    unproxied origin — the same thing the CF-origin phase hunts for, reached
+    The red-team payload is `origin_candidate`: an address the domain used to
+    answer on directly while it is *now* behind Cloudflare — a plausible
+    unproxied origin, the same thing the CF-origin phase hunts for, reached
     through passive history instead of active probing. It is a lead to verify by
     fetching the IP with the target's Host header, not a conclusion; a shared
-    host or a long-since-reassigned cloud address will look identical here.
+    host or a long-since-reassigned cloud address looks identical here.
+
+    Three conditions all have to hold, and each one is load-bearing:
+
+      * **the domain is Cloudflare-fronted today** — decided per domain from its
+        own live IPs. Without this every past address of an unproxied domain
+        becomes an "origin", which is just a hosting change with a scary label;
+      * **the historical address is not itself Cloudflare** — otherwise it is
+        the CDN, not what sits behind it;
+      * **it is not still live for that same domain** — checked against that
+        domain's own addresses, because in a multi-domain scope a shared IP
+        would otherwise let one domain's live set hide another's stale record.
+
+    When a domain has no live IPs — `--passive-only` skips resolution entirely —
+    its fronted state is unknown, and nothing is flagged. Each domain records
+    which of those it was in `origin_check` so the report can say why the column
+    is empty instead of implying a clean result.
 
     Lookups are deduped across domains, so a domain that never moved off one
     address costs one call. Returns the number of IPs enriched.
@@ -115,16 +131,20 @@ async def enrich_ip_history(client, vt_intel: dict, ipinfo_token, cf_nets, live_
         return 0
     infos = await asyncio.gather(*(enrich_ipinfo(client, ip, ipinfo_token) for ip in unique))
     by_ip = dict(zip(unique, infos))
-    live = set(live_ips or ())
     nets = _cf_nets(cf_nets)
-    for r in rows:
-        data = by_ip.get(r.get("ip")) or {}
-        r["asn"], r["org"] = _ipinfo_asn_org(data)
-        r["country"] = data.get("country")
-        r["rdns"] = data.get("hostname")
-        behind_cf = in_cf(r["ip"], nets)
-        r["cloudflare"] = behind_cf
-        r["origin_candidate"] = bool(not behind_cf and r["ip"] not in live)
+    for domain, v in vt_intel.items():
+        live = set((live_by_domain or {}).get(domain) or ())
+        fronted = any(in_cf(ip, nets) for ip in live)
+        v["origin_check"] = ("fronted" if fronted else
+                             "not_fronted" if live else "unknown")
+        for r in (v.get("ip_history") or []):
+            data = by_ip.get(r.get("ip")) or {}
+            r["asn"], r["org"] = _ipinfo_asn_org(data)
+            r["country"] = data.get("country")
+            r["rdns"] = data.get("hostname")
+            behind_cf = in_cf(r["ip"], nets)
+            r["cloudflare"] = behind_cf
+            r["origin_candidate"] = bool(fronted and not behind_cf and r["ip"] not in live)
     return len(unique)
 
 

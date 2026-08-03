@@ -453,9 +453,16 @@ async def run(domains, args, keys) -> list:
         # ranges are only loaded above, and "was this address behind the CDN"
         # is the part of the history worth acting on.
         if vt_intel:
-            live_ips = {ip for h in hosts.values() if not h.wildcard for ip in h.ips}
+            # Per domain, not pooled: a shared IP that is live for one scoped
+            # domain must not hide another domain's stale record.
+            live_by_domain = {}
+            for d in domains:
+                live_by_domain[d] = {ip for h in hosts.values()
+                                     if not h.wildcard and h.ips
+                                     and (h.subdomain == d or h.subdomain.endswith("." + d))
+                                     for ip in h.ips}
             n_hist_ips = await enrich_ip_history(client, vt_intel, ipinfo_token,
-                                                 cf_nets, live_ips)
+                                                 cf_nets, live_by_domain)
             if n_hist_ips:
                 n_origin = sum(1 for v in vt_intel.values()
                                for r in (v.get("ip_history") or [])
@@ -463,6 +470,12 @@ async def run(domains, args, keys) -> list:
                 log(f"[+] VirusTotal hosting history: {n_hist_ips} historical IP(s) enriched"
                     + (f" — {n_origin} outside Cloudflare and no longer live "
                        f"(origin candidate(s) to verify)" if n_origin else ""))
+                unknown = [d for d, v in vt_intel.items()
+                           if v.get("origin_check") == "unknown"]
+                if unknown:
+                    log(f"[i] hosting history: origin-candidate check skipped for "
+                        f"{', '.join(sorted(unknown))} — no live IPs to compare against, "
+                        f"so whether the domain is CDN-fronted is unknown (not a clean result)")
 
         # ---- Favicon pivot (shodan) — find shadow assets sharing favicon ----
         favicon_pivots = {}

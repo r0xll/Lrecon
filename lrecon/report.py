@@ -91,6 +91,27 @@ def _split_people_by_kind(people: list) -> tuple:
     return staff, roles
 
 
+def _vt_origin_check_notes(vt: dict) -> list:
+    """Why a domain has no origin candidates, when the reason isn't "none exist".
+
+    An empty column reads as a clean result, and for a domain lrecon couldn't
+    assess it isn't one — the check simply didn't run.
+    """
+    unknown = sorted(d for d, v in vt.items() if v.get("origin_check") == "unknown")
+    not_fronted = sorted(d for d, v in vt.items() if v.get("origin_check") == "not_fronted")
+    out = []
+    if unknown:
+        out.append(f"> Origin-candidate check **not run** for {', '.join(unknown)} — no live "
+                   f"IPs to compare against (`--passive-only` skips resolution), so whether "
+                   f"the domain is CDN-fronted is unknown. Absence of candidates here is not "
+                   f"a clean result.")
+    if not_fronted:
+        out.append(f"> Origin-candidate check **not applicable** to "
+                   f"{', '.join(not_fronted)} — not Cloudflare-fronted today, so a former "
+                   f"address is a hosting change rather than a bypassable origin.")
+    return out + [""] if out else []
+
+
 def _vt_history_note(r: dict) -> str:
     """What a hosting-history row means, in a word. Blank when it means nothing
     in particular — a note on every row is a note on none of them."""
@@ -428,12 +449,13 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append("")
             if any(r.get("origin_candidate") for v in vt.values()
                    for r in (v.get("ip_history") or [])):
-                lines += ["> **Origin candidates** are historical IPs that are not Cloudflare "
-                          "and are no longer in the live set — an address the domain used to "
-                          "answer on directly. Worth a fetch with the target's `Host` header "
-                          "to see whether the origin still serves there behind the CDN. "
+                lines += ["> **Origin candidates** are addresses a *currently Cloudflare-fronted* "
+                          "domain used to answer on directly — not Cloudflare themselves, and no "
+                          "longer live for that domain. Worth a fetch with the target's `Host` "
+                          "header to see whether the origin still serves there behind the CDN. "
                           "Treat as a lead: a shared host or a reassigned cloud address looks "
                           "the same from here.", ""]
+            lines += _vt_origin_check_notes(vt)
         lines += ["> Free-tier VirusTotal domain intelligence — passive DNS history VT has "
                   "observed, not a live scan. A high malicious/suspicious vote count on a "
                   "client-owned domain is usually a false positive from prior compromise or "
@@ -971,12 +993,15 @@ def write_html(hosts, domains, res, path) -> None:
                      f'<th>Note</th></tr>{history_rows}</table>')
             if any(r.get("origin_candidate") for v in vt.values()
                    for r in (v.get("ip_history") or [])):
-                body += ('<p class="note"><b>Origin candidates</b> are historical IPs that are '
-                         'not Cloudflare and are no longer in the live set — an address the '
-                         'domain used to answer on directly. Worth a fetch with the target\'s '
-                         'Host header to see whether the origin still serves there behind the '
-                         'CDN. Treat as a lead: a shared host or a reassigned cloud address '
-                         'looks the same from here.</p>')
+                body += ('<p class="note"><b>Origin candidates</b> are addresses a <i>currently '
+                         'Cloudflare-fronted</i> domain used to answer on directly — not '
+                         'Cloudflare themselves, and no longer live for that domain. Worth a '
+                         'fetch with the target\'s Host header to see whether the origin still '
+                         'serves there behind the CDN. Treat as a lead: a shared host or a '
+                         'reassigned cloud address looks the same from here.</p>')
+            for note in _vt_origin_check_notes(vt):
+                if note:
+                    body += f'<p class="note">{esc(note.lstrip("> ")).replace("**", "")}</p>'
         body += ('<p class="note">Free-tier VirusTotal domain intelligence — passive DNS '
                  'history VT has observed, not a live scan. A high malicious/suspicious vote '
                  'count on a client-owned domain is usually a false positive from prior '

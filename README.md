@@ -904,14 +904,21 @@ closest free equivalent via VirusTotal's official public API v3:
   readable — a former colo or cloud tenancy is a very different story from a
   former CDN. One IPinfo lookup per unique address, deduped across domains, and
   keyless (IPinfo answers unauthenticated at a lower rate limit).
-- **Origin candidates** — a historical IP that is **not** Cloudflare and is no
-  longer in the live set is flagged. If the domain sits behind Cloudflare today,
-  an address it used to answer on directly is a plausible unproxied origin: the
-  same thing the [Cloudflare origin phase](#cloudflare-origin-exposure) hunts
-  for, reached through passive history instead of active probing. Verify by
-  fetching the IP with the target's `Host` header — it is a lead, not a
-  conclusion, since a shared host or a reassigned cloud address looks identical
-  from the outside.
+- **Origin candidates** — an address a **currently Cloudflare-fronted** domain
+  used to answer on directly is flagged: a plausible unproxied origin, the same
+  thing the [Cloudflare origin phase](#cloudflare-origin-exposure) hunts for,
+  reached through passive history instead of active probing. Three conditions
+  all have to hold — the domain is CDN-fronted *today* (decided per domain from
+  its own live IPs), the historical address is not itself Cloudflare, and it is
+  not still live *for that domain*. Without the first, every past address of an
+  unproxied domain becomes an "origin", which is just a hosting change with a
+  scary label; without the third, a shared IP in a multi-domain scope lets one
+  domain's live set hide another's stale record. When a domain has no live IPs
+  (`--passive-only` skips resolution) the check does not run, and the report
+  says so rather than showing an empty column that reads as clean. Verify a
+  candidate by fetching the IP with the target's `Host` header — it is a lead,
+  not a conclusion, since a shared host or a reassigned cloud address looks
+  identical from the outside.
 - **WHOIS mirror, cached DNS records, reputation/detection stats** — VT's own
   domain snapshot, useful as a cross-check against the RDAP data above.
 

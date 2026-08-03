@@ -4175,8 +4175,9 @@ async def test_vt_ip_history_is_enriched_and_flags_origin_candidates():
     orig = lrecon.vt.enrich_ipinfo
     lrecon.vt.enrich_ipinfo = fake_ipinfo
     try:
+        # Live set includes a Cloudflare address, so the domain is fronted today.
         n = await _vt.enrich_ip_history(None, vt_intel, None, CF_FALLBACK,
-                                        live_ips={"198.51.100.5"})
+                                        {"x.com": {"198.51.100.5", "104.16.0.9"}})
     finally:
         lrecon.vt.enrich_ipinfo = orig
     assert n == 3 and sorted(seen) == sorted(payloads)          # one lookup per unique IP
@@ -4193,7 +4194,70 @@ async def test_vt_ip_history_is_enriched_and_flags_origin_candidates():
 
 async def test_vt_ip_history_enrichment_is_a_no_op_without_history():
     from lrecon import vt as _vt
-    assert await _vt.enrich_ip_history(None, {"x.com": {}}, None, [], set()) == 0
+    assert await _vt.enrich_ip_history(None, {"x.com": {}}, None, [], {}) == 0
+
+
+async def _enrich_with_stub(vt_intel, live_by_domain, nets=CF_FALLBACK):
+    """enrich_ip_history with IPinfo stubbed out — these cases are about the
+    origin-candidate logic, not the lookup."""
+    import lrecon.vt
+    from lrecon import vt as _vt
+
+    async def fake_ipinfo(client, ip, token):
+        return {}
+    orig = lrecon.vt.enrich_ipinfo
+    lrecon.vt.enrich_ipinfo = fake_ipinfo
+    try:
+        return await _vt.enrich_ip_history(None, vt_intel, None, nets, live_by_domain)
+    finally:
+        lrecon.vt.enrich_ipinfo = orig
+
+
+async def test_origin_candidates_need_the_domain_to_be_fronted_today():
+    """A domain that isn't behind a CDN has no origin to bypass — every past
+    address of one is an ordinary hosting change, not a lead."""
+    vt_intel = {"x.com": {"ip_history": [{"ip": "203.0.113.9"}]}}
+    await _enrich_with_stub(vt_intel, {"x.com": {"198.51.100.5"}})   # no CF in the live set
+    assert vt_intel["x.com"]["origin_check"] == "not_fronted"
+    assert vt_intel["x.com"]["ip_history"][0]["origin_candidate"] is False
+
+
+async def test_origin_candidates_are_skipped_when_fronted_state_is_unknown():
+    """--passive-only skips resolution, so there are no live IPs to compare
+    against. Flagging everything there would invent leads out of missing data."""
+    vt_intel = {"x.com": {"ip_history": [{"ip": "203.0.113.9"}]}}
+    await _enrich_with_stub(vt_intel, {})
+    assert vt_intel["x.com"]["origin_check"] == "unknown"
+    assert vt_intel["x.com"]["ip_history"][0]["origin_candidate"] is False
+
+
+async def test_one_domains_live_ip_does_not_hide_anothers_stale_record():
+    """In a multi-domain scope a shared address is live for one domain and stale
+    for another; a pooled live set silently suppressed the second."""
+    vt_intel = {"a.com": {"ip_history": [{"ip": "203.0.113.9"}]},
+                "b.com": {"ip_history": [{"ip": "203.0.113.9"}]}}
+    await _enrich_with_stub(vt_intel, {"a.com": {"104.16.0.1"},              # fronted, stale
+                                       "b.com": {"104.16.0.1", "203.0.113.9"}})  # still live
+    assert vt_intel["a.com"]["ip_history"][0]["origin_candidate"] is True
+    assert vt_intel["b.com"]["ip_history"][0]["origin_candidate"] is False
+
+
+def test_report_says_why_the_origin_check_did_not_run():
+    """An empty column reads as a clean result; for a domain lrecon couldn't
+    assess, it isn't one."""
+    res = {"vt": {"skipped.com": {"origin_check": "unknown",
+                                  "ip_history": [{"ip": "203.0.113.9", "first_seen": "2024"}]},
+                  "plain.com": {"origin_check": "not_fronted",
+                                "ip_history": [{"ip": "198.51.100.5", "first_seen": "2024"}]}}}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], res, str(md))
+        report.write_html([Host("x.com")], ["x.com"], res, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    for text in (md_text, html_text):
+        assert "not run" in text and "skipped.com" in text
+        assert "not a clean result" in text
+        assert "not applicable" in text and "plain.com" in text
 
 
 def test_vt_history_renders_org_and_origin_candidates():
