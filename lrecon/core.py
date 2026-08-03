@@ -193,10 +193,16 @@ async def run(domains, args, keys) -> list:
         ipinfo_token = keys.get("ipinfo")
 
         # ---- Phase 1: passive enum (with source attribution) ----
-        host_sources, per_source = await passive_enum(client, domains, keys, no_pd=args.no_pd)
+        host_sources, per_source, failed_sources = await passive_enum(
+            client, domains, keys, no_pd=args.no_pd)
         hosts = {n: Host(subdomain=n, source=set(srcs)) for n, srcs in host_sources.items()}
         breakdown = "  ".join(f"{s}={per_source[s]}" for s in sorted(per_source)) or "none"
         log(f"[+] {len(hosts)} unique subdomains  |  by source: {breakdown}")
+        # `otx=0` from a blocked source and `otx=0` from a clean domain look
+        # identical in the line above, and only one of them is about the target.
+        for src in sorted(failed_sources):
+            log(f"[!] source '{src}' contributed nothing because it failed, not because "
+                f"the domain(s) had no hosts there: {failed_sources[src]}")
         if per_source.get("crtsh", 0) == 0:
             log("[!] crt.sh returned 0 — its frontend 502s/times out intermittently under "
                 "load; both query forms were retried (see the crt.sh lines above for the "
@@ -442,6 +448,22 @@ async def run(domains, args, keys) -> list:
                 log(f"[+] Cloudflare detected on {len(cf['fronted'])} host(s) — "
                     f"{len(cf['candidates'])} origin candidate(s), {conf} confirmed")
 
+        # ---- VirusTotal hosting history: who hosted each past IP? ----
+        # Runs here rather than beside the VT fetch because the Cloudflare
+        # ranges are only loaded above, and "was this address behind the CDN"
+        # is the part of the history worth acting on.
+        if vt_intel:
+            live_ips = {ip for h in hosts.values() if not h.wildcard for ip in h.ips}
+            n_hist_ips = await enrich_ip_history(client, vt_intel, ipinfo_token,
+                                                 cf_nets, live_ips)
+            if n_hist_ips:
+                n_origin = sum(1 for v in vt_intel.values()
+                               for r in (v.get("ip_history") or [])
+                               if r.get("origin_candidate"))
+                log(f"[+] VirusTotal hosting history: {n_hist_ips} historical IP(s) enriched"
+                    + (f" — {n_origin} outside Cloudflare and no longer live "
+                       f"(origin candidate(s) to verify)" if n_origin else ""))
+
         # ---- Favicon pivot (shodan) — find shadow assets sharing favicon ----
         favicon_pivots = {}
         if shodan_key and not args.passive_only:
@@ -616,29 +638,62 @@ async def run(domains, args, keys) -> list:
         if breach:
             log(f"[+] breach: {sum(len(v) for v in breach.values())} known breach(es) for scope")
 
-        # ---- OSINT user enumeration (opt-in: runs if hunter/rocketreach/github
-        # keys are configured, same "presence of a key = opt-in" convention as
-        # the rest of lrecon's keyed enrichment) ----
+        # ---- OSINT user enumeration ----
+        # The keyed sources (hunter/rocketreach/github) keep the "presence of a
+        # key = opt-in" convention. The website scrape is keyless and runs on
+        # any active scope, because otherwise a client with no API keys got an
+        # empty people list that read as "nobody is exposed" when in truth
+        # nothing had been looked at.
         people = []
-        if keys.get("hunter") or keys.get("rocketreach") or keys.get("github"):
+        keyed = keys.get("hunter") or keys.get("rocketreach") or keys.get("github")
+        if keyed:
             for d in domains:
                 people += await enumerate_people(client, d, keys, gh_limiter, args.company_name)
-            if people:
-                log(f"[+] people-enum: {len(people)} company-affiliated email(s) discovered")
 
-            if args.verify_emails and people and not args.passive_only:
-                for d in domains:
-                    d_people = [p for p in people if p.email.endswith(f"@{d}")]
-                    if not d_people:
-                        continue
-                    statuses = await verify_emails(d, [p.email for p in d_people], ns)
-                    for p in d_people:
-                        p.smtp_status = statuses.get(p.email)
-                n_valid = sum(1 for p in people if p.smtp_status == "valid")
-                n_catchall = sum(1 for p in people if p.smtp_status == "catch-all")
-                n_invalid = sum(1 for p in people if p.smtp_status == "invalid")
-                log(f"[+] email verify: {n_valid} valid, {n_catchall} catch-all/inconclusive, "
-                    f"{n_invalid} invalid")
+        if not args.passive_only:
+            known = {p.email for p in people}
+            scraped_total, roles_total = 0, 0
+            for d in domains:
+                scraped = await scrape_site_emails(probe_client, d, list(hosts.values()))
+                fresh = scraped - known
+                staff, roles = split_role_accounts(fresh)
+                roles_total += len(roles)
+                scraped_total += len(fresh)
+                for email in staff + roles:
+                    people.append(Person(email=email, source={"website"}))
+                    known.add(email)
+                # An address already known from a keyed source is corroborated,
+                # not duplicated — record that the target published it itself.
+                for p in people:
+                    if p.email in scraped:
+                        p.source.add("website")
+            if scraped_total:
+                log(f"[+] website email scrape: {scraped_total} new address(es) published on "
+                    f"the target's own pages"
+                    + (f" ({roles_total} role/shared mailbox(es))" if roles_total else ""))
+
+        if people:
+            log(f"[+] people-enum: {len(people)} company-affiliated email(s) discovered")
+        elif keyed or not args.passive_only:
+            # Silence here used to be indistinguishable from "the phase never
+            # ran" — and 0 exposed users is a claim worth stating explicitly.
+            log("[i] people-enum: 0 addresses found "
+                + ("(keyed sources + website scrape both came back empty)" if keyed
+                   else "(website scrape only — no hunter/rocketreach/github key configured)"))
+
+        if args.verify_emails and people and not args.passive_only:
+            for d in domains:
+                d_people = [p for p in people if p.email.endswith(f"@{d}")]
+                if not d_people:
+                    continue
+                statuses = await verify_emails(d, [p.email for p in d_people], ns)
+                for p in d_people:
+                    p.smtp_status = statuses.get(p.email)
+            n_valid = sum(1 for p in people if p.smtp_status == "valid")
+            n_catchall = sum(1 for p in people if p.smtp_status == "catch-all")
+            n_invalid = sum(1 for p in people if p.smtp_status == "invalid")
+            log(f"[+] email verify: {n_valid} valid, {n_catchall} catch-all/inconclusive, "
+                f"{n_invalid} invalid")
 
         # ---- NVD CVE enrichment (opt-in; cached) ----
         # Resolves CPEs to CVEs, and also enriches bare Shodan/InternetDB CVE IDs

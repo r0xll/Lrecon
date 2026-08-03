@@ -36,19 +36,52 @@ def _parse_hunter_response(data: dict) -> tuple[str | None, list]:
     return pattern, people
 
 
+def _hunter_error_detail(payload) -> str:
+    """Hunter's own explanation for a refusal, if it gave one.
+
+    Hunter answers several non-obvious conditions (out of credits, plan doesn't
+    include this endpoint, domain not searchable) with a body that explains
+    itself while the status code alone does not — so a bare `HTTP 4xx` line
+    throws away the only useful part of the response.
+    """
+    errs = (payload or {}).get("errors") if isinstance(payload, dict) else None
+    details = [e.get("details") or e.get("id") for e in (errs or []) if isinstance(e, dict)]
+    return " | ".join(d for d in details if d)
+
+
 async def hunter_domain_search(client, domain: str, api_key: str) -> tuple[str | None, list]:
     try:
         r = await client.get("https://api.hunter.io/v2/domain-search",
                             params={"domain": domain, "api_key": api_key, "limit": 100},
                             timeout=25)
+        try:
+            payload = r.json()
+        except Exception:
+            payload = None
         if r.status_code == 200:
-            return _parse_hunter_response(r.json())
+            pattern, people = _parse_hunter_response(payload)
+            if not people:
+                # A 200 with zero emails is Hunter's answer for "nothing
+                # indexed", but it is also what a credit-exhausted or
+                # plan-restricted account gets. Say which, rather than letting
+                # it read as "this domain has no exposed staff".
+                d = (payload or {}).get("data") or {}
+                log(f"[!] hunter.io {domain}: 200 but no emails returned "
+                    f"(pattern={d.get('pattern') or 'none'}, "
+                    f"total={(d.get('meta') or {}).get('results', '?')}"
+                    + (f", {_hunter_error_detail(payload)}"
+                       if _hunter_error_detail(payload) else "")
+                    + ") — check remaining credits/plan before reading this as "
+                      "'no exposure'")
+            return pattern, people
+        detail = _hunter_error_detail(payload)
         if r.status_code == 401:
-            log("[!] hunter.io: invalid API key")
+            log(f"[!] hunter.io: invalid API key{' — ' + detail if detail else ''}")
         elif r.status_code == 429:
-            log("[!] hunter.io: rate limited")
+            log(f"[!] hunter.io: rate limited{' — ' + detail if detail else ''}")
         else:
-            log(f"[!] hunter.io {domain}: HTTP {r.status_code}")
+            log(f"[!] hunter.io {domain}: HTTP {r.status_code}"
+                + (f" — {detail}" if detail else ""))
     except Exception as e:
         log(f"[!] hunter.io {domain}: {e}")
     return None, []
@@ -281,6 +314,97 @@ async def verify_emails(domain: str, emails: list, resolver_ns, mail_from: str |
 # --------------------------------------------------------------------------- #
 # Orchestration — one domain in, aggregated Person list out.
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Keyless discovery: addresses the target published on its own website. Every
+# other source here needs a key, so a scope with no Hunter/RocketReach/GitHub
+# credentials produced an empty people list no matter how much the client had
+# exposed — which reads as "no exposure" rather than "nothing was looked at".
+#
+# Only the target's own pages are fetched, and only addresses *at the in-scope
+# domain* are kept: a partner's or a vendor's address appearing in a footer is
+# not the client's exposure and is not ours to collect.
+# --------------------------------------------------------------------------- #
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+# Where organisations put staff addresses. Kept short on purpose: this is one
+# fetch each against a live host, and the long tail costs far more than it finds.
+CONTACT_PATHS = ["/", "/contact", "/contact-us", "/about", "/about-us", "/team",
+                 "/imprint", "/impressum", "/legal", "/privacy", "/support"]
+
+# Role accounts are real exposure but not people, and they dominate a scrape.
+# Tracked separately so a phishing target list isn't 80% info@.
+ROLE_LOCALPARTS = {"info", "contact", "support", "sales", "admin", "webmaster",
+                   "hello", "help", "noreply", "no-reply", "donotreply", "mail",
+                   "office", "enquiries", "inquiries", "abuse", "postmaster",
+                   "marketing", "press", "media", "legal", "privacy", "security",
+                   "careers", "jobs", "hr", "billing", "accounts", "invoices"}
+
+
+def extract_emails(text: str, domain: str) -> set:
+    """In-scope addresses in a page, lowercased.
+
+    Scoped to the domain rather than collecting everything the page mentions:
+    a footer full of a vendor's contact addresses is that vendor's exposure, and
+    hoovering it up would put out-of-scope people in an engagement deliverable.
+    """
+    if not text:
+        return set()
+    out = set()
+    for m in EMAIL_RE.findall(text):
+        e = m.lower().rstrip(".")
+        local, _, host = e.partition("@")
+        if not local or (host != domain and not host.endswith("." + domain)):
+            continue
+        # Assets like logo@2x.png and sprite@3x.svg match the address shape.
+        if host.rsplit(".", 1)[-1] in ("png", "jpg", "jpeg", "gif", "svg", "webp"):
+            continue
+        out.add(e)
+    return out
+
+
+async def scrape_site_emails(probe_client, domain: str, hosts: list,
+                             max_hosts: int = 5, max_pages: int = 6) -> set:
+    """Addresses published on the target's own live web pages. Keyless.
+
+    Active by touch tier — it fetches the target — so callers must gate it the
+    same way the HTTP probe is gated. Bounded to a handful of hosts and pages so
+    it stays a cheap add-on to a run rather than a crawl: this is contact-page
+    discovery, not spidering.
+    """
+    live = [h for h in hosts
+            if h.http_status and not h.wildcard
+            and (h.subdomain == domain or h.subdomain.endswith("." + domain))]
+    # An apex or www host is where a contact page actually lives; deeper hosts
+    # are usually apps that just proxy the same footer.
+    live.sort(key=lambda h: (h.subdomain.count("."), len(h.subdomain)))
+    found = set()
+
+    async def fetch(host, path):
+        url = f"{host.scheme or 'https'}://{host.subdomain}{path}"
+        try:
+            r = await probe_client.get(url, timeout=10, follow_redirects=True)
+            if r.status_code == 200:
+                return extract_emails(r.text[:200000], domain)
+        except Exception:
+            pass
+        return set()
+
+    for host in live[:max_hosts]:
+        results = await asyncio.gather(*(fetch(host, p) for p in CONTACT_PATHS[:max_pages]))
+        for s in results:
+            found |= s
+    return found
+
+
+def split_role_accounts(emails) -> tuple[list, list]:
+    """(people, role_accounts). A shared mailbox is exposure worth reporting but
+    is nobody to phish or spray, so the two are never merged into one count."""
+    people, roles = [], []
+    for e in sorted(emails):
+        (roles if e.partition("@")[0] in ROLE_LOCALPARTS else people).append(e)
+    return people, roles
+
+
 async def enumerate_people(client, domain: str, keys: dict, gh_limiter, company_name: str | None = None) -> list:
     people_by_email = {}
     pattern = None

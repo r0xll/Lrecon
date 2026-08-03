@@ -1,6 +1,8 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from .common import *
+from .enrich import enrich_ipinfo
+from .intel import in_cf
 
 # --------------------------------------------------------------------------- #
 # VirusTotal domain intelligence — historical domain->IP resolutions ("hosting
@@ -85,6 +87,80 @@ async def vt_ip_history(client, domain: str, api_key: str, limit: int = 20) -> l
     except Exception as e:
         log(f"[!] VirusTotal {domain} IP history: {e}")
     return []
+
+
+async def enrich_ip_history(client, vt_intel: dict, ipinfo_token, cf_nets, live_ips) -> int:
+    """Attach ASN/org/country to each historical IP, and mark origin candidates.
+
+    A bare list of past IPs and dates is close to unusable on an engagement: it
+    says a domain moved, not what it moved between. One IPinfo lookup per unique
+    address turns each row into "who hosted it", which is what makes a hosting
+    history worth reading — a former colo or cloud tenancy is a very different
+    story from a former CDN.
+
+    The red-team payload is `origin_candidate`: a historical IP that is *not*
+    Cloudflare and is no longer in the domain's live set. If the domain sits
+    behind Cloudflare today, an address it used to answer on is a plausible
+    unproxied origin — the same thing the CF-origin phase hunts for, reached
+    through passive history instead of active probing. It is a lead to verify by
+    fetching the IP with the target's Host header, not a conclusion; a shared
+    host or a long-since-reassigned cloud address will look identical here.
+
+    Lookups are deduped across domains, so a domain that never moved off one
+    address costs one call. Returns the number of IPs enriched.
+    """
+    rows = [r for v in vt_intel.values() for r in (v.get("ip_history") or [])]
+    unique = sorted({r["ip"] for r in rows if r.get("ip")})
+    if not unique:
+        return 0
+    infos = await asyncio.gather(*(enrich_ipinfo(client, ip, ipinfo_token) for ip in unique))
+    by_ip = dict(zip(unique, infos))
+    live = set(live_ips or ())
+    nets = _cf_nets(cf_nets)
+    for r in rows:
+        data = by_ip.get(r.get("ip")) or {}
+        r["asn"], r["org"] = _ipinfo_asn_org(data)
+        r["country"] = data.get("country")
+        r["rdns"] = data.get("hostname")
+        behind_cf = in_cf(r["ip"], nets)
+        r["cloudflare"] = behind_cf
+        r["origin_candidate"] = bool(not behind_cf and r["ip"] not in live)
+    return len(unique)
+
+
+def _cf_nets(cf_nets) -> list:
+    """Cloudflare ranges as network objects, falling back to the bundled list.
+
+    `--passive-only` and `--no-cf-origin` skip the live range fetch, leaving
+    `cf_nets` empty — and with no ranges every historical address would be
+    labelled an origin candidate, including the ones plainly behind the CDN.
+    Also accepts CIDR strings so callers don't have to care which they hold.
+    """
+    out = []
+    for n in (cf_nets or CF_FALLBACK):
+        try:
+            out.append(n if hasattr(n, "network_address") else ipaddress.ip_network(n))
+        except Exception:
+            pass
+    return out
+
+
+def _ipinfo_asn_org(data: dict) -> tuple:
+    """(asn, org) out of an IPinfo payload, whichever shape it came back in.
+
+    Free/keyless responses put "AS13335 Cloudflare, Inc." in `org`; token
+    responses split it into an `asn` object. apply_ipinfo() already handles both
+    for live hosts — this mirrors it rather than assuming the keyed shape, since
+    keyless is the common case.
+    """
+    asn_obj = data.get("asn") or {}
+    if isinstance(asn_obj, dict) and asn_obj.get("asn"):
+        return asn_obj.get("asn"), asn_obj.get("name") or data.get("org")
+    org = data.get("org") or ""
+    if org.startswith("AS"):
+        num, _, name = org.partition(" ")
+        return num, name or None
+    return None, org or None
 
 
 async def vt_domain_intel(client, domain: str, api_key: str, limiter) -> dict:

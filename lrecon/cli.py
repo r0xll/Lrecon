@@ -239,7 +239,12 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
         f" | hibp {'key' if keys['hibp'] else 'keyless'}")
     people_sources = [n for n, k in (("hunter", keys["hunter"]), ("rocketreach", keys["rocketreach"]),
                                      ("github", keys["github"])) if k]
-    log(f"[i] people-enum: {', '.join(people_sources) if people_sources else 'off (no hunter/rocketreach/github key)'}"
+    # The website scrape needs no key, so people-enum is never fully "off" on an
+    # active run — saying otherwise told operators not to expect results they
+    # were about to get.
+    if not args.passive_only:
+        people_sources.append("website (keyless)")
+    log(f"[i] people-enum: {', '.join(people_sources) if people_sources else 'off (no key, and --passive-only skips the website scrape)'}"
         f" | email verify: {'on (active)' if args.verify_emails else 'off'}")
     if args.dork:
         chain = configured_dork_providers(keys, args.dork_provider)
