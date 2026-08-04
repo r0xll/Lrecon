@@ -432,8 +432,14 @@ async def run(domains, args, keys) -> list:
                     log(f"[+] TLS certs: {len(certs)} read"
                         + (f" ({n_bad} expired or self-signed)" if n_bad else ""))
             else:
-                log("[i] TLS cert inspection: cryptography not installed — skipping "
-                    "(pip install 'lrecon[tls]')")
+                # cryptography is a base dependency now, so reaching here means
+                # a broken install rather than a missing extra — most often a
+                # distro cryptography whose native bits don't load (tlsinfo
+                # catches the pyo3 panic that produces). Reinstalling is the fix;
+                # naming an extra would send someone chasing the wrong thing.
+                log("[!] TLS cert inspection: cryptography failed to import — skipping. "
+                    "It is a required dependency, so this is a broken install: try "
+                    "`pip install --force-reinstall cryptography`")
 
         # ---- Cloudflare origin discovery ----
         cf = {"detected": False, "fronted": [], "candidates": {}}

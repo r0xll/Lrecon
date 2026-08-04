@@ -24,9 +24,11 @@ from .common import *
 # are exactly the ones worth reporting. Reading a cert is not trusting it — no
 # request is sent beyond the handshake.
 #
-# `cryptography` is an OPTIONAL dependency (extra: `tls`), following the same
-# convention as dnspython/rich/the ProjectDiscovery binaries: absent, the
-# feature logs once and skips rather than breaking a run.
+# `cryptography` is a REQUIRED dependency. It used to be an extra, which meant a
+# plain `pip install -e .` produced reports silently missing this whole section.
+# The guard below stays anyway: cryptography's native extension can fail to load
+# on an otherwise-successful install, and a broken import should degrade the run
+# rather than end it.
 # --------------------------------------------------------------------------- #
 try:
     from cryptography import x509

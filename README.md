@@ -119,6 +119,11 @@ pip install -e .                         # installs deps + `lrecon` console comm
 pip install -e '.[screenshots]'; playwright install chromium
 ```
 
+`pip install -e .` is everything you need — including live TLS certificate
+inspection. Note the **quotes** on the extras line above: `[` and `]` are glob
+characters in fish and zsh, so an unquoted `pip install -e .[screenshots]` fails
+with a wildcard error rather than installing anything.
+
 Optional, for broader passive enum:
 
 ```fish
@@ -574,8 +579,13 @@ an unverified probe client: targets routinely serve self-signed, expired or
 mismatched certs, and those are exactly the ones worth reporting. Reading a cert
 is not trusting it, and nothing is sent beyond the handshake.
 
-This needs the optional `cryptography` dependency — `pip install 'lrecon[tls]'`.
-Without it the cert pass logs once and skips, like any other optional backend.
+This works out of the box: `cryptography` is a base dependency, so a plain
+`pip install -e .` gets you cert inspection. It used to sit behind a `[tls]`
+extra, which meant the default install quietly produced reports missing this
+whole section. The `[tls]` extra still exists and is empty, so older commands
+keep working. If the cert pass ever reports that cryptography failed to import,
+that is a broken install rather than a missing extra —
+`pip install --force-reinstall cryptography`.
 
 **Cloudflare origin discovery.** When Cloudflare fronts a host, lrecon collects
 origin-IP candidates passively — unproxied in-scope subdomains, SPF `ip4:`/`ip6:`
