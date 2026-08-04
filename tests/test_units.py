@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import csv
 import ipaddress
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -5673,3 +5674,29 @@ def test_summarize_entry_points_whois_finding_from_naive_date_only_expiry():
     eps = intel.summarize_entry_points([], {}, [], {}, [], [], None, None, whois={"acme.io": w})
     assert len(eps) == 1
     assert eps[0]["type"] == "whois-domain-expiring"
+
+
+# --------------------------------------------------------------------------- #
+# Repo hygiene
+# --------------------------------------------------------------------------- #
+def test_no_recon_output_is_tracked_in_the_repo():
+    """lrecon output is client data — subdomains, IPs, open ports, discovered
+    email addresses. Six of these were committed before anyone noticed, because
+    .gitignore listed `/lrecon.json` while the tool actually writes
+    `lrecon_<timestamp>.json`. Ignore rules don't help once a file is tracked,
+    so this test is the thing that actually prevents a recurrence.
+    """
+    import subprocess
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        tracked = subprocess.run(["git", "ls-files"], cwd=repo, capture_output=True,
+                                 text=True, timeout=30).stdout.split()
+    except Exception:
+        pytest.skip("git not available")
+    if not tracked:
+        pytest.skip("not a git checkout")
+    offenders = [f for f in tracked
+                 if re.fullmatch(r"lrecon(_\d{8}_\d{6})?\.[A-Za-z.]+", f)
+                 or f.endswith(".origin_ips.txt") or f.endswith(".targets.csv")
+                 or f.endswith(".users.csv") or f.endswith(".live.txt")]
+    assert offenders == [], f"recon output committed to the repo: {offenders}"

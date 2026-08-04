@@ -8,11 +8,29 @@ dist/
 .pytest_cache/
 .DS_Store
 
-# recon output artifacts (default basename)
+# Recon output artifacts. These are CLIENT DATA — subdomains, IPs, open ports,
+# discovered email addresses — so one committed to a public repo is a
+# disclosure, not just clutter.
+#
+# cli.py builds `out_base = f"{args.out}_{UTC timestamp}"`, so real output is
+# always `lrecon_20260730_201447.*`. The previous patterns listed `/lrecon.json`
+# and friends, a filename shape the tool has never produced, so they matched
+# nothing and six output files were committed before anyone noticed.
+#
+# Anchored to the repo root: a user writing to ~/engagements/ is unaffected, and
+# a source file that happens to start with "lrecon" is not swallowed.
+/lrecon_*.json
+/lrecon_*.md
+/lrecon_*.html
+/lrecon_*.txt
+/lrecon_*.csv
+/lrecon_*_shots/
+# Bare forms too, for anyone who overrides the basename to drop the timestamp.
 /lrecon.json
 /lrecon.md
 /lrecon.html
 /lrecon.live.txt
+/lrecon.targets.csv
 *_shots/
 
 # local secrets / config
