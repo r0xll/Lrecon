@@ -46,24 +46,36 @@ async def enum_crtsh_best(client, domain: str, use_psql: bool = True) -> set:
 _CRTSH_RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
-def _crtsh_name_in_scope(name: str, domain: str) -> bool:
+def name_in_scope(name: str, domain: str) -> bool:
     """
     True only for the apex itself or a real subdomain of it.
 
     A bare `endswith(domain)` test is wrong at the label boundary: it accepts
     `testexample.com` for `example.com` (confirmed live — crt.sh's
-    `%.example.com` pattern does return names like `m.testexample.com`). Adding
-    an out-of-scope third party's host to an engagement's scope is an ROE
-    problem, not a cosmetic one, so the boundary is checked explicitly.
+    `%.example.com` pattern does return names like `m.testexample.com`, and OTX
+    and Anubis return third-party lookalikes too). Adding an out-of-scope third
+    party's host to an engagement's scope is an ROE problem, not a cosmetic one:
+    on a non-passive run that host gets resolved, probed and port-scanned.
+
+    Used by every passive source and again by passive_enum's own filter, so a
+    source added later cannot reintroduce the hole by reaching for `endswith`.
 
     Email addresses are also rejected: certificate subjects can carry an
     rfc822Name (e.g. `subjectname@example.com`), which is not a host to scan.
     The psql tier already excludes these server-side (`NOT ILIKE '%@%'`); this
-    keeps the HTTP tier consistent with it.
+    keeps every other tier consistent with it.
     """
     if not name or " " in name or "@" in name:
         return False
+    name = name.rstrip(".").lower()
+    domain = (domain or "").rstrip(".").lower()
+    if not domain:
+        return False
     return name == domain or name.endswith("." + domain)
+
+
+# Kept so the crt.sh-specific name still resolves for anything importing it.
+_crtsh_name_in_scope = name_in_scope
 
 
 def _parse_crtsh_rows(rows, domain: str) -> set:
@@ -160,7 +172,7 @@ async def enum_certspotter(client, domain: str) -> set:
             for cert in r.json():
                 for n in cert.get("dns_names", []):
                     n = n.strip().lstrip("*.").lower()
-                    if n.endswith(domain):
+                    if name_in_scope(n, domain):
                         out.add(n)
     except Exception as e:
         log(f"[!] certspotter {domain}: {e}")
@@ -199,84 +211,120 @@ def _exc_detail(e: Exception) -> str:
     return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
 
 
-async def enum_otx(client, domain: str) -> set:
-    """AlienVault OTX passive DNS.
+async def enum_otx(client, domain: str, api_key: str | None = None) -> set:
+    """AlienVault OTX passive DNS — needs an API key.
 
-    No longer keyless in practice: the endpoint now answers anonymous callers
-    with 429 "Anonymous access to this endpoint is limited. Please
-    authenticate." It is kept because it still works for anyone with OTX
-    credentials in front of it, and reports the refusal rather than looking
-    like a domain with no passive DNS.
+    Not keyless any more: anonymous callers get 429 "Anonymous access to this
+    endpoint is limited. Please authenticate." The key goes in `X-OTX-API-KEY`
+    (`--otx-key` / `OTX_API_KEY` / `otx_api_key` in config). Without one the
+    refusal is reported rather than left to look like a domain with no passive
+    DNS.
     """
     url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+    headers = {"X-OTX-API-KEY": api_key} if api_key else {}
     try:
-        r = await client.get(url, timeout=30)
-        if r.status_code == 429:
+        r = await client.get(url, headers=headers, timeout=30)
+        if r.status_code in (401, 403):
             return _source_failed("otx", domain,
-                                  "HTTP 429 — OTX now rate-limits/refuses anonymous "
-                                  "access to passive DNS; not a sign the domain is clean")
+                                  f"HTTP {r.status_code} — OTX rejected the API key")
+        if r.status_code == 429:
+            return _source_failed(
+                "otx", domain,
+                "HTTP 429 — " + ("rate limited despite an API key; retry later"
+                                 if api_key else
+                                 "OTX refuses anonymous access to passive DNS. Set "
+                                 "--otx-key/OTX_API_KEY to use this source; not a sign "
+                                 "the domain is clean"))
         if r.status_code != 200:
             return _source_failed("otx", domain, f"HTTP {r.status_code}")
         out = SourceSet()
         for rec in r.json().get("passive_dns", []):
             h = rec.get("hostname", "").strip().lower()
-            if h.endswith(domain):
+            if name_in_scope(h, domain):
                 out.add(h)
         return out
     except Exception as e:
         return _source_failed("otx", domain, _exc_detail(e))
 
 
-async def enum_anubis(client, domain: str) -> set:
-    """jldc.me Anubis subdomain DB — keyless.
+# Anubis-DB's canonical host. jldc.me — the address lrecon used to call — now
+# redirects to jonlu.ca, which sits behind bot protection and answers 403, so
+# the source looked dead when it was only at a different address.
+ANUBIS_HOST = "https://anubisdb.com"
 
-    jldc.me 301s to jonlu.ca, which sits behind bot protection and answers 403,
-    so this source is effectively unavailable to automation. Kept (rather than
-    deleted) because the redirect target may reopen, and because reporting the
-    403 tells an operator to stop expecting hosts from it.
-    """
+
+async def enum_anubis(client, domain: str) -> set:
+    """Anubis-DB subdomain database — keyless."""
     try:
-        r = await client.get(f"https://jldc.me/anubis/subdomains/{domain}",
+        r = await client.get(f"{ANUBIS_HOST}/anubis/subdomains/{domain}",
                              timeout=30, follow_redirects=True)
-        if r.status_code == 403:
-            return _source_failed("anubis", domain,
-                                  "HTTP 403 — jldc.me now redirects to jonlu.ca, which "
-                                  "blocks automated clients; source unavailable")
+        if r.status_code == 404:
+            return SourceSet()          # a real "nothing on this domain" answer
         if r.status_code != 200:
             return _source_failed("anubis", domain, f"HTTP {r.status_code}")
         out = SourceSet()
-        for n in r.json():
-            n = n.strip().lower()
-            if n.endswith(domain):
+        for n in (r.json() or []):
+            n = str(n).strip().lower().lstrip("*.")
+            if name_in_scope(n, domain):
                 out.add(n)
         return out
     except Exception as e:
         return _source_failed("anubis", domain, _exc_detail(e))
 
 
-async def enum_wayback(client, domain: str) -> set:
+# The archive rate-limits hard and its CDX endpoint drops connections under
+# load. Same treatment as crt.sh: retry the transient statuses rather than
+# losing the source for the whole run on one bad response.
+_WAYBACK_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+async def enum_wayback(client, domain: str, attempts: int = 4) -> set:
     """Wayback CDX index — keyless.
 
     HTTPS is required, not cosmetic: web.archive.org answers plain HTTP with a
     301 to the same URL over TLS, and the shared enum client is
     `follow_redirects=False`, so the old `http://` URL never returned a single
-    host on any target. `follow_redirects=True` is belt-and-braces for the
-    archive's own internal redirects.
+    host on any target.
+
+    Retries with backoff because a single 429 or dropped connection used to end
+    the source for the run — and 429 is the archive's normal response under any
+    load, not an exceptional one. `Retry-After` is honoured when sent, since
+    guessing shorter than the server asked just earns another 429.
     """
     url = (f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
            f"&output=json&fl=original&collapse=urlkey&limit=10000")
+    errors = []
+    for attempt in range(attempts):
+        try:
+            r = await client.get(url, timeout=45, follow_redirects=True)
+            if r.status_code == 200:
+                out = SourceSet()
+                for row in (r.json() or [])[1:]:
+                    host = row[0].split("//")[-1].split("/")[0].split(":")[0].lower()
+                    if name_in_scope(host, domain):
+                        out.add(host)
+                return out
+            errors.append(f"HTTP {r.status_code}")
+            if r.status_code not in _WAYBACK_RETRY_STATUS:
+                break
+            delay = _retry_after_seconds(r)
+        except Exception as e:
+            errors.append(_exc_detail(e))
+            delay = None
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay if delay is not None
+                                else min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
+    return _source_failed("wayback", domain,
+                          f"no data after {len(errors)} attempt(s) [{'; '.join(errors[:4])}]")
+
+
+def _retry_after_seconds(r) -> float | None:
+    """`Retry-After` in seconds, if the server sent a usable one."""
+    raw = (r.headers.get("retry-after") or "").strip()
     try:
-        r = await client.get(url, timeout=45, follow_redirects=True)
-        if r.status_code != 200:
-            return _source_failed("wayback", domain, f"HTTP {r.status_code}")
-        out = SourceSet()
-        for row in r.json()[1:]:
-            host = row[0].split("//")[-1].split("/")[0].split(":")[0].lower()
-            if host.endswith(domain):
-                out.add(host)
-        return out
-    except Exception as e:
-        return _source_failed("wayback", domain, _exc_detail(e))
+        return min(float(raw), 30.0) if raw else None
+    except ValueError:
+        return None                     # HTTP-date form — fall back to backoff
 
 
 async def enum_shodan_dns(client, domain: str, key: str) -> set:
@@ -325,7 +373,7 @@ async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict
         jobs += [
             ("crtsh",       enum_crtsh_best(client, d, use_psql=not no_pd)),
             ("certspotter", enum_certspotter(client, d)),
-            ("otx",         enum_otx(client, d)),
+            ("otx",         enum_otx(client, d, keys.get("otx"))),
             ("anubis",      enum_anubis(client, d)),
             ("wayback",     enum_wayback(client, d)),
             ("subfinder",   enum_subfinder(d)),
@@ -345,7 +393,7 @@ async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict
         if isinstance(res, set):
             if getattr(res, "failed", False):
                 failed.setdefault(src, res.detail or "source unavailable")
-            in_scope = {n for n in res if any(n.endswith(d) for d in domains)}
+            in_scope = {n for n in res if any(name_in_scope(n, d) for d in domains)}
             per_source[src] += len(in_scope)
             for n in in_scope:
                 host_sources[n].add(src)

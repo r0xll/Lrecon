@@ -63,7 +63,7 @@ except Exception:
 
 
 def log(msg: str) -> None:
-    """Print a log line verbatim.
+    """Print a log line verbatim, but still coloured.
 
     `markup=False` is load-bearing, not a style choice: rich parses square
     brackets as markup tags and *deletes* the ones it recognises. Every `[i]`
@@ -71,9 +71,16 @@ def log(msg: str) -> None:
     hint rendered as `pip install 'lrecon'` — an instruction that installs
     nothing, because `[tls]` disappeared. lrecon builds its own `[+]`/`[i]`
     prefixes and never uses rich markup here, so nothing is lost by disabling it.
+
+    Highlighting is deliberately left ON. It was switched off alongside markup,
+    which was a mistake: the two are independent, and it is highlighting — not
+    markup — that colours IPs, URLs, counts and quoted strings, i.e. the thing
+    that makes a finding stand out in a long run. Turning it off made the console
+    monochrome for no benefit. rich emits ANSI only when attached to a terminal,
+    so this behaves the same under fish/bash/zsh and stays clean when piped.
     """
     if _HAVE_RICH:
-        _console.print(msg, markup=False, highlight=False)
+        _console.print(msg, markup=False)
     else:
         print(msg, file=sys.stderr)
 
@@ -231,7 +238,7 @@ def load_keys(args) -> dict:
             # customers; brave/vertex are the replacement backends). `vertex`
             # is a dict: access_token/project/location/engine/datastore.
             "brave": None, "vertex": None,
-            "vt": None,
+            "vt": None, "otx": None,
             # LLM (dossier/news synthesis): cloud-provider keys + the resolved
             # `llm` config section (provider/model/base_url/... from config.json).
             "openai": None, "anthropic": None, "google_ai": None, "llm": None}
@@ -250,6 +257,7 @@ def load_keys(args) -> dict:
             keys["brave"] = data.get("brave_search_key")
             keys["vertex"] = data.get("vertex") if isinstance(data.get("vertex"), dict) else None
             keys["vt"] = data.get("vt_api_key")
+            keys["otx"] = data.get("otx_api_key")
             keys["openai"] = data.get("openai_api_key")
             keys["anthropic"] = data.get("anthropic_api_key")
             keys["google_ai"] = data.get("google_ai_api_key")
@@ -268,6 +276,7 @@ def load_keys(args) -> dict:
         or keys["brave"]
     keys["vertex"] = _resolve_vertex(keys["vertex"], args)
     keys["vt"] = os.environ.get("VT_API_KEY") or keys["vt"]
+    keys["otx"] = os.environ.get("OTX_API_KEY") or keys["otx"]
     keys["openai"] = os.environ.get("OPENAI_API_KEY") or keys["openai"]
     keys["anthropic"] = os.environ.get("ANTHROPIC_API_KEY") or keys["anthropic"]
     keys["google_ai"] = os.environ.get("GOOGLE_AI_API_KEY") or keys["google_ai"]
@@ -287,6 +296,8 @@ def load_keys(args) -> dict:
         keys["brave"] = args.brave_key
     if args.vt_key:
         keys["vt"] = args.vt_key
+    if getattr(args, "otx_key", None):
+        keys["otx"] = args.otx_key
     # LLM CLI overrides layer on top of the config.json `llm` section.
     llm_over = {k: v for k, v in (
         ("provider", getattr(args, "llm_provider", None)),

@@ -439,12 +439,12 @@ def write_markdown(hosts, domains, res, path) -> None:
         any_history = any(v.get("ip_history") for v in vt.values())
         if any_history:
             lines += ["**Historical IP resolutions (hosting history)** — newest first:", "",
-                      "| Domain | IP | First seen | ASN | Org | Country | Note |",
-                      "|---|---|---|---|---|---|---|"]
+                      "| Domain | IP | First seen | Org | Country | Note |",
+                      "|---|---|---|---|---|---|"]
             for d, v in vt.items():
                 for r in (v.get("ip_history") or [])[:20]:
                     lines.append(f"| {d} | `{r['ip']}` | {r.get('first_seen') or '—'} "
-                                 f"| {r.get('asn') or '—'} | {r.get('org') or '—'} "
+                                 f"| {r.get('org') or '—'} "
                                  f"| {r.get('country') or '—'} | {_vt_history_note(r)} |")
             lines.append("")
             if any(r.get("origin_candidate") for v in vt.values()
@@ -1016,7 +1016,7 @@ def write_html(hosts, domains, res, path) -> None:
 
         history_rows = "".join(
             f"<tr><td>{esc(d)}</td><td><code>{esc(r['ip'])}</code></td>"
-            f"<td>{esc(r.get('first_seen'))}</td><td>{esc(r.get('asn') or '—')}</td>"
+            f"<td>{esc(r.get('first_seen'))}</td>"
             f"<td>{esc(r.get('org') or '—')}</td><td>{esc(r.get('country') or '—')}</td>"
             f"<td>{_hist_note_html(r)}</td></tr>"
             for d, v in vt.items() for r in (v.get("ip_history") or [])[:20])
@@ -1024,7 +1024,7 @@ def write_html(hosts, domains, res, path) -> None:
             body += (f'<p><b>Historical IP resolutions (hosting history)</b> — newest first:</p>'
                      f'{_html_export_button("t-vt-history", "vt_ip_history.csv")}'
                      f'<table id="t-vt-history"><tr><th>Domain</th><th>IP</th>'
-                     f'<th>First seen</th><th>ASN</th><th>Org</th><th>Country</th>'
+                     f'<th>First seen</th><th>Org</th><th>Country</th>'
                      f'<th>Note</th></tr>{history_rows}</table>')
             if any(r.get("origin_candidate") for v in vt.values()
                    for r in (v.get("ip_history") or [])):
@@ -1267,14 +1267,20 @@ def write_html(hosts, domains, res, path) -> None:
                     f'<td>{flag_cell}</td></tr>')
 
         rows = "".join(_cert_row(c) for c in _certs_by_risk(certs))
+        cert_cols = ["Endpoint", "Subject CN", "SANs", "Issuer", "Expires", "Flags"]
         body = (f'{_html_export_button("t-certs", "tls_certificates.csv")}'
-                f'<div style="overflow-x:auto"><table id="t-certs">'
-                f'<tr><th>Endpoint</th><th>Subject CN</th><th>SANs</th><th>Issuer</th>'
-                f'<th>Expires</th><th>Flags</th></tr>{rows}</table></div>'
+                f'{_html_filter_toolbar("t-certs")}'
+                f'<div style="overflow-x:auto">'
+                f'<table id="t-certs" data-filterable="1">'
+                f'<tr>{"".join(f"<th>{c}</th>" for c in cert_cols)}</tr>'
+                f'{_html_filter_row(cert_cols)}{rows}</table></div>'
                 f'<p class="note">Read from the live handshake — the certificates '
                 f'actually presented, including ones never submitted to a CT log. '
                 f'In-scope SAN entries are added to the host list as <code>tls-san</code>; '
-                f'other tenants\' names on a shared certificate are excluded.</p>')
+                f'other tenants\' names on a shared certificate are excluded.</p>'
+                f'<p class="note">Filter as on the attack surface: type to narrow, prefix '
+                f'<code>!</code> to exclude. <code>!—</code> under Flags leaves only the '
+                f'certificates with something wrong with them.</p>')
         sections.append(_html_section("certs", "TLS certificates (as served)",
                                       len(certs), body))
 

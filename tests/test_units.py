@@ -151,6 +151,27 @@ def test_confirm_tech_stack_false_when_no_cpe_matches():
     assert enrich.confirm_tech_stack(h) is False
 
 
+async def test_http_probe_populates_tech_so_cve_confirmation_can_run():
+    """h.tech was only ever filled by the ProjectDiscovery httpx backend, so on a
+    pure-Python run confirm_tech_stack() had nothing to compare against and
+    returned None for every host — CVE tech-validation silently never ran."""
+    class _Resp:
+        status_code = 200
+        headers = {"server": "nginx/1.18.0", "x-powered-by": "PHP/7.4"}
+        text = "<html><title>hi</title></html>"
+        url = "https://a.x.com/"
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _Resp()
+
+    h = Host("a.x.com", cpes=["cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*"])
+    await active.http_probe(_C(), h)
+    assert h.tech == ["nginx/1.18.0", "PHP/7.4"]
+    # The point of the fix: the comparison now actually resolves.
+    assert enrich.confirm_tech_stack(h) is True
+
+
 def test_confirm_tech_stack_none_when_no_live_tech_or_no_cpes():
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=["cpe:2.3:a:x:y:1:*"], tech=[])) is None
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=[], tech=["nginx"])) is None
@@ -171,10 +192,11 @@ class _FakeResp:
 
 class _FakeRespText:
     """Response whose body is text (bucket listing XML), not JSON."""
-    def __init__(self, status_code, text=""):
+    def __init__(self, status_code, text="", headers=None):
         self.status_code = status_code
         self.text = text
         self.content = text.encode()
+        self.headers = headers or {}
 
     def json(self):
         raise ValueError("not json")
@@ -247,6 +269,80 @@ async def test_enum_crtsh_retries_200_with_non_list_body(monkeypatch):
     out = await sources.enum_crtsh(client, "x.com")
     assert out == {"a.x.com"}
     assert client.calls == 2
+
+
+async def test_brave_key_is_not_validated_unless_dorking():
+    """Brave has no free account endpoint, so validating the key *is* spending a
+    search. Charging every ordinary scan one out of 2k/mo — for a key that run
+    was never going to use — eats the opt-in dorking budget."""
+    class _C:
+        def __init__(self):
+            self.calls = []
+
+        async def get(self, url, **kwargs):
+            self.calls.append(url)
+            return _FakeResp(200, {})
+
+    from lrecon import core
+    without = _C()
+    await core.verify_keys(without, {"brave": "k"}, dorking=False)
+    assert without.calls == []                     # no quota spent on an ordinary scan
+
+    with_dork = _C()
+    await core.verify_keys(with_dork, {"brave": "k"}, dorking=True)
+    assert any("search.brave.com" in u for u in with_dork.calls)
+
+
+async def test_bad_vt_and_otx_keys_are_nulled_out():
+    class _C:
+        async def get(self, url, **kwargs):
+            return _FakeResp(401, {})
+
+    from lrecon import core
+    keys = {"vt": "bad", "otx": "bad"}
+    await core.verify_keys(_C(), keys)
+    assert keys["vt"] is None and keys["otx"] is None
+
+
+async def test_every_passive_source_enforces_the_label_boundary():
+    """ROE, not cosmetics: an out-of-scope lookalike admitted here gets resolved,
+    probed and port-scanned on a non-passive run. Only crt.sh checked the
+    boundary; every other source used a bare endswith, and so did passive_enum's
+    own filter."""
+    lookalike, real = "m.testexample.com", "dev.example.com"
+
+    otx = await sources.enum_otx(_FakeEnumClient({"otx.alienvault.com": _FakeResp(
+        200, {"passive_dns": [{"hostname": real}, {"hostname": lookalike}]})}), "example.com")
+    assert otx == {real}
+
+    anubis = await sources.enum_anubis(_FakeEnumClient(
+        {"anubisdb.com": _FakeResp(200, [real, lookalike])}), "example.com")
+    assert anubis == {real}
+
+    wayback = await sources.enum_wayback(_FakeEnumClient({"web.archive.org": _FakeResp(
+        200, [["original"], [f"https://{real}/p"], [f"https://{lookalike}/p"]])}), "example.com")
+    assert wayback == {real}
+
+    certspotter = await sources.enum_certspotter(_FakeEnumClient(
+        {"certspotter.com": _FakeResp(200, [{"dns_names": [real, lookalike]}])}), "example.com")
+    assert certspotter == {real}
+
+
+async def test_passive_enum_filter_also_rejects_lookalikes(monkeypatch):
+    """The final filter is the backstop — a source added later must not be able
+    to reintroduce the hole by reaching for endswith."""
+    async def leaky(client, domain, api_key=None):
+        return {"m.testexample.com", "dev.example.com"}
+
+    monkeypatch.setattr(sources, "enum_otx", leaky)
+    for name in ("enum_certspotter", "enum_anubis", "enum_wayback"):
+        monkeypatch.setattr(sources, name, lambda c, d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_subfinder", lambda d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_crtsh_best",
+                        lambda c, d, use_psql=True: asyncio.sleep(0, result=set()))
+    host_sources, per_source, _failed = await sources.passive_enum(None, ["example.com"], {})
+    assert "m.testexample.com" not in host_sources
+    assert per_source["otx"] == 1
 
 
 def test_crtsh_name_in_scope_enforces_label_boundary():
@@ -2115,6 +2211,40 @@ def test_log_does_not_let_rich_eat_square_brackets(capsys):
     assert "[i]" in text
 
 
+def test_log_still_colours_output():
+    """Regression: highlighting was switched off alongside markup, which made the
+    console monochrome. The two are independent — markup off keeps brackets
+    literal, highlighting on is what makes a finding stand out."""
+    import io, re
+    from rich.console import Console
+    from lrecon import common
+    buf = io.StringIO()
+    forced = Console(file=buf, force_terminal=True, width=200)
+    with monkeypatched(common, "_console", forced), monkeypatched(common, "_HAVE_RICH", True):
+        common.log("[i] 42 hosts 1.2.3.4 https://x.test (pip install 'lrecon[tls]')")
+    written = buf.getvalue()
+    assert "\x1b[" in written                        # ANSI escapes present
+    # Colour codes sit *between* the bracket characters, so compare what a
+    # reader actually sees rather than the raw byte string.
+    visible = re.sub(r"\x1b\[[0-9;]*m", "", written)
+    assert "[tls]" in visible and "[i]" in visible
+
+
+class monkeypatched:
+    """Minimal attribute patcher — the colour test needs a real Console object,
+    which pytest's monkeypatch fixture can't be used for at module import time."""
+    def __init__(self, obj, name, value):
+        self.obj, self.name, self.value = obj, name, value
+
+    def __enter__(self):
+        self.old = getattr(self.obj, self.name)
+        setattr(self.obj, self.name, self.value)
+        return self.value
+
+    def __exit__(self, *exc):
+        setattr(self.obj, self.name, self.old)
+
+
 def test_provider_assigned_name_is_stale_dns_not_a_takeover():
     """An AWS load-balancer name carries an AWS-generated hash and ID. Deleting
     the balancer retires the name permanently — nobody can ask for it back, so
@@ -3564,6 +3694,23 @@ def test_attack_surface_has_a_country_column_in_both_writers():
         assert "IE, US" in text and "FR" in text
 
 
+def test_certs_table_is_filterable():
+    """Same complaint as the attack surface, same generic machinery — a real
+    scope produces far too many cert rows to read top to bottom."""
+    res = {"certs": [{"host": "a.x.com", "port": 443, "cn": "a.x.com",
+                      "sans": ["a.x.com"], "issuer": "R3",
+                      "not_after": "2027-01-01T00:00:00+00:00", "expired": False,
+                      "self_signed": False, "days_to_expiry": 300}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("a.x.com")], ["x.com"], res, str(path))
+        content = path.read_text()
+    table = content.split('id="t-certs"')[1].split("</table>")[0]
+    assert 'id="t-certs" data-filterable="1"' in content
+    assert table.count("<th>") == table.count('class="filter-input"') == 6
+    assert 'class="filtercount" data-for="t-certs"' in content
+
+
 def test_attack_surface_table_is_filterable():
     """The filter row and its hook have to be present for the JS to bind to —
     the behaviour itself is exercised in a real browser, not here."""
@@ -4352,7 +4499,8 @@ def test_vt_history_renders_org_and_origin_candidates():
         report.write_html([Host("x.com")], ["x.com"], res, str(html))
         md_text, html_text = md.read_text(), html.read_text()
     for text in (md_text, html_text):
-        assert "Colo Provider" in text and "AS64496" in text
+        assert "Colo Provider" in text
+        assert "AS64496" not in text          # ASN column dropped on request
         assert "origin candidate" in text
         assert "Host" in text                  # the how-to-verify note
     assert "**origin candidate**" in md_text
@@ -4390,14 +4538,73 @@ async def test_blocked_sources_are_reported_as_failed_not_empty():
     otx = await sources.enum_otx(_FakeEnumClient(
         {"otx.alienvault.com": _FakeRespText(429, "")}), "x.com")
     assert otx == set() and otx.failed and "429" in otx.detail
+    # Without a key the message has to name the cause, not just the status.
+    assert "OTX_API_KEY" in otx.detail
 
     anubis = await sources.enum_anubis(_FakeEnumClient(
-        {"jldc.me": _FakeRespText(403, "")}), "x.com")
-    assert anubis == set() and anubis.failed and "403" in anubis.detail
+        {"anubisdb.com": _FakeRespText(503, "")}), "x.com")
+    assert anubis == set() and anubis.failed and "503" in anubis.detail
 
     wayback = await sources.enum_wayback(_FakeEnumClient(
-        {"web.archive.org": _FakeRespText(503, "")}), "x.com")
-    assert wayback == set() and wayback.failed
+        {"web.archive.org": _FakeRespText(503, "")}), "x.com", attempts=1)
+    assert wayback == set() and wayback.failed and "503" in wayback.detail
+
+
+async def test_otx_sends_the_api_key_when_one_is_configured():
+    """OTX refuses anonymous callers outright, so the key is the difference
+    between the source working and contributing nothing."""
+    seen = {}
+
+    class _C(_FakeEnumClient):
+        async def get(self, url, **kwargs):
+            seen.update(kwargs.get("headers") or {})
+            return await super().get(url, **kwargs)
+
+    c = _C({"otx.alienvault.com": _FakeResp(
+        200, {"passive_dns": [{"hostname": "a.x.com"}, {"hostname": "b.other.com"}]})})
+    out = await sources.enum_otx(c, "x.com", "tok")
+    assert out == {"a.x.com"}
+    assert seen.get("X-OTX-API-KEY") == "tok"
+
+
+async def test_anubis_reads_the_live_host():
+    """jldc.me is dead (301 to a bot-blocked host); anubisdb.com is canonical."""
+    c = _FakeEnumClient({"anubisdb.com": _FakeResp(
+        200, ["*.a.x.com", "b.x.com", "c.other.com"])})
+    out = await sources.enum_anubis(c, "x.com")
+    assert out == {"a.x.com", "b.x.com"}          # wildcard stripped, scope enforced
+    assert not out.failed
+    assert c.calls and "anubisdb.com" in c.calls[0]
+
+
+async def test_wayback_retries_a_429_instead_of_giving_up():
+    """429 is the archive's normal response under load, not an exceptional one —
+    one of them used to cost the source for the entire run."""
+    class _Flaky:
+        def __init__(self):
+            self.n = 0
+
+        async def get(self, url, **kwargs):
+            self.n += 1
+            if self.n == 1:
+                return _FakeRespText(429, "")
+            return _FakeResp(200, [["original"], ["https://a.x.com/p"]])
+
+    c = _Flaky()
+    out = await sources.enum_wayback(c, "x.com")
+    assert out == {"a.x.com"} and not out.failed and c.n == 2
+
+
+def test_retry_after_header_is_honoured_when_usable():
+    """Retrying sooner than the server asked just earns another 429."""
+    assert sources._retry_after_seconds(_FakeRespText(429, "")) is None
+    r = _FakeRespText(429, "")
+    r.headers = {"retry-after": "5"}
+    assert sources._retry_after_seconds(r) == 5.0
+    r.headers = {"retry-after": "9999"}
+    assert sources._retry_after_seconds(r) == 30.0      # capped
+    r.headers = {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    assert sources._retry_after_seconds(r) is None      # date form → backoff
 
 
 async def test_a_source_with_genuinely_nothing_is_not_marked_failed():
@@ -4411,7 +4618,7 @@ async def test_passive_enum_separates_failed_sources_from_empty_ones(monkeypatch
     async def ok(client, domain):
         return {"a.x.com"}
 
-    async def blocked(client, domain):
+    async def blocked(client, domain, api_key=None):
         return sources.SourceSet(failed=True, detail="HTTP 403 — blocked")
 
     async def empty(client, domain):
@@ -4434,7 +4641,7 @@ async def test_a_source_that_worked_for_one_domain_is_not_marked_failed(monkeypa
     """One domain's 403 shouldn't indict a source that answered for another."""
     calls = {"n": 0}
 
-    async def flaky(client, domain):
+    async def flaky(client, domain, api_key=None):
         calls["n"] += 1
         if domain == "bad.com":
             return sources.SourceSet(failed=True, detail="HTTP 403")
@@ -4449,6 +4656,48 @@ async def test_a_source_that_worked_for_one_domain_is_not_marked_failed(monkeypa
     _hs, per_source, failed = await sources.passive_enum(None, ["good.com", "bad.com"], {})
     assert per_source["otx"] == 1
     assert "otx" not in failed
+
+
+def test_hunter_plan_cap_is_read_back_out_of_the_error():
+    assert people.hunter_plan_cap(
+        "The search results are limited to 10 email addresses on your current plan") == 10
+    assert people.hunter_plan_cap("limited to 25 emails") == 25
+    assert people.hunter_plan_cap("some other error") is None
+    assert people.hunter_plan_cap("") is None
+
+
+async def test_hunter_retries_at_the_plan_cap():
+    """Asking for more than the plan allows is a hard 400, not a truncated
+    result — so every search failed and Hunter looked like it had no data."""
+    seen = []
+
+    class _C:
+        async def get(self, url, **kwargs):
+            limit = kwargs["params"]["limit"]
+            seen.append(limit)
+            if limit > 10:
+                return _FakeResp(400, {"errors": [{"details": "The search results are "
+                                                              "limited to 10 email addresses "
+                                                              "on your current plan"}]})
+            return _FakeResp(200, {"data": {"pattern": "{first}",
+                                            "emails": [{"value": "a@x.com"}]}})
+
+    pattern, ppl = await people.hunter_domain_search(_C(), "x.com", "k")
+    assert seen == [100, 10]                       # asked, then retried at the cap
+    assert [p.email for p in ppl] == ["a@x.com"]
+    assert pattern == "{first}"
+
+
+async def test_hunter_does_not_loop_on_an_unparseable_400():
+    calls = []
+
+    class _C:
+        async def get(self, url, **kwargs):
+            calls.append(kwargs["params"]["limit"])
+            return _FakeResp(400, {"errors": [{"details": "something else entirely"}]})
+
+    pattern, ppl = await people.hunter_domain_search(_C(), "x.com", "k")
+    assert calls == [100] and ppl == [] and pattern is None
 
 
 def test_extract_emails_keeps_only_in_scope_addresses():

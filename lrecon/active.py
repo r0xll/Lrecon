@@ -16,6 +16,12 @@ async def http_probe(client, host: Host) -> None:
             host.server = r.headers.get("server")
             host.powered_by = r.headers.get("x-powered-by")
             host.final_url = str(r.url)
+            # Feed the same field the ProjectDiscovery httpx backend fills, so
+            # confirm_tech_stack() has something to compare CPEs against. It
+            # previously only ever got data on runs where PD httpx was on PATH,
+            # which meant CVE tech-confirmation silently did nothing for anyone
+            # on the pure-Python path — always None, never True or False.
+            host.tech = [t for t in (host.server, host.powered_by) if t]
             body = r.text[:30000]
             lo = body.lower()
             if "<title" in lo:
