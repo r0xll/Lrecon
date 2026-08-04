@@ -63,7 +63,7 @@ except Exception:
 
 
 def log(msg: str) -> None:
-    """Print a log line verbatim.
+    """Print a log line verbatim, but still coloured.
 
     `markup=False` is load-bearing, not a style choice: rich parses square
     brackets as markup tags and *deletes* the ones it recognises. Every `[i]`
@@ -71,9 +71,16 @@ def log(msg: str) -> None:
     hint rendered as `pip install 'lrecon'` — an instruction that installs
     nothing, because `[tls]` disappeared. lrecon builds its own `[+]`/`[i]`
     prefixes and never uses rich markup here, so nothing is lost by disabling it.
+
+    Highlighting is deliberately left ON. It was switched off alongside markup,
+    which was a mistake: the two are independent, and it is highlighting — not
+    markup — that colours IPs, URLs, counts and quoted strings, i.e. the thing
+    that makes a finding stand out in a long run. Turning it off made the console
+    monochrome for no benefit. rich emits ANSI only when attached to a terminal,
+    so this behaves the same under fish/bash/zsh and stays clean when piped.
     """
     if _HAVE_RICH:
-        _console.print(msg, markup=False, highlight=False)
+        _console.print(msg, markup=False)
     else:
         print(msg, file=sys.stderr)
 

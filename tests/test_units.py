@@ -2115,6 +2115,40 @@ def test_log_does_not_let_rich_eat_square_brackets(capsys):
     assert "[i]" in text
 
 
+def test_log_still_colours_output():
+    """Regression: highlighting was switched off alongside markup, which made the
+    console monochrome. The two are independent — markup off keeps brackets
+    literal, highlighting on is what makes a finding stand out."""
+    import io, re
+    from rich.console import Console
+    from lrecon import common
+    buf = io.StringIO()
+    forced = Console(file=buf, force_terminal=True, width=200)
+    with monkeypatched(common, "_console", forced), monkeypatched(common, "_HAVE_RICH", True):
+        common.log("[i] 42 hosts 1.2.3.4 https://x.test (pip install 'lrecon[tls]')")
+    written = buf.getvalue()
+    assert "\x1b[" in written                        # ANSI escapes present
+    # Colour codes sit *between* the bracket characters, so compare what a
+    # reader actually sees rather than the raw byte string.
+    visible = re.sub(r"\x1b\[[0-9;]*m", "", written)
+    assert "[tls]" in visible and "[i]" in visible
+
+
+class monkeypatched:
+    """Minimal attribute patcher — the colour test needs a real Console object,
+    which pytest's monkeypatch fixture can't be used for at module import time."""
+    def __init__(self, obj, name, value):
+        self.obj, self.name, self.value = obj, name, value
+
+    def __enter__(self):
+        self.old = getattr(self.obj, self.name)
+        setattr(self.obj, self.name, self.value)
+        return self.value
+
+    def __exit__(self, *exc):
+        setattr(self.obj, self.name, self.old)
+
+
 def test_provider_assigned_name_is_stale_dns_not_a_takeover():
     """An AWS load-balancer name carries an AWS-generated hash and ID. Deleting
     the balancer retires the name permanently — nobody can ask for it back, so
