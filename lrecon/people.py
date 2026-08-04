@@ -49,15 +49,38 @@ def _hunter_error_detail(payload) -> str:
     return " | ".join(d for d in details if d)
 
 
-async def hunter_domain_search(client, domain: str, api_key: str) -> tuple[str | None, list]:
+_HUNTER_CAP_RE = re.compile(r"limited to (\d+) email", re.I)
+
+
+def hunter_plan_cap(detail: str) -> int | None:
+    """The result cap Hunter's error names, if it named one.
+
+    Asking for more than the plan allows is a hard 400, not a truncated result:
+    "The search results are limited to 10 email addresses on your current plan."
+    Every search failed because lrecon asked for 100. The number is read back
+    out rather than hardcoded, since it is plan-specific and changes with the
+    plan.
+    """
+    m = _HUNTER_CAP_RE.search(detail or "")
+    return int(m.group(1)) if m else None
+
+
+async def hunter_domain_search(client, domain: str, api_key: str,
+                               limit: int = 100) -> tuple[str | None, list]:
     try:
         r = await client.get("https://api.hunter.io/v2/domain-search",
-                            params={"domain": domain, "api_key": api_key, "limit": 100},
+                            params={"domain": domain, "api_key": api_key, "limit": limit},
                             timeout=25)
         try:
             payload = r.json()
         except Exception:
             payload = None
+        if r.status_code == 400:
+            cap = hunter_plan_cap(_hunter_error_detail(payload))
+            if cap and cap < limit:
+                log(f"[i] hunter.io {domain}: plan caps results at {cap} — retrying at that "
+                    f"limit (asked for {limit})")
+                return await hunter_domain_search(client, domain, api_key, limit=cap)
         if r.status_code == 200:
             pattern, people = _parse_hunter_response(payload)
             if not people:

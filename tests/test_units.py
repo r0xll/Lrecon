@@ -151,6 +151,27 @@ def test_confirm_tech_stack_false_when_no_cpe_matches():
     assert enrich.confirm_tech_stack(h) is False
 
 
+async def test_http_probe_populates_tech_so_cve_confirmation_can_run():
+    """h.tech was only ever filled by the ProjectDiscovery httpx backend, so on a
+    pure-Python run confirm_tech_stack() had nothing to compare against and
+    returned None for every host — CVE tech-validation silently never ran."""
+    class _Resp:
+        status_code = 200
+        headers = {"server": "nginx/1.18.0", "x-powered-by": "PHP/7.4"}
+        text = "<html><title>hi</title></html>"
+        url = "https://a.x.com/"
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _Resp()
+
+    h = Host("a.x.com", cpes=["cpe:2.3:a:nginx:nginx:1.18.0:*:*:*:*:*:*:*"])
+    await active.http_probe(_C(), h)
+    assert h.tech == ["nginx/1.18.0", "PHP/7.4"]
+    # The point of the fix: the comparison now actually resolves.
+    assert enrich.confirm_tech_stack(h) is True
+
+
 def test_confirm_tech_stack_none_when_no_live_tech_or_no_cpes():
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=["cpe:2.3:a:x:y:1:*"], tech=[])) is None
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=[], tech=["nginx"])) is None
@@ -171,10 +192,11 @@ class _FakeResp:
 
 class _FakeRespText:
     """Response whose body is text (bucket listing XML), not JSON."""
-    def __init__(self, status_code, text=""):
+    def __init__(self, status_code, text="", headers=None):
         self.status_code = status_code
         self.text = text
         self.content = text.encode()
+        self.headers = headers or {}
 
     def json(self):
         raise ValueError("not json")
@@ -3598,6 +3620,23 @@ def test_attack_surface_has_a_country_column_in_both_writers():
         assert "IE, US" in text and "FR" in text
 
 
+def test_certs_table_is_filterable():
+    """Same complaint as the attack surface, same generic machinery — a real
+    scope produces far too many cert rows to read top to bottom."""
+    res = {"certs": [{"host": "a.x.com", "port": 443, "cn": "a.x.com",
+                      "sans": ["a.x.com"], "issuer": "R3",
+                      "not_after": "2027-01-01T00:00:00+00:00", "expired": False,
+                      "self_signed": False, "days_to_expiry": 300}]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("a.x.com")], ["x.com"], res, str(path))
+        content = path.read_text()
+    table = content.split('id="t-certs"')[1].split("</table>")[0]
+    assert 'id="t-certs" data-filterable="1"' in content
+    assert table.count("<th>") == table.count('class="filter-input"') == 6
+    assert 'class="filtercount" data-for="t-certs"' in content
+
+
 def test_attack_surface_table_is_filterable():
     """The filter row and its hook have to be present for the JS to bind to —
     the behaviour itself is exercised in a real browser, not here."""
@@ -4386,7 +4425,8 @@ def test_vt_history_renders_org_and_origin_candidates():
         report.write_html([Host("x.com")], ["x.com"], res, str(html))
         md_text, html_text = md.read_text(), html.read_text()
     for text in (md_text, html_text):
-        assert "Colo Provider" in text and "AS64496" in text
+        assert "Colo Provider" in text
+        assert "AS64496" not in text          # ASN column dropped on request
         assert "origin candidate" in text
         assert "Host" in text                  # the how-to-verify note
     assert "**origin candidate**" in md_text
@@ -4424,14 +4464,73 @@ async def test_blocked_sources_are_reported_as_failed_not_empty():
     otx = await sources.enum_otx(_FakeEnumClient(
         {"otx.alienvault.com": _FakeRespText(429, "")}), "x.com")
     assert otx == set() and otx.failed and "429" in otx.detail
+    # Without a key the message has to name the cause, not just the status.
+    assert "OTX_API_KEY" in otx.detail
 
     anubis = await sources.enum_anubis(_FakeEnumClient(
-        {"jldc.me": _FakeRespText(403, "")}), "x.com")
-    assert anubis == set() and anubis.failed and "403" in anubis.detail
+        {"anubisdb.com": _FakeRespText(503, "")}), "x.com")
+    assert anubis == set() and anubis.failed and "503" in anubis.detail
 
     wayback = await sources.enum_wayback(_FakeEnumClient(
-        {"web.archive.org": _FakeRespText(503, "")}), "x.com")
-    assert wayback == set() and wayback.failed
+        {"web.archive.org": _FakeRespText(503, "")}), "x.com", attempts=1)
+    assert wayback == set() and wayback.failed and "503" in wayback.detail
+
+
+async def test_otx_sends_the_api_key_when_one_is_configured():
+    """OTX refuses anonymous callers outright, so the key is the difference
+    between the source working and contributing nothing."""
+    seen = {}
+
+    class _C(_FakeEnumClient):
+        async def get(self, url, **kwargs):
+            seen.update(kwargs.get("headers") or {})
+            return await super().get(url, **kwargs)
+
+    c = _C({"otx.alienvault.com": _FakeResp(
+        200, {"passive_dns": [{"hostname": "a.x.com"}, {"hostname": "b.other.com"}]})})
+    out = await sources.enum_otx(c, "x.com", "tok")
+    assert out == {"a.x.com"}
+    assert seen.get("X-OTX-API-KEY") == "tok"
+
+
+async def test_anubis_reads_the_live_host():
+    """jldc.me is dead (301 to a bot-blocked host); anubisdb.com is canonical."""
+    c = _FakeEnumClient({"anubisdb.com": _FakeResp(
+        200, ["*.a.x.com", "b.x.com", "c.other.com"])})
+    out = await sources.enum_anubis(c, "x.com")
+    assert out == {"a.x.com", "b.x.com"}          # wildcard stripped, scope enforced
+    assert not out.failed
+    assert c.calls and "anubisdb.com" in c.calls[0]
+
+
+async def test_wayback_retries_a_429_instead_of_giving_up():
+    """429 is the archive's normal response under load, not an exceptional one —
+    one of them used to cost the source for the entire run."""
+    class _Flaky:
+        def __init__(self):
+            self.n = 0
+
+        async def get(self, url, **kwargs):
+            self.n += 1
+            if self.n == 1:
+                return _FakeRespText(429, "")
+            return _FakeResp(200, [["original"], ["https://a.x.com/p"]])
+
+    c = _Flaky()
+    out = await sources.enum_wayback(c, "x.com")
+    assert out == {"a.x.com"} and not out.failed and c.n == 2
+
+
+def test_retry_after_header_is_honoured_when_usable():
+    """Retrying sooner than the server asked just earns another 429."""
+    assert sources._retry_after_seconds(_FakeRespText(429, "")) is None
+    r = _FakeRespText(429, "")
+    r.headers = {"retry-after": "5"}
+    assert sources._retry_after_seconds(r) == 5.0
+    r.headers = {"retry-after": "9999"}
+    assert sources._retry_after_seconds(r) == 30.0      # capped
+    r.headers = {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    assert sources._retry_after_seconds(r) is None      # date form → backoff
 
 
 async def test_a_source_with_genuinely_nothing_is_not_marked_failed():
@@ -4445,7 +4544,7 @@ async def test_passive_enum_separates_failed_sources_from_empty_ones(monkeypatch
     async def ok(client, domain):
         return {"a.x.com"}
 
-    async def blocked(client, domain):
+    async def blocked(client, domain, api_key=None):
         return sources.SourceSet(failed=True, detail="HTTP 403 — blocked")
 
     async def empty(client, domain):
@@ -4468,7 +4567,7 @@ async def test_a_source_that_worked_for_one_domain_is_not_marked_failed(monkeypa
     """One domain's 403 shouldn't indict a source that answered for another."""
     calls = {"n": 0}
 
-    async def flaky(client, domain):
+    async def flaky(client, domain, api_key=None):
         calls["n"] += 1
         if domain == "bad.com":
             return sources.SourceSet(failed=True, detail="HTTP 403")
@@ -4483,6 +4582,48 @@ async def test_a_source_that_worked_for_one_domain_is_not_marked_failed(monkeypa
     _hs, per_source, failed = await sources.passive_enum(None, ["good.com", "bad.com"], {})
     assert per_source["otx"] == 1
     assert "otx" not in failed
+
+
+def test_hunter_plan_cap_is_read_back_out_of_the_error():
+    assert people.hunter_plan_cap(
+        "The search results are limited to 10 email addresses on your current plan") == 10
+    assert people.hunter_plan_cap("limited to 25 emails") == 25
+    assert people.hunter_plan_cap("some other error") is None
+    assert people.hunter_plan_cap("") is None
+
+
+async def test_hunter_retries_at_the_plan_cap():
+    """Asking for more than the plan allows is a hard 400, not a truncated
+    result — so every search failed and Hunter looked like it had no data."""
+    seen = []
+
+    class _C:
+        async def get(self, url, **kwargs):
+            limit = kwargs["params"]["limit"]
+            seen.append(limit)
+            if limit > 10:
+                return _FakeResp(400, {"errors": [{"details": "The search results are "
+                                                              "limited to 10 email addresses "
+                                                              "on your current plan"}]})
+            return _FakeResp(200, {"data": {"pattern": "{first}",
+                                            "emails": [{"value": "a@x.com"}]}})
+
+    pattern, ppl = await people.hunter_domain_search(_C(), "x.com", "k")
+    assert seen == [100, 10]                       # asked, then retried at the cap
+    assert [p.email for p in ppl] == ["a@x.com"]
+    assert pattern == "{first}"
+
+
+async def test_hunter_does_not_loop_on_an_unparseable_400():
+    calls = []
+
+    class _C:
+        async def get(self, url, **kwargs):
+            calls.append(kwargs["params"]["limit"])
+            return _FakeResp(400, {"errors": [{"details": "something else entirely"}]})
+
+    pattern, ppl = await people.hunter_domain_search(_C(), "x.com", "k")
+    assert calls == [100] and ppl == [] and pattern is None
 
 
 def test_extract_emails_keeps_only_in_scope_addresses():

@@ -129,6 +129,9 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                          "(needs --vt-key; free tier is 4 req/min, 2 calls/domain — explicit "
                          "flag even with a key configured, since it adds real wall-clock time)")
     ap.add_argument("--vt-key", help="VirusTotal API key (else env/config)")
+    ap.add_argument("--otx-key", help="AlienVault OTX API key (else OTX_API_KEY/config). "
+                                      "OTX refuses anonymous passive-DNS queries, so this "
+                                      "source contributes nothing without one")
     ap.add_argument("--nvd", action="store_true", help="resolve CPEs to CVEs via NVD (slow)")
     ap.add_argument("--nvd-max-cves", type=int, default=25,
                     help="per-host cap on bare Shodan/InternetDB CVE IDs resolved via NVD "

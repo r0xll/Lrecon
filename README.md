@@ -79,7 +79,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 
 | Phase | What runs | Target touch |
 |---|---|---|
-| 1. Passive enum | crt.sh, Cert Spotter, OTX, Anubis, Wayback CDX, Shodan DNS, subfinder | none |
+| 1. Passive enum | crt.sh, Cert Spotter, Anubis, Wayback CDX, OTX (keyed), Shodan DNS, subfinder | none |
 | 2. Resolution | shared fast resolver, A/AAAA/CNAME concurrent, wildcard filtering | DNS only |
 | 3. Enrichment | per **unique IP**: IPinfo (ASN/org/rDNS) + Shodan host / InternetDB (ports/CVE) | none (API) |
 | 4. Active | HTTP probe, favicon hash, takeover checks, optional TCP scan | yes |
@@ -91,12 +91,12 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | Auth surface | passive OIDC/SSO discovery — reads each live host's `/.well-known/openid-configuration` and fingerprints the identity provider (Okta, Entra/Azure AD, Auth0, Ping, ADFS, Google, Keycloak). Discovery only: no login/credential probing (not run under `--passive-only`) | yes (one GET/host) |
 | People OSINT | company email enumeration: website scrape (keyless), Hunter.io, GitHub commit history, RocketReach | website scrape only |
 | Search-engine dorking | admin/login/config/backup/`.git`/API-doc exposure via Google Custom Search (opt-in, keyed — see [Search-engine dorking](#search-engine-dorking)) | none (API) |
-| VirusTotal domain intel | historical IP/hosting resolutions enriched with ASN/org + origin candidates, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
+| VirusTotal domain intel | historical IP/hosting resolutions enriched with org/country + origin candidates, WHOIS mirror, reputation (opt-in, keyed — see [Domain intelligence & IP/hosting history](#domain-intelligence--iphosting-history-virustotal)) | none (API) |
 | Email verify | SMTP RCPT-TO probe of discovered emails (opt-in, `--verify-emails`) | yes, mail infra |
 | CVE | NVD CPE->CVE resolution (opt-in, cached) | none (API) |
 | Diff | change vs previous run snapshot | none |
 
-Sources are keyless except **Shodan** and **subfinder**. Shodan/InternetDB only
+Sources are keyless except **Shodan**, **subfinder** and **OTX**. Shodan/InternetDB only
 hold data for IPs they have already indexed, so they are often empty — that is
 expected. IPinfo fills ASN/org/rDNS regardless of whether a token is
 configured — keyless requests just hit a lower, unauthenticated rate limit.
@@ -152,6 +152,7 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 | RocketReach | company people search (name/title only — see below) | `--rocketreach-key` | `ROCKETREACH_API_KEY` | limited |
 | Search-engine dorking | `--dork` entry-point search (admin/login/config/backup exposure) via Google CSE / Brave Search / Vertex AI Search (`--dork-provider`) | `--google-cse-key`+`--google-cse-cx` / `--brave-key` / `--vertex-*` | `GOOGLE_CSE_KEY`+`GOOGLE_CSE_CX` / `BRAVE_SEARCH_API_KEY` / `VERTEX_*` | Google CSE 100/day, Brave 2k/mo |
 | VirusTotal | `--vt` domain intelligence — historical IP/hosting resolutions, WHOIS mirror, reputation | `--vt-key` | `VT_API_KEY` | 500/day, 4 req/min |
+| AlienVault OTX | passive-DNS subdomain enum. Anonymous access is refused (429), so this source contributes nothing without a key | `--otx-key` | `OTX_API_KEY` | free |
 
 ```fish
 # persistent (fish universal vars — visible inside the venv)
@@ -346,9 +347,9 @@ of those is a fact about the target:
 
 | Source | Status |
 |---|---|
-| **Wayback CDX** | working. It previously returned nothing on *every* target: the URL was `http://`, `web.archive.org` 301s to HTTPS, and the shared enum client does not follow redirects. Fixed. |
-| **OTX** | answers anonymous callers `429 — "Anonymous access to this endpoint is limited. Please authenticate."` Effectively no longer keyless; kept for anyone fronting it with credentials. |
-| **Anubis** | `jldc.me` now 301s to `jonlu.ca`, which blocks automated clients with a 403. Effectively unavailable. |
+| **Wayback CDX** | working, and now **retried**. The URL was `http://` and `web.archive.org` 301s to HTTPS, which the shared enum client doesn't follow — so it returned nothing on *every* target. It also 429s routinely under load, which used to cost the source for the whole run; there are now 4 attempts with backoff, honouring `Retry-After`. |
+| **Anubis** | working. `jldc.me` 301s to `jonlu.ca`, which blocks automated clients — but that was never the canonical host. [Anubis-DB](https://github.com/jonluca/Anubis-DB) serves from **`anubisdb.com`**, and lrecon now queries that. |
+| **OTX** | **needs an API key.** Anonymous callers get `429 — "Anonymous access to this endpoint is limited. Please authenticate."` Set `--otx-key`/`OTX_API_KEY` and it works again; without one, the failure line says so rather than looking like a clean domain. |
 
 A source that works for one domain in the scope is not reported as failed
 because it 403'd on another.
@@ -923,7 +924,7 @@ closest free equivalent via VirusTotal's official public API v3:
 
 - **Historical IP resolutions** (hosting history) — every domain→IP passive-DNS
   resolution VT has observed, newest first, each with a first-seen date, **plus
-  ASN / org / country / rDNS per address**. A bare list of IPs and dates says a
+  org / country / rDNS per address**. A bare list of IPs and dates says a
   domain moved, not what it moved between; the org is what makes the history
   readable — a former colo or cloud tenancy is a very different story from a
   former CDN. One IPinfo lookup per unique address, deduped across domains, and

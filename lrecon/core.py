@@ -121,6 +121,57 @@ async def verify_keys(client, keys: dict) -> None:
         except Exception as e:
             log(f"[!] RocketReach API: check failed ({e}) — proceeding anyway")
 
+    if keys.get("brave"):
+        try:
+            r = await client.get("https://api.search.brave.com/res/v1/web/search",
+                                params={"q": "lrecon", "count": 1},
+                                headers={"X-Subscription-Token": keys["brave"],
+                                         "Accept": "application/json"}, timeout=15)
+            if r.status_code == 200:
+                log("[+] Brave Search API: Ready")
+            elif r.status_code in (401, 403):
+                log("[!] Brave Search API: Invalid — dorking via Brave disabled")
+                keys["brave"] = None
+            elif r.status_code == 429:
+                log("[!] Brave Search API: rate limited at startup — proceeding anyway")
+            else:
+                log(f"[!] Brave Search API: unexpected response (HTTP {r.status_code}) "
+                    f"— proceeding anyway")
+        except Exception as e:
+            log(f"[!] Brave Search API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("vt"):
+        try:
+            # /users/{key} is the documented account endpoint and costs no
+            # lookup quota, which matters on a tier capped at 4 req/min.
+            r = await client.get(f"https://www.virustotal.com/api/v3/users/{keys['vt']}",
+                                headers={"x-apikey": keys["vt"]}, timeout=15)
+            if r.status_code == 200:
+                log("[+] VirusTotal API: Ready")
+            elif r.status_code in (401, 403):
+                log("[!] VirusTotal API: Invalid — --vt domain intelligence disabled")
+                keys["vt"] = None
+            else:
+                log(f"[!] VirusTotal API: unexpected response (HTTP {r.status_code}) "
+                    f"— proceeding anyway")
+        except Exception as e:
+            log(f"[!] VirusTotal API: check failed ({e}) — proceeding anyway")
+
+    if keys.get("otx"):
+        try:
+            r = await client.get("https://otx.alienvault.com/api/v1/user/me",
+                                headers={"X-OTX-API-KEY": keys["otx"]}, timeout=15)
+            if r.status_code == 200:
+                log("[+] OTX API: Ready")
+            elif r.status_code in (401, 403):
+                log("[!] OTX API: Invalid — passive DNS via OTX disabled")
+                keys["otx"] = None
+            else:
+                log(f"[!] OTX API: unexpected response (HTTP {r.status_code}) "
+                    f"— proceeding anyway")
+        except Exception as e:
+            log(f"[!] OTX API: check failed ({e}) — proceeding anyway")
+
     if keys.get("hibp"):
         # hibp_breaches() only calls HIBP's keyless domain-breaches endpoint —
         # there's nothing keyed to verify here yet, so just say so plainly
@@ -524,6 +575,7 @@ async def run(domains, args, keys) -> list:
         asn_info = {}
         if args.asn_expand and not args.passive_only:
             asns = {h.asn for h in hosts.values() if h.asn}
+            barren = []
             for asn in asns:
                 prefixes = await ripestat_prefixes(client, asn)
                 asn_info[asn] = prefixes
@@ -534,7 +586,19 @@ async def run(domains, args, keys) -> list:
                         if any(host.endswith(d) for d in domains) and host not in hosts:
                             hosts[host] = Host(subdomain=host, ips=[ip], source={"asn-rdns"})
                             added += 1
-                    log(f"[+] {asn}: {len(prefixes)} prefixes, PTR-swept -> {added} new in-scope hosts")
+                    # An ASN that yielded nothing is the normal case and says
+                    # nothing an operator can act on. One summary line records
+                    # that the sweep ran; the per-ASN lines are kept for the
+                    # ASNs that actually produced hosts.
+                    if added:
+                        log(f"[+] {asn}: {len(prefixes)} prefixes, PTR-swept -> "
+                            f"{added} new in-scope hosts")
+                    else:
+                        barren.append(asn)
+            if barren:
+                log(f"[i] ASN expansion: {len(barren)} ASN(s) swept with no new in-scope "
+                    f"hosts ({', '.join(sorted(barren)[:6])}"
+                    + (f" +{len(barren) - 6} more" if len(barren) > 6 else "") + ")")
 
         # ---- Intel phase: email posture, github, buckets, breach ----
         email = {}
