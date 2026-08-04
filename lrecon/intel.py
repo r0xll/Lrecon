@@ -1783,10 +1783,27 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
         poc_ids = [cid for cid in cve_ids if nvd_by_id.get(cid, {}).get("poc")]
         unscored = len(cve_ids) - len(cvss_values)
 
+        # An entry point is a claim that this is worth working *now*, and that
+        # claim rests on the vulnerable software actually being there. The CVE
+        # list comes from Shodan/InternetDB banners that can be weeks stale, so
+        # the live tech-detect result decides whether it gets promoted at all.
+        if h.tech_confirmed is False:
+            # The probe looked and found no matching software. Reporting that as
+            # a critical entry point sends someone to exploit something that
+            # isn't running. It stays in the CVE hits section and the JSON —
+            # nothing is lost, it just isn't a priority lead.
+            continue
+
         severity = min(
             (_cve_severity(nvd_by_id.get(cid, {}).get("cvss"), has_poc=bool(nvd_by_id.get(cid, {}).get("poc")))
              for cid in cve_ids),
             key=lambda s: ENTRY_SEVERITY_ORDER.get(s, 9))
+        if h.tech_confirmed is None and severity == "critical":
+            # Couldn't check — no live tech data, or no CPEs to compare. That is
+            # absence of evidence, not evidence of absence, so the lead stays;
+            # but an unverified banner shouldn't outrank a confirmed finding at
+            # the top of the list.
+            severity = "high"
 
         cvss_note = f" (max CVSS {max_cvss})" if max_cvss is not None else ""
         poc_note = f" [{len(poc_ids)} with public PoC]" if poc_ids else ""
@@ -1797,9 +1814,9 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
         # probe (enrich.confirm_tech_stack) — Shodan/InternetDB data can be
         # weeks stale, so this flags whether the vulnerable software still
         # looks live, to cut down manual triage.
-        tech_note = " [tech-stack confirmed live]" if h.tech_confirmed is True else \
-                    (" [unconfirmed — live probe found no matching software, may be stale]"
-                     if h.tech_confirmed is False else "")
+        tech_note = (" [tech-stack confirmed live]" if h.tech_confirmed is True else
+                     " [tech stack unverified — capped below critical; no live tech data "
+                     "to compare the reported CPEs against]")
         detail = "; ".join(
             cid + (f" (CVSS {nvd_by_id[cid]['cvss']})" if nvd_by_id.get(cid, {}).get("cvss") is not None else "")
             + (" [PoC]" if nvd_by_id.get(cid, {}).get("poc") else "")

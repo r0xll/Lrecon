@@ -867,16 +867,27 @@ def _html_section(section_id: str, title: str, count, body_html: str, open_defau
 
 
 def _html_filter_toolbar(table_id: str) -> str:
-    """Row counter + reset for a filterable table.
+    """Hint box, row counter and reset, directly above the filter row.
 
-    The counter is not decoration: a filtered table looks exactly like a short
-    one, and reading "12 hosts" off a table that is silently hiding 300 is the
-    same class of mistake as a blocked source reporting 0.
+    The syntax used to be explained in a note *below* the table, which is not
+    where anyone looks before typing into a box at the top. The counter is not
+    decoration either: a filtered table looks exactly like a short one, and
+    reading "12 hosts" off a table silently hiding 300 is the same class of
+    mistake as a blocked source reporting 0.
     """
-    return (f'<div class="filterbar"><span class="filtercount" '
-            f'data-for="{table_id}"></span>'
-            f'<button class="export-btn" type="button" '
-            f'onclick="resetFilters(\'{table_id}\')">Reset filters</button></div>')
+    return (
+        f'<div class="filterhint">'
+        f'<b>Filter:</b> type in a column box to narrow. '
+        f'<code>443,8443</code> matches either &middot; '
+        f'<code>!403</code> excludes &middot; '
+        f'<code>!403,404</code> excludes both &middot; '
+        f'<code>—</code> is an empty cell, so <code>!—</code> means "has one". '
+        f'Columns combine with AND. Export CSV writes exactly the rows on screen.'
+        f'</div>'
+        f'<div class="filterbar"><span class="filtercount" '
+        f'data-for="{table_id}"></span>'
+        f'<button class="export-btn" type="button" '
+        f'onclick="resetFilters(\'{table_id}\')">Reset filters</button></div>')
 
 
 def _html_filter_row(columns: list) -> str:
@@ -1277,10 +1288,7 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<p class="note">Read from the live handshake — the certificates '
                 f'actually presented, including ones never submitted to a CT log. '
                 f'In-scope SAN entries are added to the host list as <code>tls-san</code>; '
-                f'other tenants\' names on a shared certificate are excluded.</p>'
-                f'<p class="note">Filter as on the attack surface: type to narrow, prefix '
-                f'<code>!</code> to exclude. <code>!—</code> under Flags leaves only the '
-                f'certificates with something wrong with them.</p>')
+                f'other tenants\' names on a shared certificate are excluded.</p>')
         sections.append(_html_section("certs", "TLS certificates (as served)",
                                       len(certs), body))
 
@@ -1495,11 +1503,7 @@ def write_html(hosts, domains, res, path) -> None:
             f'<table id="t-attacksurface" data-filterable="1">'
             f'<tr>{"".join(f"<th>{c}</th>" for c in as_cols)}</tr>'
             f'{_html_filter_row(as_cols)}'
-            f'{"".join(rows)}</table>'
-            '<p class="note">Type in a column box to narrow the table; prefix with '
-            '<code>!</code> to exclude instead (<code>!403</code> hides the 403s). Empty '
-            'cells show as <code>—</code>, so <code>!—</code> under CVEs leaves only hosts '
-            'that have one. Export CSV writes exactly the rows on screen.</p>')
+            f'{"".join(rows)}</table>')
     if any_nonweb:
         body += ('<p class="note">Highlighted ports are non-web services (SSH, RDP, databases, '
                 'etc.) — the HTTP probe never touches them, so they need a manual look.</p>')
@@ -1566,6 +1570,12 @@ code {{ background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }}
 tr:nth-child(even) {{ background: #fafafa; }}
 .filterbar {{ display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; }}
 .filtercount {{ font-size: .8rem; color: #666; }}
+/* Sits above the boxes it describes — the old note was below the table, which
+   is not where anyone looks before typing into a filter at the top. */
+.filterhint {{ font-size: .78rem; line-height: 1.5; color: #555; background: #f7f7f7;
+              border: 1px solid #e0e0e0; border-radius: 4px; padding: .4rem .6rem;
+              margin-bottom: .5rem; }}
+.filterhint code {{ font-size: .95em; }}
 /* Sits directly under the sticky header so the inputs stay reachable while
    scrolling a long table. 1.9rem is the header's own height. */
 th.filter-th {{ position: sticky; top: 1.9rem; background: #f4f4f4; padding: 2px 4px; }}
@@ -1610,6 +1620,7 @@ h4 {{ margin: 1.1rem 0 .4rem; font-size: 14px; }}
   code {{ background: #2a2d33; }}
   tr:nth-child(even) {{ background: #1c1f24; }}
   .filtercount {{ color: #999; }}
+  .filterhint {{ background: #1c1f24; border-color: #3a3d44; color: #aaa; }}
   th.filter-th {{ background: #23262c; }}
   tr.filter-row {{ background: #23262c !important; }}
   .filter-input {{ background: #16181c; border-color: #555; color: #e6e6e6; }}
@@ -1672,14 +1683,29 @@ function toggleAllSections(open) {{
 }}
 // Live column filters. Substring, case-insensitive, all columns ANDed; a
 // leading '!' negates so rows can be excluded as well as selected.
+// A box holds one or more comma-separated values, OR'd together — ports and
+// HTTP codes are exactly the columns you want to ask "443 or 8443" about, and a
+// single substring could not express that. A leading '!' negates the whole set,
+// so !403,404 hides both. Empty parts are dropped so a trailing comma typed
+// mid-thought doesn't blank the table.
 function _filterTerm(raw) {{
   var v = raw.trim().toLowerCase();
   if (!v) return null;
-  if (v.charAt(0) === '!') {{
-    var rest = v.slice(1).trim();
-    return rest ? {{negate: true, text: rest}} : null;
+  var negate = v.charAt(0) === '!';
+  if (negate) v = v.slice(1).trim();
+  var parts = v.split(',').map(function(p) {{ return p.trim(); }})
+               .filter(function(p) {{ return p.length > 0; }});
+  return parts.length ? {{negate: negate, parts: parts}} : null;
+}}
+// A purely numeric filter matches a whole number, not a digit substring:
+// otherwise 443 matches 8443 and 200 matches 2000, which makes the Open Ports
+// and HTTP columns — the ones people most want to filter — quietly wrong.
+// Text terms keep substring matching, so "ngin" still finds "nginx".
+function _matches(cell, part) {{
+  if (/^[0-9]+$/.test(part)) {{
+    return new RegExp('(^|[^0-9])' + part + '([^0-9]|$)').test(cell);
   }}
-  return {{negate: false, text: v}};
+  return cell.indexOf(part) !== -1;
 }}
 function applyFilters(table) {{
   var inputs = Array.prototype.slice.call(table.querySelectorAll('.filter-input'));
@@ -1692,7 +1718,8 @@ function applyFilters(table) {{
     var cells = row.querySelectorAll('td');
     var keep = terms.every(function(term, i) {{
       if (!term || !cells[i]) return true;
-      var hit = cells[i].textContent.toLowerCase().indexOf(term.text) !== -1;
+      var cell = cells[i].textContent.toLowerCase();
+      var hit = term.parts.some(function(p) {{ return _matches(cell, p); }});
       return term.negate ? !hit : hit;
     }});
     row.style.display = keep ? '' : 'none';

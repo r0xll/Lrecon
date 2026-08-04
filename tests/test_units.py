@@ -2231,6 +2231,48 @@ def test_log_still_colours_output():
     assert "[tls]" in visible and "[i]" in visible
 
 
+def _render(line):
+    """log() output through a forced-colour Console, as (raw, visible)."""
+    import io
+    from rich.console import Console
+    from lrecon import common
+    buf = io.StringIO()
+    forced = Console(file=buf, force_terminal=True, width=300)
+    with monkeypatched(common, "_console", forced), monkeypatched(common, "_HAVE_RICH", True):
+        common.log(line)
+    raw = buf.getvalue()
+    return raw, re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip("\n")
+
+
+def test_log_colours_the_prefix_by_severity():
+    """A red [!] is findable while scrolling without reading the text."""
+    styles = {}
+    for prefix in ("[!]", "[+]", "[i]", "[-]", "[*]"):
+        raw, visible = _render(f"{prefix} something happened")
+        assert visible == f"{prefix} something happened"     # text untouched
+        styles[prefix] = raw.split(prefix)[0]                # the opening escape
+    # Warning, success and info must be visually distinct from each other.
+    assert len({styles["[!]"], styles["[+]"], styles["[i]"]}) == 3
+    assert all(s.startswith("\x1b[") for s in styles.values())
+
+
+def test_severity_colour_does_not_disturb_the_message():
+    """The two colouring layers have to compose: the prefix is styled by us, the
+    body still goes through rich's highlighter, and neither alters the text."""
+    line = "[+] 42 unique subdomains | 1.2.3.4 https://x.test (pip install 'lrecon[tls]')"
+    raw, visible = _render(line)
+    assert visible == line                       # byte-identical, brackets intact
+    assert "1;32m[+]" in raw                     # our prefix style
+    assert raw.count("\x1b[") > 4                # ...plus the highlighter's spans
+
+
+def test_log_without_a_known_prefix_is_left_alone():
+    line = "no prefix at all 1.2.3.4"
+    raw, visible = _render(line)
+    assert visible == line
+    assert not raw.startswith("\x1b[2m")          # not accidentally dimmed
+
+
 class monkeypatched:
     """Minimal attribute patcher — the colour test needs a real Console object,
     which pytest's monkeypatch fixture can't be used for at module import time."""
@@ -3222,7 +3264,8 @@ def test_summarize_entry_points_unlisted_non_web_port_gets_generic_medium():
 
 def test_summarize_entry_points_includes_nvd_only_cves():
     # InternetDB gave CPEs but no vulns entries; --nvd found a critical CVE via CPE lookup.
-    h = Host("legacy.x.com", nvd_cves=[{"id": "CVE-2026-9999", "cvss": 9.8}])
+    h = Host("legacy.x.com", nvd_cves=[{"id": "CVE-2026-9999", "cvss": 9.8}],
+             tech_confirmed=True)      # critical requires a corroborated stack
     cf = {"detected": False, "candidates": {}}
     eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
     assert len(eps) == 1
@@ -3231,17 +3274,39 @@ def test_summarize_entry_points_includes_nvd_only_cves():
     assert "CVE-2026-9999" in eps[0]["summary"]
 
 
-def test_summarize_entry_points_notes_tech_confirmed_status():
+def test_cve_entry_points_require_a_corroborated_tech_stack():
+    """An entry point claims something is worth working now, and that rests on
+    the vulnerable software actually being there. CVE lists come from banners
+    that can be weeks stale."""
     cf = {"detected": False, "candidates": {}}
-    confirmed = Host("a.x.com", vulns=["CVE-2026-1"], tech_confirmed=True)
-    unconfirmed = Host("b.x.com", vulns=["CVE-2026-2"], tech_confirmed=False)
-    unknown = Host("c.x.com", vulns=["CVE-2026-3"], tech_confirmed=None)
-    eps = intel.summarize_entry_points([confirmed, unconfirmed, unknown], cf, [], {}, [], [])
-    by_target = {e["target"]: e["summary"] for e in eps}
-    assert "[tech-stack confirmed live]" in by_target["a.x.com"]
-    assert "[unconfirmed" in by_target["b.x.com"]
-    assert "[tech-stack confirmed live]" not in by_target["c.x.com"]
-    assert "[unconfirmed" not in by_target["c.x.com"]
+    confirmed = Host("a.x.com", vulns=["CVE-2026-1"],
+                     nvd_cves=[{"id": "CVE-2026-1", "cvss": 9.8}], tech_confirmed=True)
+    contradicted = Host("b.x.com", vulns=["CVE-2026-2"],
+                        nvd_cves=[{"id": "CVE-2026-2", "cvss": 9.8}], tech_confirmed=False)
+    unknown = Host("c.x.com", vulns=["CVE-2026-3"],
+                   nvd_cves=[{"id": "CVE-2026-3", "cvss": 9.8}], tech_confirmed=None)
+    eps = intel.summarize_entry_points([confirmed, contradicted, unknown], cf, [], {}, [], [])
+    by_target = {e["target"]: e for e in eps}
+
+    # Probe corroborates the reported CPE — full severity, as before.
+    assert by_target["a.x.com"]["severity"] == "critical"
+    assert "[tech-stack confirmed live]" in by_target["a.x.com"]["summary"]
+
+    # Probe looked and found no matching software: not a priority lead at all.
+    # It is still in the CVE hits section and the JSON — only the promotion goes.
+    assert "b.x.com" not in by_target
+
+    # Couldn't check: absence of evidence, so it stays but cannot top the list.
+    assert by_target["c.x.com"]["severity"] == "high"
+    assert "unverified" in by_target["c.x.com"]["summary"]
+
+
+def test_unverified_cve_below_critical_does_not_get_promoted_upward():
+    """The cap only ever lowers — a high-CVSS finding must not be inflated."""
+    cf = {"detected": False, "candidates": {}}
+    h = Host("c.x.com", vulns=["CVE-2026-3"], nvd_cves=[{"id": "CVE-2026-3", "cvss": 5.0}])
+    eps = intel.summarize_entry_points([h], cf, [], {}, [], [])
+    assert eps[0]["severity"] == "medium"
 
 
 def test_summarize_entry_points_merges_vulns_and_nvd_by_max_cvss():
@@ -3278,6 +3343,7 @@ def test_summarize_entry_points_skips_host_with_only_dos_cves():
 def test_summarize_entry_points_ranks_by_cvss_not_alphabetically():
     # Alphabetically CVE-2007-... sorts first; by severity it should sort last.
     h = Host("legacy.x.com", vulns=["CVE-2007-4723", "CVE-2024-9999"],
+             tech_confirmed=True,
              nvd_cves=[
                  {"id": "CVE-2007-4723", "cvss": 2.1, "desc": "Minor info leak"},
                  {"id": "CVE-2024-9999", "cvss": 9.8, "desc": "Unauthenticated RCE"},
@@ -3726,8 +3792,30 @@ def test_attack_surface_table_is_filterable():
     assert table.count("<th>") == table.count('class="filter-input"') == 8
     assert 'class="filtercount" data-for="t-attacksurface"' in content
     assert "resetFilters('t-attacksurface')" in content
-    # The negation hint is documented rather than left to be discovered.
-    assert "<code>!</code>" in content and "!403" in content
+    # The syntax is explained *above* the boxes it describes, not in a note
+    # under the table where nobody looks before typing.
+    assert content.index('class="filterhint"') < content.index('class="filter-input"')
+    for example in ("443,8443", "!403", "!403,404", "!—"):
+        assert example in content
+
+
+def test_filter_js_supports_multi_value_and_whole_number_matching():
+    """Behaviour is exercised in a browser; this guards the two pieces of logic
+    that make it work, since a silent regression here is invisible in Python.
+
+    Whole-number matching is not cosmetic: as a substring, `443` matches `8443`
+    and `200` matches `2000`, which makes Open Ports and HTTP — the columns
+    people actually filter — quietly wrong."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(_country_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    script = content.split("<script>")[1].split("</script>")[0]
+    assert "split(',')" in script                       # comma-separated OR
+    assert "term.parts.some(" in script                 # any part matches
+    assert "^[0-9]+$" in script and "[^0-9]" in script  # numeric boundary guard
+    # Negation still applies to the whole set, not just the first part.
+    assert "term.negate ? !hit : hit" in script
 
 
 def test_csv_export_js_skips_the_filter_row_and_hidden_rows():
