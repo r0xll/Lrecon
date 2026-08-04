@@ -46,24 +46,36 @@ async def enum_crtsh_best(client, domain: str, use_psql: bool = True) -> set:
 _CRTSH_RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
-def _crtsh_name_in_scope(name: str, domain: str) -> bool:
+def name_in_scope(name: str, domain: str) -> bool:
     """
     True only for the apex itself or a real subdomain of it.
 
     A bare `endswith(domain)` test is wrong at the label boundary: it accepts
     `testexample.com` for `example.com` (confirmed live — crt.sh's
-    `%.example.com` pattern does return names like `m.testexample.com`). Adding
-    an out-of-scope third party's host to an engagement's scope is an ROE
-    problem, not a cosmetic one, so the boundary is checked explicitly.
+    `%.example.com` pattern does return names like `m.testexample.com`, and OTX
+    and Anubis return third-party lookalikes too). Adding an out-of-scope third
+    party's host to an engagement's scope is an ROE problem, not a cosmetic one:
+    on a non-passive run that host gets resolved, probed and port-scanned.
+
+    Used by every passive source and again by passive_enum's own filter, so a
+    source added later cannot reintroduce the hole by reaching for `endswith`.
 
     Email addresses are also rejected: certificate subjects can carry an
     rfc822Name (e.g. `subjectname@example.com`), which is not a host to scan.
     The psql tier already excludes these server-side (`NOT ILIKE '%@%'`); this
-    keeps the HTTP tier consistent with it.
+    keeps every other tier consistent with it.
     """
     if not name or " " in name or "@" in name:
         return False
+    name = name.rstrip(".").lower()
+    domain = (domain or "").rstrip(".").lower()
+    if not domain:
+        return False
     return name == domain or name.endswith("." + domain)
+
+
+# Kept so the crt.sh-specific name still resolves for anything importing it.
+_crtsh_name_in_scope = name_in_scope
 
 
 def _parse_crtsh_rows(rows, domain: str) -> set:
@@ -160,7 +172,7 @@ async def enum_certspotter(client, domain: str) -> set:
             for cert in r.json():
                 for n in cert.get("dns_names", []):
                     n = n.strip().lstrip("*.").lower()
-                    if n.endswith(domain):
+                    if name_in_scope(n, domain):
                         out.add(n)
     except Exception as e:
         log(f"[!] certspotter {domain}: {e}")
@@ -228,7 +240,7 @@ async def enum_otx(client, domain: str, api_key: str | None = None) -> set:
         out = SourceSet()
         for rec in r.json().get("passive_dns", []):
             h = rec.get("hostname", "").strip().lower()
-            if h.endswith(domain):
+            if name_in_scope(h, domain):
                 out.add(h)
         return out
     except Exception as e:
@@ -253,7 +265,7 @@ async def enum_anubis(client, domain: str) -> set:
         out = SourceSet()
         for n in (r.json() or []):
             n = str(n).strip().lower().lstrip("*.")
-            if n.endswith(domain):
+            if name_in_scope(n, domain):
                 out.add(n)
         return out
     except Exception as e:
@@ -289,7 +301,7 @@ async def enum_wayback(client, domain: str, attempts: int = 4) -> set:
                 out = SourceSet()
                 for row in (r.json() or [])[1:]:
                     host = row[0].split("//")[-1].split("/")[0].split(":")[0].lower()
-                    if host.endswith(domain):
+                    if name_in_scope(host, domain):
                         out.add(host)
                 return out
             errors.append(f"HTTP {r.status_code}")
@@ -381,7 +393,7 @@ async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict
         if isinstance(res, set):
             if getattr(res, "failed", False):
                 failed.setdefault(src, res.detail or "source unavailable")
-            in_scope = {n for n in res if any(n.endswith(d) for d in domains)}
+            in_scope = {n for n in res if any(name_in_scope(n, d) for d in domains)}
             per_source[src] += len(in_scope)
             for n in in_scope:
                 host_sources[n].add(src)

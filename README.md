@@ -154,6 +154,8 @@ Both are optional. Precedence for each: **CLI flag > env var > config file**.
 | VirusTotal | `--vt` domain intelligence — historical IP/hosting resolutions, WHOIS mirror, reputation | `--vt-key` | `VT_API_KEY` | 500/day, 4 req/min |
 | AlienVault OTX | passive-DNS subdomain enum. Anonymous access is refused (429), so this source contributes nothing without a key | `--otx-key` | `OTX_API_KEY` | free |
 
+Every key is validated at startup against an endpoint that costs no quota — except **Brave**, which has no free account endpoint, so validating the key *is* spending a search. That check therefore runs only when `--dork` is requested; an ordinary scan never touches the Brave quota.
+
 ```fish
 # persistent (fish universal vars — visible inside the venv)
 set -Ux SHODAN_API_KEY "..."

@@ -271,6 +271,80 @@ async def test_enum_crtsh_retries_200_with_non_list_body(monkeypatch):
     assert client.calls == 2
 
 
+async def test_brave_key_is_not_validated_unless_dorking():
+    """Brave has no free account endpoint, so validating the key *is* spending a
+    search. Charging every ordinary scan one out of 2k/mo — for a key that run
+    was never going to use — eats the opt-in dorking budget."""
+    class _C:
+        def __init__(self):
+            self.calls = []
+
+        async def get(self, url, **kwargs):
+            self.calls.append(url)
+            return _FakeResp(200, {})
+
+    from lrecon import core
+    without = _C()
+    await core.verify_keys(without, {"brave": "k"}, dorking=False)
+    assert without.calls == []                     # no quota spent on an ordinary scan
+
+    with_dork = _C()
+    await core.verify_keys(with_dork, {"brave": "k"}, dorking=True)
+    assert any("search.brave.com" in u for u in with_dork.calls)
+
+
+async def test_bad_vt_and_otx_keys_are_nulled_out():
+    class _C:
+        async def get(self, url, **kwargs):
+            return _FakeResp(401, {})
+
+    from lrecon import core
+    keys = {"vt": "bad", "otx": "bad"}
+    await core.verify_keys(_C(), keys)
+    assert keys["vt"] is None and keys["otx"] is None
+
+
+async def test_every_passive_source_enforces_the_label_boundary():
+    """ROE, not cosmetics: an out-of-scope lookalike admitted here gets resolved,
+    probed and port-scanned on a non-passive run. Only crt.sh checked the
+    boundary; every other source used a bare endswith, and so did passive_enum's
+    own filter."""
+    lookalike, real = "m.testexample.com", "dev.example.com"
+
+    otx = await sources.enum_otx(_FakeEnumClient({"otx.alienvault.com": _FakeResp(
+        200, {"passive_dns": [{"hostname": real}, {"hostname": lookalike}]})}), "example.com")
+    assert otx == {real}
+
+    anubis = await sources.enum_anubis(_FakeEnumClient(
+        {"anubisdb.com": _FakeResp(200, [real, lookalike])}), "example.com")
+    assert anubis == {real}
+
+    wayback = await sources.enum_wayback(_FakeEnumClient({"web.archive.org": _FakeResp(
+        200, [["original"], [f"https://{real}/p"], [f"https://{lookalike}/p"]])}), "example.com")
+    assert wayback == {real}
+
+    certspotter = await sources.enum_certspotter(_FakeEnumClient(
+        {"certspotter.com": _FakeResp(200, [{"dns_names": [real, lookalike]}])}), "example.com")
+    assert certspotter == {real}
+
+
+async def test_passive_enum_filter_also_rejects_lookalikes(monkeypatch):
+    """The final filter is the backstop — a source added later must not be able
+    to reintroduce the hole by reaching for endswith."""
+    async def leaky(client, domain, api_key=None):
+        return {"m.testexample.com", "dev.example.com"}
+
+    monkeypatch.setattr(sources, "enum_otx", leaky)
+    for name in ("enum_certspotter", "enum_anubis", "enum_wayback"):
+        monkeypatch.setattr(sources, name, lambda c, d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_subfinder", lambda d: asyncio.sleep(0, result=set()))
+    monkeypatch.setattr(sources, "enum_crtsh_best",
+                        lambda c, d, use_psql=True: asyncio.sleep(0, result=set()))
+    host_sources, per_source, _failed = await sources.passive_enum(None, ["example.com"], {})
+    assert "m.testexample.com" not in host_sources
+    assert per_source["otx"] == 1
+
+
 def test_crtsh_name_in_scope_enforces_label_boundary():
     # A bare endswith() accepts testexample.com for example.com — confirmed
     # live that crt.sh's %.example.com pattern returns such names.

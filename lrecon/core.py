@@ -38,7 +38,7 @@ async def _gather_with_progress(coros, desc, use_progress):
     return await asyncio.gather(*coros)
 
 
-async def verify_keys(client, keys: dict) -> None:
+async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
     """
     On-boot API key verification — one cheap, non-quota-consuming call per
     configured key (account-info endpoints where available, not the actual
@@ -47,6 +47,9 @@ async def verify_keys(client, keys: dict) -> None:
     Nulls out rejected keys in keys (in place) so the rest of the pipeline
     automatically falls back to keyless/skips that service, same as the
     prior Shodan-only check this replaces.
+
+    `dorking` gates the one service with no free account endpoint (Brave), where
+    "verify the key" and "spend quota" are the same request — see below.
     """
     if keys.get("shodan"):
         try:
@@ -121,7 +124,12 @@ async def verify_keys(client, keys: dict) -> None:
         except Exception as e:
             log(f"[!] RocketReach API: check failed ({e}) — proceeding anyway")
 
-    if keys.get("brave"):
+    # Brave has no free account endpoint — the only way to validate a key is to
+    # spend a search from the monthly quota. So this runs *only* when dorking is
+    # actually requested: charging every ordinary scan one search out of 2k/mo,
+    # to validate a key that run was never going to use, would eat the opt-in
+    # dorking budget (and can 429 it) for no benefit.
+    if keys.get("brave") and dorking:
         try:
             r = await client.get("https://api.search.brave.com/res/v1/web/search",
                                 params={"q": "lrecon", "count": 1},
@@ -239,7 +247,7 @@ async def run(domains, args, keys) -> list:
               httpx.AsyncClient(limits=limits, headers=headers, verify=False,
                                 follow_redirects=False) as probe_client:
 
-        await verify_keys(client, keys)
+        await verify_keys(client, keys, dorking=bool(getattr(args, "dork", False)))
         shodan_key = keys.get("shodan")           # re-sync: verify_keys() may have nulled either
         ipinfo_token = keys.get("ipinfo")
 
