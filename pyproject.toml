@@ -8,6 +8,14 @@ dependencies = [
     "dnspython>=2.6",
     "rich>=13.0",
     "mmh3>=4.0",
+    # Live TLS certificate inspection. Was an extra, on the theory that the base
+    # install should stay minimal — but reading the cert a host actually serves
+    # is core to an attack-surface tool (SAN mining, Cloudflare origin
+    # confirmation, expired/self-signed flags), and shipping it off by default
+    # meant `pip install -e .` silently produced reports missing a whole
+    # section. It is a normal wheel with no build step on every supported
+    # platform, exactly like the four above.
+    "cryptography>=42",
 ]
 
 [project.scripts]
@@ -22,11 +30,11 @@ include = ["lrecon*"]
 
 [project.optional-dependencies]
 screenshots = ["playwright>=1.40"]
-# Live TLS certificate inspection (SAN mining, origin confirmation, expiry /
-# self-signed flags). Optional so the base install stays minimal — without it
-# the cert pass logs once and skips, like the other optional backends.
-tls = ["cryptography>=42"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=42"]
+# Kept as an empty extra so `pip install 'lrecon[tls]'` — in older docs, scripts
+# and shell history — still resolves instead of erroring on an unknown extra.
+# cryptography moved into the base dependencies; nothing to add here.
+tls = []
+dev = ["pytest>=8", "pytest-asyncio>=0.23"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

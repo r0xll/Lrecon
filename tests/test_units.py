@@ -2352,12 +2352,14 @@ async def test_mail_infra_lookup_keyless_still_enriches_asn_org(monkeypatch):
 from lrecon import tlsinfo
 
 # Gate only the tests that need a real certificate, and gate them on the flag
-# tlsinfo actually uses. A module-level importorskip would skip this whole file
-# when the optional [tls] extra is missing — silently taking every other test
-# with it — and `import cryptography` succeeding doesn't mean x509 loads: a
-# half-installed native extension raises from `from cryptography import x509`.
+# tlsinfo actually uses. cryptography is a required dependency now, so these
+# should always run — the gate stays because `import cryptography` succeeding
+# doesn't mean x509 loads: a half-installed native extension raises from
+# `from cryptography import x509`, and that shouldn't take the whole file down
+# with it (a module-level importorskip would silently skip every other test
+# here too).
 requires_crypto = pytest.mark.skipif(
-    not tlsinfo.HAVE_CRYPTO, reason="needs the optional [tls] extra")
+    not tlsinfo.HAVE_CRYPTO, reason="cryptography present but x509 failed to import")
 
 _CERT_KEY = None
 
