@@ -3528,6 +3528,83 @@ def test_write_html_minimal_data_does_not_crash_and_has_attack_surface():
         assert absent not in content
 
 
+def _country_hosts():
+    return [
+        Host("a.x.com", ips=["1.2.3.4"], ip_country={"1.2.3.4": "US"},
+             server="nginx", http_status=200, scheme="https", vulns=["CVE-2021-1234"]),
+        Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"],
+             ip_country={"9.9.9.9": "US", "8.8.8.8": "IE"}, http_status=200, scheme="https"),
+        Host("legacy.x.com", ips=["4.4.4.4"], country="FR", http_status=403, scheme="https"),
+        Host("unknown.x.com", ips=["7.7.7.7"], http_status=403, scheme="https"),
+    ]
+
+
+def test_host_countries_reports_every_region_not_just_the_first():
+    """Host.country is first-IP-wins, so a host balanced across regions looked
+    like a single-country asset — the wrong answer for the scoping and
+    data-residency questions this column gets read for."""
+    a, multi, legacy, unknown = _country_hosts()
+    assert report.host_countries(a) == "US"
+    assert report.host_countries(multi) == "IE, US"
+    # No per-IP data (enriched by a path that had none) — fall back, don't blank.
+    assert report.host_countries(legacy) == "FR"
+    assert report.host_countries(unknown) == "—"
+
+
+def test_attack_surface_has_a_country_column_in_both_writers():
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown(_country_hosts(), ["x.com"], {}, str(md))
+        report.write_html(_country_hosts(), ["x.com"], {}, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    assert "| Country |" in md_text and "<th>Country</th>" in html_text
+    for text in (md_text, html_text):
+        assert "IE, US" in text and "FR" in text
+
+
+def test_attack_surface_table_is_filterable():
+    """The filter row and its hook have to be present for the JS to bind to —
+    the behaviour itself is exercised in a real browser, not here."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(_country_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert 'id="t-attacksurface" data-filterable="1"' in content
+    # One input per column of *this* table — a mismatch silently shifts every
+    # filter onto the wrong column.
+    table = content.split('id="t-attacksurface"')[1].split("</table>")[0]
+    assert table.count("<th>") == table.count('class="filter-input"') == 8
+    assert 'class="filtercount" data-for="t-attacksurface"' in content
+    assert "resetFilters('t-attacksurface')" in content
+    # The negation hint is documented rather than left to be discovered.
+    assert "<code>!</code>" in content and "!403" in content
+
+
+def test_csv_export_js_skips_the_filter_row_and_hidden_rows():
+    """Regression for two concrete defects: the filter row exporting as a row of
+    empty strings, and a filtered export silently carrying rows the operator
+    cannot see."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(_country_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    assert "!row.classList.contains('filter-row')" in content
+    assert "row.style.display !== 'none'" in content
+
+
+def test_report_js_has_balanced_braces():
+    """The whole page is one f-string, so an unescaped brace in the added CSS or
+    JS silently corrupts the script block rather than raising."""
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html(_country_hosts(), ["x.com"], {}, str(path))
+        content = path.read_text()
+    script = content.split("<script>")[1].split("</script>")[0]
+    assert script.count("{") == script.count("}")
+    # A doubled brace surviving into the output means an f-string escape leaked.
+    assert "{{" not in script and "}}" not in script
+
+
 def test_write_html_escapes_attacker_controlled_strings():
     hosts = [Host("<script>alert(1)</script>.x.com", ips=["1.2.3.4"],
                   server="<img src=x onerror=alert(2)>",

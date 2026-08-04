@@ -340,7 +340,10 @@ class Host:
     asn: str | None = None
     ip_asn: dict = field(default_factory=dict)   # {ip: "ASxxxxx"} — asn above is last-IP-wins
     ip_org: dict = field(default_factory=dict)   # {ip: "Org Name"} — parallel to ip_asn
+    ip_country: dict = field(default_factory=dict)  # {ip: "US"} — parallel to ip_asn/ip_org
     rdns: str | None = None
+    # First IP wins, so a host whose addresses span regions shows only one of
+    # them. Kept for existing consumers; ip_country above is the honest view.
     country: str | None = None
     http_status: int | None = None
     http_title: str | None = None
