@@ -62,8 +62,20 @@ except Exception:
     TimeElapsedColumn = MofNCompleteColumn = None
 
 
+# What each line prefix means, and how it should read at a glance in a long run.
+# Only the prefix is tinted: colouring whole lines would fight the highlighter
+# that colours IPs, URLs and counts inside the message.
+LOG_PREFIX_STYLES = {
+    "[!]": "bold red",        # problem, failure, or a finding worth stopping at
+    "[+]": "bold green",      # success / something was found
+    "[i]": "dim",             # informational, safe to skim past
+    "[-]": "yellow",          # negative result worth noticing
+    "[*]": "bold cyan",       # in-progress / section marker
+}
+
+
 def log(msg: str) -> None:
-    """Print a log line verbatim, but still coloured.
+    """Print a log line verbatim, coloured by severity.
 
     `markup=False` is load-bearing, not a style choice: rich parses square
     brackets as markup tags and *deletes* the ones it recognises. Every `[i]`
@@ -75,14 +87,28 @@ def log(msg: str) -> None:
     Highlighting is deliberately left ON. It was switched off alongside markup,
     which was a mistake: the two are independent, and it is highlighting — not
     markup — that colours IPs, URLs, counts and quoted strings, i.e. the thing
-    that makes a finding stand out in a long run. Turning it off made the console
-    monochrome for no benefit. rich emits ANSI only when attached to a terminal,
-    so this behaves the same under fish/bash/zsh and stays clean when piped.
+    that makes a finding stand out in a long run.
+
+    On top of that, the prefix itself is styled by severity, so a red `[!]` is
+    findable while scrolling without reading the text. The prefix is written as
+    a separate styled span rather than via markup, precisely because markup is
+    off — and the message keeps going through the highlighter unchanged, so the
+    two colouring layers compose instead of competing.
+
+    rich emits ANSI only when attached to a terminal and honours NO_COLOR, so
+    this behaves the same under fish/bash/zsh and stays clean when piped.
     """
-    if _HAVE_RICH:
-        _console.print(msg, markup=False)
-    else:
+    if not _HAVE_RICH:
         print(msg, file=sys.stderr)
+        return
+    style = LOG_PREFIX_STYLES.get(msg[:3]) if len(msg) >= 3 else None
+    if style:
+        # end="" on the prefix so the two spans land on one line. The remainder
+        # is printed normally, which keeps the highlighter working on it.
+        _console.print(msg[:3], style=style, markup=False, highlight=False, end="")
+        _console.print(msg[3:], markup=False)
+    else:
+        _console.print(msg, markup=False)
 
 
 # names re-exported to sibling modules via `from .common import *`

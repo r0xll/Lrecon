@@ -286,13 +286,20 @@ Per run, `<out>.*`:
   | Type | Effect |
   |---|---|
   | `nginx` in **Tech** | keep only rows whose Tech contains `nginx` |
+  | `443,8080` in **Open Ports** | either one — comma-separated values are ORed |
   | `!403` in **HTTP** | *remove* the 403s — a leading `!` negates |
+  | `!403,404` in **HTTP** | remove both |
   | `!—` in **CVEs** | only hosts that have a CVE (empty cells render as `—`) |
 
-  Filters across columns are ANDed, matching is case-insensitive substring, and a
-  `showing N of M` counter sits above the table so a filtered view is never mistaken
-  for a short one. **Export CSV writes exactly the rows on screen** — filter, then
-  export, and the file matches what you were looking at.
+  Filters across columns are ANDed and matching is case-insensitive substring —
+  except for a purely numeric value, which matches a **whole number**, so `443`
+  finds port 443 without also matching 8443. The syntax is spelled out in a box
+  above the filter row, and a `showing N of M` counter sits beside it so a filtered
+  view is never mistaken for a short one. **Export CSV writes exactly the rows on
+  screen** — filter, then export, and the file matches what you were looking at.
+
+  The **TLS certificates** table has the same filter row; `!—` under Flags leaves
+  only the certificates with something wrong with them.
 - **`<out>.json`** — hosts plus every findings block (cf, email, github, buckets, breach, asn,
   favicon_pivots, diff, per_source, entry_points, whois, dorks, dns, mail_infra, vt, people,
   auth_surface).
@@ -355,6 +362,8 @@ of those is a fact about the target:
 
 A source that works for one domain in the scope is not reported as failed
 because it 403'd on another.
+
+**Persistent wayback 429s are usually your exit IP.** archive.org rate-limits shared and VPN ranges hard (TorGuard and similar), so a commercial VPN will 429 every attempt no matter how patiently lrecon backs off. Nothing to fix in the tool — run that source from a different egress if you need it.
 
 Note that lrecon deliberately does **not** send `exclude=expired`. It shrinks the
 result set (fewer planner timeouts) but measured against `example.com` it dropped
@@ -614,12 +623,26 @@ see [Optional backends](#optional-backends-projectdiscovery--psql)), lrecon
 cross-references each host's reported CPEs against what's actually being
 served right now and marks the CVE hit **tech-confirmed** (still corroborated)
 or **unconfirmed** (no live match — banner may be stale, or the software's
-been patched/replaced) in both the CVE hits table and the entry-points
-summary. Triage tech-confirmed hosts first to cut down manual validation
-work. Without the `httpx` binary installed, lrecon falls back to reading
-just the `Server`/`X-Powered-By` headers — no Wappalyzer fingerprinting — so
-confirmation stays unavailable (`None`, shown as `—`) until it's installed;
-run `lrecon --check-backends` to confirm it's on PATH.
+been patched/replaced). Without the `httpx` binary the built-in probe supplies
+`Server`/`X-Powered-By` instead — coarser than Wappalyzer fingerprinting, but
+enough to compare against, so confirmation still runs; `lrecon --check-backends`
+tells you whether `httpx` is on PATH.
+
+**Confirmation gates promotion to an entry point.** An entry point asserts
+something is worth working *now*, and that rests on the vulnerable software
+actually being there:
+
+| State | Meaning | Entry point |
+|---|---|---|
+| **confirmed** | the live probe corroborates the reported CPE | full CVSS-derived severity, up to `critical` |
+| **unconfirmed** | the probe looked and found no matching software | **none** — sending someone to exploit software that isn't running is worse than saying nothing |
+| **unverified** | nothing to compare (host never answered, or no CPEs reported) | kept, but capped at `high` |
+
+The distinction between the last two matters: "we looked and it's not there" is
+evidence, "we couldn't look" is not. An unverified host can still be hiding a
+real critical behind a non-web port, so it stays on the list — just not at the
+top of it. Nothing is ever dropped from the **CVE hits** table or the JSON;
+this only changes what gets promoted into the priority summary.
 
 **Non-web port highlighting.** The HTTP probe/tech-detect pipeline only ever
 touches general-purpose web/app-proxy ports (80, 443, 8080, 8443, etc.).
