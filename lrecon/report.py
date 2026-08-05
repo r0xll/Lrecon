@@ -877,8 +877,9 @@ def _html_filter_toolbar(table_id: str) -> str:
     """
     return (
         f'<div class="filterhint">'
-        f'<b>Filter:</b> type in a column box to narrow. '
-        f'<code>443,8443</code> matches either &middot; '
+        f'<b>Filter:</b> type in a column box to narrow — any cell containing '
+        f'what you type matches, so <code>20</code> finds 20, 2070 and 8020. '
+        f'<code>443,8080</code> matches either &middot; '
         f'<code>!403</code> excludes &middot; '
         f'<code>!403,404</code> excludes both &middot; '
         f'<code>—</code> is an empty cell, so <code>!—</code> means "has one". '
@@ -1697,14 +1698,12 @@ function _filterTerm(raw) {{
                .filter(function(p) {{ return p.length > 0; }});
   return parts.length ? {{negate: negate, parts: parts}} : null;
 }}
-// A purely numeric filter matches a whole number, not a digit substring:
-// otherwise 443 matches 8443 and 200 matches 2000, which makes the Open Ports
-// and HTTP columns — the ones people most want to filter — quietly wrong.
-// Text terms keep substring matching, so "ngin" still finds "nginx".
+// Plain substring, for every column including the numeric ones. Filtering here
+// is exploratory — you type a fragment and narrow as you go — so typing 20 has
+// to surface 20, 2070 and 8020 alike. Numbers were briefly matched as whole
+// values to stop 443 pulling in 8443, but that trades away the far more common
+// case: you rarely know the exact port up front, which is why you are filtering.
 function _matches(cell, part) {{
-  if (/^[0-9]+$/.test(part)) {{
-    return new RegExp('(^|[^0-9])' + part + '([^0-9]|$)').test(cell);
-  }}
   return cell.indexOf(part) !== -1;
 }}
 function applyFilters(table) {{

@@ -3795,17 +3795,20 @@ def test_attack_surface_table_is_filterable():
     # The syntax is explained *above* the boxes it describes, not in a note
     # under the table where nobody looks before typing.
     assert content.index('class="filterhint"') < content.index('class="filter-input"')
-    for example in ("443,8443", "!403", "!403,404", "!—"):
+    for example in ("443,8080", "!403", "!403,404", "!—"):
         assert example in content
+    # The hint has to say substring, or nobody will guess `20` finds 2070.
+    assert "2070" in content
 
 
-def test_filter_js_supports_multi_value_and_whole_number_matching():
-    """Behaviour is exercised in a browser; this guards the two pieces of logic
-    that make it work, since a silent regression here is invisible in Python.
+def test_filter_js_matches_on_substring_including_numbers():
+    """Behaviour is exercised in a browser; this guards the logic that makes it
+    work, since a silent regression here is invisible in Python.
 
-    Whole-number matching is not cosmetic: as a substring, `443` matches `8443`
-    and `200` matches `2000`, which makes Open Ports and HTTP — the columns
-    people actually filter — quietly wrong."""
+    Matching is plain substring in every column, numeric ones included: typing
+    `20` has to surface 20, 2070 and 8020. Numbers were briefly matched as whole
+    values to stop `443` pulling in `8443`, but filtering here is exploratory —
+    you rarely know the exact port up front, which is why you are filtering."""
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "r.html"
         report.write_html(_country_hosts(), ["x.com"], {}, str(path))
@@ -3813,7 +3816,8 @@ def test_filter_js_supports_multi_value_and_whole_number_matching():
     script = content.split("<script>")[1].split("</script>")[0]
     assert "split(',')" in script                       # comma-separated OR
     assert "term.parts.some(" in script                 # any part matches
-    assert "^[0-9]+$" in script and "[^0-9]" in script  # numeric boundary guard
+    assert "cell.indexOf(part) !== -1" in script        # plain substring
+    assert "^[0-9]+$" not in script                     # no whole-number special case
     # Negation still applies to the whole set, not just the first part.
     assert "term.negate ? !hit : hit" in script
 

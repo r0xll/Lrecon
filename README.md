@@ -286,17 +286,19 @@ Per run, `<out>.*`:
   | Type | Effect |
   |---|---|
   | `nginx` in **Tech** | keep only rows whose Tech contains `nginx` |
+  | `20` in **Open Ports** | anything containing 20 — port 20, 2070, 8020 |
   | `443,8080` in **Open Ports** | either one — comma-separated values are ORed |
   | `!403` in **HTTP** | *remove* the 403s — a leading `!` negates |
   | `!403,404` in **HTTP** | remove both |
   | `!—` in **CVEs** | only hosts that have a CVE (empty cells render as `—`) |
 
-  Filters across columns are ANDed and matching is case-insensitive substring —
-  except for a purely numeric value, which matches a **whole number**, so `443`
-  finds port 443 without also matching 8443. The syntax is spelled out in a box
-  above the filter row, and a `showing N of M` counter sits beside it so a filtered
-  view is never mistaken for a short one. **Export CSV writes exactly the rows on
-  screen** — filter, then export, and the file matches what you were looking at.
+  Matching is **case-insensitive substring in every column**, numbers included:
+  filtering is exploratory, and you rarely know the exact port up front — which
+  is why you are filtering. Columns combine with AND. The syntax is spelled out
+  in a box above the filter row, and a `showing N of M` counter sits beside it so
+  a filtered view is never mistaken for a short one. **Export CSV writes exactly
+  the rows on screen** — filter, then export, and the file matches what you were
+  looking at.
 
   The **TLS certificates** table has the same filter row; `!—` under Flags leaves
   only the certificates with something wrong with them.
