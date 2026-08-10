@@ -402,14 +402,7 @@ async def run(domains, args, keys) -> list:
             # port scan backend: naabu > pure-python tcp_scan
             naabu_ok = args.active_ports and not args.no_pd and backends.have("naabu")
 
-            # HTTP probe backend: PD httpx (batch, tech fingerprint) > per-host probe
-            httpx_data = None
-            if not args.no_pd:
-                httpx_data = await backends.httpx_probe([h.subdomain for h in active_hosts])
-            if httpx_data is not None:
-                log(f"[+] HTTP probe via httpx backend ({len(httpx_data)} responded)")
-
-            async def do_active(h):
+            async def _do_active(h, httpx_data):
                 if args.active_ports:
                     if naabu_ok:
                         np = await backends.naabu_scan(h.ips[0], args.ports)
@@ -438,8 +431,24 @@ async def run(domains, args, keys) -> list:
                     if h.http_status and h.scheme and h.favicon_hash is None:
                         h.favicon_hash = await favicon_hash(probe_client, f"{h.scheme}://{h.subdomain}")
                 return h
-            await _gather_with_progress((do_active(h) for h in active_hosts),
-                                        "probing", use_prog)
+
+            # One probe pass over an arbitrary host list — the seed set now, the
+            # favicon-expansion set later — so both share exactly the same
+            # probe/port-scan/favicon path rather than a second copy of it. The
+            # httpx batch (tech fingerprint) is per-list, since the expansion
+            # hosts aren't known when the seed set is probed.
+            async def probe_hosts(host_list, desc="probing"):
+                if not host_list:
+                    return
+                httpx_data = None
+                if not args.no_pd:
+                    httpx_data = await backends.httpx_probe([h.subdomain for h in host_list])
+                    if httpx_data is not None:
+                        log(f"[+] HTTP probe via httpx backend ({len(httpx_data)} responded)")
+                await _gather_with_progress((_do_active(h, httpx_data) for h in host_list),
+                                            desc, use_prog)
+
+            await probe_hosts(active_hosts)
 
             # ---- GitHub Pages: is the lead actually claimable? ----
             # *.github.io is wildcarded, so a dead Pages target never NXDOMAINs
@@ -543,15 +552,51 @@ async def run(domains, args, keys) -> list:
                         f"so whether the domain is CDN-fronted is unknown (not a clean result)")
 
         # ---- Favicon pivot (shodan) — find shadow assets sharing favicon ----
+        # A custom favicon is a company fingerprint: hosts serving it are very
+        # likely the same org's, even when their names look nothing like the
+        # seed domains. That is the whole point, and also why a match on an
+        # unrelated domain is only *evidence* of ownership, never proof — so
+        # cross-domain hosts are reported with that evidence but not probed
+        # unless the operator opts in with --favicon-expand (see below).
         favicon_pivots = {}
         if shodan_key and not args.passive_only:
             if not cf_nets:
                 cf_nets = await load_cf_ranges(client)
             hashes = {h.favicon_hash for h in hosts.values() if h.favicon_hash}
+            expand_hosts = {}
             for fh in hashes:
-                extra = await shodan_favicon_pivot(client, fh, shodan_key, cf_nets)
-                if extra:
-                    favicon_pivots[fh] = sorted(set(extra))
+                res_fp = await shodan_favicon_pivot(client, fh, shodan_key, cf_nets,
+                                                    limiter=shodan_limiter)
+                if res_fp.get("skipped"):
+                    favicon_pivots[fh] = {"skipped": res_fp["skipped"]}
+                    log(f"[i] favicon {fh}: {res_fp['skipped']:,} matches — too common to "
+                        f"be a company marker, skipped")
+                    continue
+                matches = res_fp.get("matches") or []
+                if not matches:
+                    continue
+                matches, expand = classify_favicon_matches(matches, domains, name_in_scope)
+                expand_hosts.update({n: ip for n, ip in expand.items() if n not in expand_hosts})
+                favicon_pivots[fh] = {"matches": matches}
+
+            # --favicon-expand: pull the cross-domain matches into the active
+            # pipeline. Off by default and loud when on, because a shared icon is
+            # weak ownership evidence and this actively touches hosts outside the
+            # seed domains — confirm they are in the SOW.
+            new_favicon_hosts = [
+                Host(subdomain=n, ips=[ip], source={"favicon"})
+                for n, ip in sorted(expand_hosts.items()) if n not in hosts]
+            if getattr(args, "favicon_expand", False) and new_favicon_hosts and not args.passive_only:
+                log(f"[!] --favicon-expand: probing {len(new_favicon_hosts)} host(s) matched "
+                    f"only by favicon — outside the seed domains; confirm they are in your SOW")
+                for h in new_favicon_hosts:
+                    hosts[h.subdomain] = h
+                    h.source.add("favicon-expand")
+                await probe_hosts(new_favicon_hosts, desc="probing favicon matches")
+            elif new_favicon_hosts:
+                log(f"[i] favicon pivot: {len(new_favicon_hosts)} cross-domain host(s) found "
+                    f"— reported with evidence but not probed (pass --favicon-expand to probe, "
+                    f"after confirming SOW)")
 
         # ---- rDNS wire-back: add in-scope PTR names as hosts ----
         for h in list(hosts.values()):

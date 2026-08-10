@@ -116,7 +116,7 @@ __all__ = [
     "log", "Host", "Person", "RateLimiter", "load_keys",
     "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "WEB_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
     "SELF_SERVE", "ACCOUNT_BOUND", "NOT_CLAIMABLE", "TAKEOVER_ERROR_STATUSES",
-    "non_web_ports", "human_bytes",
+    "non_web_ports", "human_bytes", "in_cf",
     "_HAVE_DNS", "_HAVE_RICH", "_console",
     "Progress", "SpinnerColumn", "BarColumn", "TextColumn",
     "TimeElapsedColumn", "MofNCompleteColumn",
@@ -141,6 +141,17 @@ TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 389, 443, 445,
 # Shodan/InternetDB/naabu outside it) is a non-HTTP service the probe never
 # looks at, so it needs a human to go check it by hand.
 WEB_PORTS = {80, 443, 8000, 8008, 8080, 8081, 8443, 8888, 9000, 9443}
+
+
+def in_cf(ip: str, nets) -> bool:
+    """True if `ip` falls in any of `nets` (Cloudflare ranges as ip_network
+    objects). Lives here rather than in intel.py because enrich.py needs it and
+    can't import from intel (intel imports enrich)."""
+    try:
+        a = ipaddress.ip_address(ip)
+        return any(a in n for n in nets)
+    except Exception:
+        return False
 
 
 def human_bytes(n) -> str:

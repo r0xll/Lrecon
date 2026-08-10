@@ -85,7 +85,7 @@ renaming. Override with `LRECON_HTTPX=/path/to/httpx` if yours lives elsewhere.
 | 4. Active | HTTP probe, favicon hash, takeover checks, optional TCP scan | yes |
 | CF origin | Cloudflare detection + origin-IP candidates (+ optional confirm) | confirm step only |
 | Expansion | ASN->netblock (RIPEstat) + reverse-DNS sweep, rDNS wire-back | DNS only |
-| Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot | none / provider |
+| Intel | email posture (SPF/DKIM/DMARC), GitHub dorking, cloud buckets, breach, favicon pivot (Shodan) | none / provider |
 | DNS records | apex A/AAAA/MX/NS/SOA snapshot + mail infrastructure ID (provider/ASN/org per MX host) | DNS only |
 | WHOIS/RDAP | domain registration data: registrar, created/expires, nameservers, status; falls back to classic WHOIS (port 43), then to `--vt`'s cached WHOIS text, for TLDs/environments where RDAP has nothing (always on) | none (third-party registry) |
 | Auth surface | passive OIDC/SSO discovery — reads each live host's `/.well-known/openid-configuration` and fingerprints the identity provider (Okta, Entra/Azure AD, Auth0, Ping, ADFS, Google, Keycloak). Discovery only: no login/credential probing (not run under `--passive-only`) | yes (one GET/host) |
@@ -617,6 +617,31 @@ or a third party's. A confirmed origin is an **origin IP disclosure / WAF-bypass
 finding; the report includes a baseline CVSS vector and remediation (restrict
 origin firewall to Cloudflare ranges / Authenticated Origin Pulls / cloudflared
 tunnel).
+
+**Favicon pivot (Shodan).** A custom favicon is a company fingerprint — hosts
+serving the same icon are very likely the same org's, *even when their names look
+nothing like the seed domains*, which is exactly the shadow estate ordinary
+subdomain enum misses. lrecon hashes each live host's favicon (mmh3, the format
+Shodan indexes) and searches `http.favicon.hash:` for others. Each match is
+reported with the evidence needed to judge ownership — IP, hostnames, org, cert
+CN, page title — and tagged **in-scope**, **cross-domain**, or **ip-only**;
+Cloudflare hosts are flagged, not dropped, since an origin answering on a shared
+icon is worth seeing. The table filters like the attack surface.
+
+Two guards matter here:
+
+- **Noise.** A stock favicon (default nginx, WordPress, a JS framework) matches
+  tens of thousands of unrelated hosts. Shodan reports the total up front, so a
+  hash exceeding **500 matches** is skipped with a line saying so — a skipped
+  framework default never reads as "no shadow assets".
+- **Scope.** A shared icon is *evidence* of common ownership, never proof, and
+  cross-domain matches are outside the seed domains — i.e. outside the SOW until
+  you confirm otherwise. lrecon reports them either way but **never probes** them
+  unless you pass `--favicon-expand`, which pulls the cross-domain matches into
+  the active phase and logs a one-line ROE warning naming the count. The
+  boundary check is the same label-anchored one every enum source uses, so a
+  lookalike like `notacme.com` is never mistaken for in-scope. `--passive-only`
+  never probes regardless of the flag.
 
 **Tech-stack confirmation for CVE hits.** Shodan/InternetDB CVE data comes
 from a periodic internet-wide scan that can be weeks old. Where a live

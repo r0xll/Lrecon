@@ -162,19 +162,90 @@ async def favicon_hash(client, base_url: str):
     return None
 
 
-async def shodan_favicon_pivot(client, fhash: int, key: str, cf_nets) -> list:
+# A favicon shared by more hosts than this is a framework/CDN default (stock
+# nginx, WordPress, a JS framework), not a company marker — pivoting on it drags
+# in tens of thousands of unrelated hosts. Shodan returns the total up front, so
+# we can decide to skip before paging a single result.
+FAVICON_MAX_MATCHES = 500
+
+
+def classify_favicon_matches(matches: list, domains, name_in_scope) -> tuple:
+    """Tag each match with a scope and pick the expansion candidates.
+
+    Scope is `in-scope` (a hostname is under a seed domain), `cross-domain` (has
+    hostnames, none in scope), or `ip-only` (no hostname to reason about).
+    Returns `(tagged_matches, {hostname: ip})` — the second is the cross-domain
+    hosts, and *only* those: an in-scope name is already enumerated, and a bare
+    IP is nothing to probe by hostname.
+
+    Kept as a pure function precisely because it is the ROE-relevant decision —
+    which hosts become probe candidates — so it can be tested without standing
+    up the whole pipeline. `name_in_scope` is injected to avoid an import cycle.
+    """
+    expand = {}
+    for m in matches:
+        names = m.get("hostnames") or []
+        if any(name_in_scope(n, d) for n in names for d in domains):
+            m["scope"] = "in-scope"
+        elif names:
+            m["scope"] = "cross-domain"
+            for n in names:
+                expand.setdefault(n, m["ip"])
+        else:
+            m["scope"] = "ip-only"
+    return matches, expand
+
+
+async def shodan_favicon_pivot(client, fhash: int, key: str, cf_nets,
+                               limiter=None) -> dict:
+    """Hosts across the internet serving a given favicon — the point being to
+    find a company's assets whose names don't resemble the seed domains.
+
+    Returns one of:
+      * ``{"skipped": total}`` — too common to be a marker (see FAVICON_MAX_MATCHES).
+      * ``{"matches": [...]}``  — each a dict of the evidence needed to judge
+        ownership: ip, hostnames, org, cert CN, title, port, and whether it sits
+        behind Cloudflare. The old version returned bare IPs and dropped all of
+        this, which is exactly what a favicon pivot exists to surface.
+      * ``{}`` — no key, error, or genuinely nothing.
+
+    Cloudflare hosts are flagged rather than dropped: an origin answering on a
+    shared favicon behind CF is worth *seeing*, same reasoning as the VT
+    hosting-history origin candidates.
+    """
     if not key:
-        return []
+        return {}
+    if limiter is not None:
+        await limiter.wait()
     try:
         r = await client.get("https://api.shodan.io/shodan/host/search",
                             params={"key": key, "query": f"http.favicon.hash:{fhash}"},
                             timeout=25)
-        if r.status_code == 200:
-            return [m.get("ip_str") for m in r.json().get("matches", [])
-                    if m.get("ip_str") and not in_cf(m["ip_str"], cf_nets)]
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        total = data.get("total") or 0
+        if total > FAVICON_MAX_MATCHES:
+            return {"skipped": total}
+        out = []
+        for m in data.get("matches", []):
+            ip = m.get("ip_str")
+            if not ip:
+                continue
+            ssl = m.get("ssl") or {}
+            cert_cn = (((ssl.get("cert") or {}).get("subject") or {}).get("CN"))
+            out.append({
+                "ip": ip,
+                "port": m.get("port"),
+                "hostnames": sorted(m.get("hostnames") or []),
+                "org": m.get("org"),
+                "cert_cn": cert_cn,
+                "title": (m.get("http") or {}).get("title") or m.get("title"),
+                "in_cf": in_cf(ip, cf_nets),
+            })
+        return {"matches": out}
     except Exception:
-        pass
-    return []
+        return {}
 
 
 
