@@ -793,10 +793,28 @@ def write_markdown(hosts, domains, res, path) -> None:
     fp = res.get("favicon_pivots") or {}
     if fp:
         lines += ["## Favicon pivots (shadow assets sharing favicon)", ""]
-        for fh, ips in fp.items():
-            lines.append(f"- hash `{fh}` -> {', '.join(ips[:20])}")
-        lines += ["", "> IPs serving the same favicon outside the known surface are "
-                  "candidate shadow/origin hosts — validate ownership before reporting.", ""]
+        for fh, entry in fp.items():
+            if entry.get("skipped"):
+                lines.append(f"- hash `{fh}` — **{entry['skipped']:,} matches**, too common "
+                             f"to be a company marker (likely a framework/CDN default); skipped")
+                continue
+            matches = entry.get("matches") or []
+            lines.append(f"- hash `{fh}` — {len(matches)} host(s):")
+            lines.append("")
+            lines.append("| IP | Hostnames | Org | Cert CN | Title | Scope |")
+            lines.append("|---|---|---|---|---|---|")
+            for m in matches[:50]:
+                names = ", ".join(m.get("hostnames") or []) or "—"
+                scope = m.get("scope", "?") + (" · behind CF" if m.get("in_cf") else "")
+                lines.append(f"| `{m['ip']}`"
+                             + (f":{m['port']}" if m.get("port") else "")
+                             + f" | {names} | {m.get('org') or '—'} | {m.get('cert_cn') or '—'} "
+                             f"| {(m.get('title') or '—')[:60]} | {scope} |")
+            lines.append("")
+        lines += ["> A shared custom favicon is strong evidence of common ownership, but only "
+                  "evidence — validate before reporting, and confirm SOW coverage before "
+                  "touching any **cross-domain** host. Run with `--favicon-expand` to probe "
+                  "those actively.", ""]
 
     nuclei = res.get("nuclei") or []
     if nuclei:
@@ -1462,9 +1480,40 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- Favicon pivots ----
     if fp:
-        rows = "".join(f'<li>hash <code>{esc(fh)}</code> -&gt; {esc(", ".join(ips[:20]))}</li>'
-                       for fh, ips in fp.items())
-        body = f'<ul>{rows}</ul><p class="note">Validate ownership before reporting as shadow assets.</p>'
+        fav_cols = ["Hash", "IP", "Hostnames", "Org", "Cert CN", "Title", "Scope"]
+        rows = []
+        skipped_lines = []
+        for fh, entry in fp.items():
+            if entry.get("skipped"):
+                skipped_lines.append(
+                    f'<li>hash <code>{esc(fh)}</code> — <strong>{entry["skipped"]:,} '
+                    f'matches</strong>, too common to be a company marker; skipped</li>')
+                continue
+            for m in (entry.get("matches") or [])[:50]:
+                names = ", ".join(m.get("hostnames") or []) or "—"
+                scope = esc(m.get("scope", "?"))
+                if m.get("in_cf"):
+                    scope += ' <span class="note">· behind CF</span>'
+                cls = "bad" if m.get("scope") == "cross-domain" else ""
+                ipport = esc(m["ip"]) + (f":{esc(m['port'])}" if m.get("port") else "")
+                rows.append(
+                    f'<tr><td><code>{esc(fh)}</code></td><td><code>{ipport}</code></td>'
+                    f'<td>{esc(names)}</td><td>{esc(m.get("org"))}</td>'
+                    f'<td>{esc(m.get("cert_cn"))}</td><td>{esc((m.get("title") or "")[:60])}</td>'
+                    f'<td class="{cls}">{scope}</td></tr>')
+        body = ""
+        if skipped_lines:
+            body += f'<ul>{"".join(skipped_lines)}</ul>'
+        if rows:
+            body += (f'{_html_export_button("t-favicon", "favicon_pivots.csv")}'
+                     f'{_html_filter_toolbar("t-favicon")}'
+                     f'<div style="overflow-x:auto">'
+                     f'<table id="t-favicon" data-filterable="1">'
+                     f'<tr>{"".join(f"<th>{c}</th>" for c in fav_cols)}</tr>'
+                     f'{_html_filter_row(fav_cols)}{"".join(rows)}</table></div>')
+        body += ('<p class="note">A shared custom favicon is strong evidence of common '
+                 'ownership, but only evidence — validate before reporting, and confirm SOW '
+                 'coverage before touching any cross-domain host.</p>')
         sections.append(_html_section("favicon", "Favicon pivots", len(fp), body))
 
     # ---- nuclei findings ----

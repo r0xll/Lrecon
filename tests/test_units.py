@@ -4471,6 +4471,114 @@ def test_people_report_separates_individuals_from_shared_mailboxes():
     assert md_text.index("bob@x.com") < md_text.index("info@x.com")
 
 
+class _FaviconClient:
+    """Serves one canned Shodan search response, recording the query it saw."""
+    def __init__(self, payload, status=200):
+        self.payload, self.status, self.calls = payload, status, []
+
+    async def get(self, url, **kwargs):
+        self.calls.append(kwargs.get("params", {}))
+        return _FakeResp(self.status, self.payload)
+
+
+async def test_favicon_pivot_returns_evidence_not_bare_ips():
+    """The point of a favicon pivot is the evidence a match belongs to the
+    target — org, hostnames, cert CN, title. The old version kept only the IP
+    and dropped all of it."""
+    payload = {"total": 2, "matches": [
+        {"ip_str": "203.0.113.9", "port": 443, "hostnames": ["vpn.acme.io"],
+         "org": "Acme Inc", "ssl": {"cert": {"subject": {"CN": "*.acme.io"}}},
+         "http": {"title": "Acme VPN"}},
+        {"ip_str": "198.51.100.7", "hostnames": [], "org": "Acme Inc"},
+    ]}
+    c = _FaviconClient(payload)
+    out = await enrich.shodan_favicon_pivot(c, 12345, "key", [])
+    ms = out["matches"]
+    assert ms[0] == {"ip": "203.0.113.9", "port": 443, "hostnames": ["vpn.acme.io"],
+                     "org": "Acme Inc", "cert_cn": "*.acme.io", "title": "Acme VPN",
+                     "in_cf": False}
+    assert ms[1]["hostnames"] == [] and ms[1]["cert_cn"] is None
+    assert c.calls[0]["query"] == "http.favicon.hash:12345"
+
+
+async def test_favicon_pivot_skips_a_too_common_hash_before_paging():
+    """A framework-default favicon matches tens of thousands of unrelated hosts.
+    Shodan reports the total up front, so the skip costs exactly one query."""
+    c = _FaviconClient({"total": 8123, "matches": [{"ip_str": "1.2.3.4"}]})
+    out = await enrich.shodan_favicon_pivot(c, 1, "key", [])
+    assert out == {"skipped": 8123}
+    assert len(c.calls) == 1                         # did not page results
+
+
+async def test_favicon_pivot_flags_cloudflare_rather_than_dropping():
+    """An origin answering on a shared favicon behind CF is worth seeing. The old
+    version dropped CF hosts entirely — and, because in_cf was never imported
+    into enrich, actually raised NameError on every call and returned nothing."""
+    from lrecon.common import CF_FALLBACK
+    nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]   # as the real caller passes them
+    payload = {"total": 1, "matches": [{"ip_str": "104.16.0.1", "hostnames": ["x.acme.io"]}]}
+    out = await enrich.shodan_favicon_pivot(_FaviconClient(payload), 1, "key", nets)
+    assert out["matches"][0]["in_cf"] is True
+
+
+async def test_favicon_pivot_uses_the_rate_limiter():
+    class _L:
+        def __init__(self): self.n = 0
+        async def wait(self): self.n += 1
+    lim = _L()
+    await enrich.shodan_favicon_pivot(_FaviconClient({"total": 0, "matches": []}),
+                                      1, "key", [], limiter=lim)
+    assert lim.n == 1
+
+
+async def test_favicon_pivot_no_key_is_a_noop():
+    c = _FaviconClient({"total": 1, "matches": [{"ip_str": "1.2.3.4"}]})
+    assert await enrich.shodan_favicon_pivot(c, 1, "", []) == {}
+    assert c.calls == []                             # no key, no request
+
+
+def test_favicon_scope_classification_and_expansion_candidates():
+    """The ROE-relevant decision: which favicon matches become probe candidates.
+    Only cross-domain hosts with a name — an in-scope name is already enumerated,
+    a bare IP is nothing to probe by hostname."""
+    from lrecon.sources import name_in_scope
+    matches = [
+        {"ip": "1.1.1.1", "hostnames": ["vpn.acme.com"]},          # in-scope
+        {"ip": "2.2.2.2", "hostnames": ["shadow.acme-cdn.net"]},   # cross-domain
+        {"ip": "3.3.3.3", "hostnames": []},                        # ip-only
+        {"ip": "4.4.4.4", "hostnames": ["notacme.com"]},           # cross (boundary!)
+    ]
+    tagged, expand = enrich.classify_favicon_matches(matches, ["acme.com"], name_in_scope)
+    by_ip = {m["ip"]: m["scope"] for m in tagged}
+    assert by_ip == {"1.1.1.1": "in-scope", "2.2.2.2": "cross-domain",
+                     "3.3.3.3": "ip-only", "4.4.4.4": "cross-domain"}
+    # notacme.com is NOT treated as in-scope for acme.com — same label boundary
+    # as every enum source (the P1 fix from #42).
+    assert expand == {"shadow.acme-cdn.net": "2.2.2.2", "notacme.com": "4.4.4.4"}
+    assert "vpn.acme.com" not in expand           # in-scope, not an expansion host
+
+
+def test_favicon_report_renders_evidence_and_skip_lines():
+    res = {"favicon_pivots": {
+        111: {"matches": [
+            {"ip": "203.0.113.9", "port": 443, "hostnames": ["shadow.other.net"],
+             "org": "Acme Inc", "cert_cn": "*.other.net", "title": "Acme portal",
+             "in_cf": False, "scope": "cross-domain"}]},
+        222: {"skipped": 9001},
+    }}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("x.com")], ["x.com"], res, str(md))
+        report.write_html([Host("x.com")], ["x.com"], res, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    for text in (md_text, html_text):
+        assert "shadow.other.net" in text and "Acme Inc" in text     # evidence
+        assert "cross-domain" in text
+        assert "9,001" in text and "too common" in text              # skip line
+    # The pivot table filters like the others.
+    assert 'id="t-favicon" data-filterable="1"' in html_text
+
+
 async def test_vt_ip_history_is_enriched_and_flags_origin_candidates():
     """A list of past IPs and dates says a domain moved, not what it moved
     between — and an old non-Cloudflare address is the red-team payload."""

@@ -99,6 +99,11 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--asn-expand", action="store_true",
                     help="expand scope via ASN->netblocks + reverse-DNS sweep (aggressive)")
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
+    ap.add_argument("--favicon-expand", action="store_true",
+                    help="actively probe hosts on OTHER domains that share a target favicon "
+                         "(needs Shodan; ROE-gated — a shared icon is weak ownership evidence, "
+                         "so confirm the matches are in your SOW). Off by default: matches are "
+                         "reported with evidence either way, this only controls probing them")
     ap.add_argument("--buckets", action="store_true", help="cloud bucket permutation enum")
     ap.add_argument("--bucket-keywords", help="extra comma-separated bucket keywords")
     ap.add_argument("--dork", action="store_true",

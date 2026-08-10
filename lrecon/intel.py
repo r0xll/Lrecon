@@ -27,12 +27,9 @@ async def load_cf_ranges(client) -> list:
     return nets
 
 
-def in_cf(ip: str, nets) -> bool:
-    try:
-        a = ipaddress.ip_address(ip)
-        return any(a in n for n in nets)
-    except Exception:
-        return False
+# in_cf moved to common.py so enrich.py can use it too (enrich can't import from
+# intel — intel already imports enrich). Re-exported here for existing callers.
+from .common import in_cf
 
 
 async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys, cf_nets,
