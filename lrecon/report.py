@@ -230,7 +230,7 @@ def _target_status(h) -> str:
     return "unresolved"
 
 
-def write_csv(hosts, path, resolved: bool = True) -> int:
+def write_csv(hosts, path) -> int:
     """Flat target list for client scope confirmation — one row per
     (subdomain, IP) pair (a multi-IP host repeats the subdomain, one row per
     IP, each with its own org, so every IP's org is directly visible).
@@ -240,11 +240,16 @@ def write_csv(hosts, path, resolved: bool = True) -> int:
 
       * **wildcard-suspect hosts** — DNS-wildcard enum artefacts, never real
         targets (the HTTP live list already drops these; this used not to).
-      * **hosts that were resolved and came back dead** — a name lrecon found
-        in an old CT log that no longer resolves is noise on a scope sheet.
-        Guarded by `resolved`: under `--passive-only` no resolution ran, so a
-        missing IP means "unchecked", not "dead", and the host is kept with
-        status `unresolved` rather than silently dropped.
+      * **hosts that definitively do not exist** — `h.nxdomain`, i.e. the
+        resolver returned NXDOMAIN. A name lrecon found in an old CT log that no
+        longer resolves is noise on a scope sheet.
+
+    The exclusion is keyed on a *confirmed* NXDOMAIN, not on an empty IP list: a
+    timeout or SERVFAIL also leaves a host with no IPs but is inconclusive, and
+    dropping it would silently pull a possibly-live target off the client's
+    authorised scope — the one error worse than leaving a dead name in. Such a
+    host stays with status `unresolved`. (`--passive-only` never resolves, so no
+    host is ever nxdomain there and the full discovered list is kept.)
 
     Dead names are not lost — they remain in the report and JSON; they're just
     not promoted onto the approval sheet. A `status` column (live / resolves /
@@ -257,10 +262,8 @@ def write_csv(hosts, path, resolved: bool = True) -> int:
         w.writerow(["subdomain", "ip", "org", "status"])
         n = 0
         for h in hosts:
-            if h.wildcard:
+            if h.wildcard or h.nxdomain:
                 continue
-            if resolved and not h.ips:
-                continue                       # checked and dead — off the scope sheet
             status = _target_status(h)
             if not h.ips:
                 w.writerow([h.subdomain, "", "", status])

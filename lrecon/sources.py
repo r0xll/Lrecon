@@ -3,7 +3,7 @@ import asyncio, ipaddress, random, shutil, string
 from .common import *
 from . import backends
 try:
-    import dns.asyncresolver, dns.rdatatype
+    import dns.asyncresolver, dns.rdatatype, dns.resolver
 except Exception:
     pass
 
@@ -424,25 +424,41 @@ def get_resolver(nameservers):
 
 
 async def resolve_full(subdomain: str, nameservers) -> tuple:
+    """Resolve a name to `(ips, cname, nxdomain)`.
+
+    `nxdomain` is True only when the name *definitively does not exist* — the
+    resolver returned NXDOMAIN, not a timeout or SERVFAIL. That distinction is
+    load-bearing for the scope sheet: an empty IP list from a transient DNS
+    failure must not be mistaken for a dead host and dropped, the same
+    "inconclusive is not negative" rule applied to SPF/MTA-STS/source failures
+    elsewhere. NoAnswer (the name exists but has no A/AAAA — e.g. MX-only) is
+    also *not* nxdomain: the host is real, just not web-facing.
+    """
     if not _HAVE_DNS:
-        return [], None
+        return [], None, False
     res = get_resolver(nameservers)
 
     async def q(rtype):
         try:
-            return rtype, await res.resolve(subdomain, rtype)
-        except Exception:
-            return rtype, None
+            return rtype, await res.resolve(subdomain, rtype), None
+        except Exception as e:
+            return rtype, None, e
 
     ips, cname = [], None
-    for rtype, ans in await asyncio.gather(q("A"), q("AAAA"), q("CNAME")):
+    results = await asyncio.gather(q("A"), q("AAAA"), q("CNAME"))
+    for rtype, ans, _err in results:
         if ans is None:
             continue
         if rtype == "CNAME":
             cname = str(ans[0].target).rstrip(".").lower()
         else:
             ips.extend(str(r) for r in ans)
-    return ips, cname
+    # Confirmed-dead only if nothing resolved AND a query actually said
+    # NXDOMAIN. NXDOMAIN is a property of the name, so any of the three queries
+    # raising it settles the name's non-existence.
+    nxdomain = (not ips and not cname
+                and any(isinstance(err, dns.resolver.NXDOMAIN) for _, _, err in results))
+    return ips, cname, nxdomain
 
 
 def _closest_zone_from_nxdomain(exc) -> str | None:
