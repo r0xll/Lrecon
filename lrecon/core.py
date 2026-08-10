@@ -339,7 +339,7 @@ async def run(domains, args, keys) -> list:
                         _mark_wildcard(h)
             else:
                 async def do_resolve(h):
-                    h.ips, h.cname = await resolve_full(h.subdomain, ns)
+                    h.ips, h.cname, h.nxdomain = await resolve_full(h.subdomain, ns)
                     _mark_wildcard(h)
                     return h
                 await _gather_with_progress((do_resolve(h) for h in hosts.values()),
@@ -603,7 +603,7 @@ async def run(domains, args, keys) -> list:
             if h.rdns and any(h.rdns.endswith(d) for d in domains) and h.rdns not in hosts:
                 nh = Host(subdomain=h.rdns, source={"rdns"})
                 if not args.passive_only:
-                    nh.ips, nh.cname = await resolve_full(h.rdns, ns)
+                    nh.ips, nh.cname, nh.nxdomain = await resolve_full(h.rdns, ns)
                 hosts[h.rdns] = nh
 
         # ---- TLS SAN wire-back: add in-scope names found on live certs ----
@@ -618,7 +618,7 @@ async def run(domains, args, keys) -> list:
                     continue
                 nh = Host(subdomain=name, source={"tls-san"})
                 if not args.passive_only:
-                    nh.ips, nh.cname = await resolve_full(name, ns)
+                    nh.ips, nh.cname, nh.nxdomain = await resolve_full(name, ns)
                 hosts[name] = nh
                 san_added += 1
         if san_added:

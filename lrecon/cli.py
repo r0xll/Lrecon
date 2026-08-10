@@ -302,7 +302,17 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     write_markdown(hosts, args.domains, res, md_path)
     write_html(hosts, args.domains, res, html_path)
     n_live = write_live_hosts(hosts, live_path)
-    write_csv(hosts, csv_path)
+    n_targets = write_csv(hosts, csv_path)
+    # Say what was left off the scope sheet, so a shorter list never reads as
+    # "nothing found" — same reasoning as the passive-source failure lines. Only
+    # confirmed-NXDOMAIN hosts are excluded as dead; a timeout/SERVFAIL host
+    # stays on the sheet as `unresolved` rather than being wrongly dropped.
+    n_dead = sum(1 for h in hosts if h.nxdomain and not h.wildcard)
+    n_wild = sum(1 for h in hosts if h.wildcard)
+    if n_dead or n_wild:
+        log(f"[i] scope sheet ({csv_path.split('/')[-1]}): excluded "
+            f"{n_dead} non-existent (NXDOMAIN) and {n_wild} wildcard host(s) — they "
+            f"remain in the full report/JSON, just not on the approval list")
 
     outputs = [json_path, md_path, html_path, live_path, csv_path]
     people = res.get("people") or []

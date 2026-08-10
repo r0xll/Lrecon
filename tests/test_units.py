@@ -3640,7 +3640,7 @@ def test_write_csv_one_row_per_subdomain_ip_pair():
         # resolved to an org — the other row's org stays blank rather
         # than falling back to a scalar that may belong to a different
         # IP on the same host.
-        Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"},
+        Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], source={"seed"},
              ip_asn={"8.8.8.8": "AS15169"}, ip_org={"8.8.8.8": "Google LLC"}),
     ]
     with tempfile.TemporaryDirectory() as d:
@@ -3648,10 +3648,14 @@ def test_write_csv_one_row_per_subdomain_ip_pair():
         n = report.write_csv(hosts, str(path))
         rows = list(csv.DictReader(path.open()))
     assert n == 3                                  # 1 + 2 IP rows
-    assert list(rows[0].keys()) == ["subdomain", "ip", "org"]
-    assert rows[0] == {"subdomain": "a.x.com", "ip": "1.2.3.4", "org": "Google LLC"}
-    assert rows[1] == {"subdomain": "multi.x.com", "ip": "9.9.9.9", "org": ""}
-    assert rows[2] == {"subdomain": "multi.x.com", "ip": "8.8.8.8", "org": "Google LLC"}
+    assert list(rows[0].keys()) == ["subdomain", "ip", "org", "status"]
+    assert rows[0] == {"subdomain": "a.x.com", "ip": "1.2.3.4", "org": "Google LLC",
+                       "status": "live"}
+    # resolves but no HTTP — still a valid target, flagged not dropped.
+    assert rows[1] == {"subdomain": "multi.x.com", "ip": "9.9.9.9", "org": "",
+                       "status": "resolves"}
+    assert rows[2] == {"subdomain": "multi.x.com", "ip": "8.8.8.8", "org": "Google LLC",
+                       "status": "resolves"}
 
 
 def test_write_csv_single_ip_host_falls_back_to_scalar_org():
@@ -3665,14 +3669,67 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_org():
     assert rows[0]["org"] == "Google LLC"
 
 
-def test_write_csv_host_with_no_resolved_ips_still_gets_a_row():
-    h = Host("unresolved.x.com", ips=[])
+async def test_resolve_full_flags_nxdomain_but_not_transient_failure(monkeypatch):
+    """The scope-sheet drop hinges on this: an empty IP list from NXDOMAIN means
+    dead, but an empty list from a timeout/SERVFAIL is inconclusive and must not
+    read as dead."""
+    import dns.resolver
+
+    class _R:
+        async def resolve(self, name, rtype):
+            if name == "gone.test":
+                raise dns.resolver.NXDOMAIN
+            if name == "slow.test":
+                raise dns.exception.Timeout          # not NXDOMAIN
+            if name == "mail.test":
+                raise dns.resolver.NoAnswer          # exists, no A/AAAA
+            raise Exception("x")
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    monkeypatch.setattr(sources, "_HAVE_DNS", True)
+
+    assert (await sources.resolve_full("gone.test", None))[2] is True    # confirmed dead
+    assert (await sources.resolve_full("slow.test", None))[2] is False   # inconclusive
+    assert (await sources.resolve_full("mail.test", None))[2] is False   # exists, MX-only
+
+
+def test_write_csv_drops_only_confirmed_dead_and_wildcards():
+    """The client approves this list before testing, so names that don't exist
+    (NXDOMAIN) and DNS-wildcard noise are excluded — but a host that merely has
+    no IP is NOT assumed dead: a timeout/SERVFAIL leaves no IP too, and dropping
+    a possibly-live target off the authorised scope is the worse error."""
+    hosts = [
+        Host("live.x.com", ips=["1.2.3.4"], http_status=200),
+        Host("gone.x.com", ips=[], nxdomain=True),           # confirmed non-existent
+        Host("timeout.x.com", ips=[]),                       # inconclusive — no IP, NOT nxdomain
+        Host("mailonly.x.com", ips=[]),                      # exists (MX-only), just no A record
+        Host("wild.x.com", ips=["9.9.9.9"], wildcard=True),  # enum artefact
+    ]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
-        n = report.write_csv([h], str(path))
+        n = report.write_csv(hosts, str(path))
         rows = list(csv.DictReader(path.open()))
-    assert n == 1
-    assert rows[0] == {"subdomain": "unresolved.x.com", "ip": "", "org": ""}
+    kept = [r["subdomain"] for r in rows]
+    assert kept == ["live.x.com", "timeout.x.com", "mailonly.x.com"]   # gone + wild dropped
+    assert n == 3
+    # The inconclusive ones stay, honestly labelled rather than silently gone.
+    assert {r["subdomain"]: r["status"] for r in rows}["timeout.x.com"] == "unresolved"
+
+
+def test_write_csv_passive_only_keeps_the_full_discovered_list():
+    """--passive-only never resolves, so no host is nxdomain and nothing is
+    dropped for non-existence — the discovered-name list is the whole point."""
+    hosts = [Host("a.x.com", ips=[]), Host("b.x.com", ips=[])]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "targets.csv"
+        n = report.write_csv(hosts, str(path))
+        rows = list(csv.DictReader(path.open()))
+    assert n == 2
+    assert all(r["status"] == "unresolved" and r["ip"] == "" for r in rows)
+    # ...but a wildcard is still noise.
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "t.csv"
+        report.write_csv([Host("w.x.com", wildcard=True)], str(path))
+        assert list(csv.DictReader(path.open())) == []
 
 
 # --------------------------------------------------------------------------- #

@@ -415,6 +415,12 @@ class Host:
     # that cannot be registered.
     stale_dns: str | None = None
     wildcard: bool = False
+    # Set only when resolution definitively returned NXDOMAIN — the name does not
+    # exist. Deliberately distinct from "no IPs": a timeout or SERVFAIL also
+    # yields no IPs but is inconclusive, and must not be treated as dead (e.g. on
+    # the client scope sheet). Never set on the dnsx path, which can't tell an
+    # absent host from a non-existent one.
+    nxdomain: bool = False
     enrich_src: set = field(default_factory=set)
     source: set = field(default_factory=set)
 
