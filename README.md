@@ -310,8 +310,16 @@ Per run, `<out>.*`:
   one per line, if any were found — direct handoff to `nmap -iL` / `nuclei -l` to scan what
   Cloudflare was masking. Not written if no candidates were found.
 - **`<out>.targets.csv`** — flat target list for client scope confirmation: one
-  row per subdomain/IP pair (a multi-IP host repeats across several rows, one
-  IP per row), each with its own org — no comma-joined multi-value cells.
+  row per subdomain/IP pair (a multi-IP host repeats across several rows, one IP
+  per row), each with its own org and a **`status`** column — `live` (answered
+  the HTTP probe), `resolves` (has an IP but no web service — SSH/VPN/mail/API,
+  still a real target), or `unresolved` (`--passive-only`, resolution not
+  attempted). Because a client approves this list before testing, **hosts that
+  were resolved and came back dead (NXDOMAIN) are excluded**, as are
+  DNS-wildcard enum artefacts — you're not asking anyone to sign off on names
+  that no longer exist. Dead names still appear in the full report and JSON;
+  the run logs how many were held back. Under `--passive-only` nothing is
+  dropped for non-resolution, since nothing was resolved to judge.
 - **`<out>.users.csv`** — enumerated company emails, if any hunter/rocketreach/github
   key is configured (see [People OSINT](#people-osint-user-enumeration)).
 - **`<out>.dossier.json` / `<out>.dossier.md`** — the structured target dossier, with the

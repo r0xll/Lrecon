@@ -3640,7 +3640,7 @@ def test_write_csv_one_row_per_subdomain_ip_pair():
         # resolved to an org — the other row's org stays blank rather
         # than falling back to a scalar that may belong to a different
         # IP on the same host.
-        Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], wildcard=True, source={"seed"},
+        Host("multi.x.com", ips=["9.9.9.9", "8.8.8.8"], source={"seed"},
              ip_asn={"8.8.8.8": "AS15169"}, ip_org={"8.8.8.8": "Google LLC"}),
     ]
     with tempfile.TemporaryDirectory() as d:
@@ -3648,10 +3648,14 @@ def test_write_csv_one_row_per_subdomain_ip_pair():
         n = report.write_csv(hosts, str(path))
         rows = list(csv.DictReader(path.open()))
     assert n == 3                                  # 1 + 2 IP rows
-    assert list(rows[0].keys()) == ["subdomain", "ip", "org"]
-    assert rows[0] == {"subdomain": "a.x.com", "ip": "1.2.3.4", "org": "Google LLC"}
-    assert rows[1] == {"subdomain": "multi.x.com", "ip": "9.9.9.9", "org": ""}
-    assert rows[2] == {"subdomain": "multi.x.com", "ip": "8.8.8.8", "org": "Google LLC"}
+    assert list(rows[0].keys()) == ["subdomain", "ip", "org", "status"]
+    assert rows[0] == {"subdomain": "a.x.com", "ip": "1.2.3.4", "org": "Google LLC",
+                       "status": "live"}
+    # resolves but no HTTP — still a valid target, flagged not dropped.
+    assert rows[1] == {"subdomain": "multi.x.com", "ip": "9.9.9.9", "org": "",
+                       "status": "resolves"}
+    assert rows[2] == {"subdomain": "multi.x.com", "ip": "8.8.8.8", "org": "Google LLC",
+                       "status": "resolves"}
 
 
 def test_write_csv_single_ip_host_falls_back_to_scalar_org():
@@ -3665,14 +3669,37 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_org():
     assert rows[0]["org"] == "Google LLC"
 
 
-def test_write_csv_host_with_no_resolved_ips_still_gets_a_row():
-    h = Host("unresolved.x.com", ips=[])
+def test_write_csv_drops_dead_and_wildcard_hosts_from_the_scope_sheet():
+    """The client approves this list before testing — it must not contain names
+    that no longer exist or DNS-wildcard enum noise."""
+    hosts = [
+        Host("live.x.com", ips=["1.2.3.4"], http_status=200),
+        Host("dead.x.com", ips=[]),                          # resolved -> NXDOMAIN
+        Host("wild.x.com", ips=["9.9.9.9"], wildcard=True),  # enum artefact
+    ]
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "targets.csv"
-        n = report.write_csv([h], str(path))
+        n = report.write_csv(hosts, str(path), resolved=True)
         rows = list(csv.DictReader(path.open()))
     assert n == 1
-    assert rows[0] == {"subdomain": "unresolved.x.com", "ip": "", "org": ""}
+    assert [r["subdomain"] for r in rows] == ["live.x.com"]
+
+
+def test_write_csv_passive_only_keeps_unresolved_hosts():
+    """Under --passive-only no resolution ran, so a missing IP means 'unchecked',
+    not 'dead' — dropping them would empty the file the run exists to produce."""
+    hosts = [Host("a.x.com", ips=[]), Host("b.x.com", ips=[])]
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "targets.csv"
+        n = report.write_csv(hosts, str(path), resolved=False)
+        rows = list(csv.DictReader(path.open()))
+    assert n == 2
+    assert all(r["status"] == "unresolved" and r["ip"] == "" for r in rows)
+    # ...but a wildcard is still noise even when unresolved.
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "t.csv"
+        report.write_csv([Host("w.x.com", wildcard=True)], str(path), resolved=False)
+        assert list(csv.DictReader(path.open())) == []
 
 
 # --------------------------------------------------------------------------- #

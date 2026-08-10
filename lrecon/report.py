@@ -214,34 +214,62 @@ def _spf_lookups(sp: dict) -> tuple[str, str, str]:
 
 
 
-def write_csv(hosts, path) -> int:
+def _target_status(h) -> str:
+    """Liveness of a host for the scope sheet.
+
+    `live`    — answered the HTTP probe.
+    `resolves`— has an IP but no HTTP response. Still a real target: SSH, VPN,
+                mail and APIs all resolve without serving a web page, so this is
+                deliberately not treated as dead.
+    `unresolved` — no IP because resolution wasn't attempted (`--passive-only`).
     """
-    Flat target list for client scope confirmation — one row per
-    (subdomain, IP) pair, not one row per host: a host with multiple IPs
-    gets multiple rows (the subdomain repeats), each with its own org
-    column rather than cramming everything into one comma-joined cell, so
-    every IP's org is directly visible without cross-referencing. This is
-    "here's what we found in your scope, please confirm ownership," not a
-    vuln report. A host with no resolved IPs still gets one row (ip/org
-    blank) so it isn't silently dropped from the list. Falls back to the
-    scalar h.org only for single-IP hosts, where there's no ambiguity
-    about which IP they belong to — for a multi-IP host, an IP missing from
-    ip_org is left blank rather than guessing from the scalar, which may
-    have been last-set by a different one of the host's IPs.
+    if h.http_status:
+        return "live"
+    if h.ips:
+        return "resolves"
+    return "unresolved"
+
+
+def write_csv(hosts, path, resolved: bool = True) -> int:
+    """Flat target list for client scope confirmation — one row per
+    (subdomain, IP) pair (a multi-IP host repeats the subdomain, one row per
+    IP, each with its own org, so every IP's org is directly visible).
+
+    This is the sheet a client approves before testing starts, so it must not
+    ask them to sign off on things that don't exist. Two exclusions:
+
+      * **wildcard-suspect hosts** — DNS-wildcard enum artefacts, never real
+        targets (the HTTP live list already drops these; this used not to).
+      * **hosts that were resolved and came back dead** — a name lrecon found
+        in an old CT log that no longer resolves is noise on a scope sheet.
+        Guarded by `resolved`: under `--passive-only` no resolution ran, so a
+        missing IP means "unchecked", not "dead", and the host is kept with
+        status `unresolved` rather than silently dropped.
+
+    Dead names are not lost — they remain in the report and JSON; they're just
+    not promoted onto the approval sheet. A `status` column (live / resolves /
+    unresolved) tells the client which rows have a live web service. Falls back
+    to the scalar `h.org` only for single-IP hosts, where there's no ambiguity
+    about which IP an org belongs to.
     """
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["subdomain", "ip", "org"])
+        w.writerow(["subdomain", "ip", "org", "status"])
         n = 0
         for h in hosts:
+            if h.wildcard:
+                continue
+            if resolved and not h.ips:
+                continue                       # checked and dead — off the scope sheet
+            status = _target_status(h)
             if not h.ips:
-                w.writerow([h.subdomain, "", ""])
+                w.writerow([h.subdomain, "", "", status])
                 n += 1
                 continue
             single = len(h.ips) == 1
             for ip in h.ips:
                 org = h.ip_org.get(ip) or (h.org if single else "") or ""
-                w.writerow([h.subdomain, ip, org])
+                w.writerow([h.subdomain, ip, org, status])
                 n += 1
     return n
 

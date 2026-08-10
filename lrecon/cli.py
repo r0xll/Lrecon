@@ -302,7 +302,16 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     write_markdown(hosts, args.domains, res, md_path)
     write_html(hosts, args.domains, res, html_path)
     n_live = write_live_hosts(hosts, live_path)
-    write_csv(hosts, csv_path)
+    n_targets = write_csv(hosts, csv_path, resolved=not args.passive_only)
+    # Say what was left off the scope sheet, so a shorter list never reads as
+    # "nothing found" — same reasoning as the passive-source failure lines.
+    if not args.passive_only:
+        n_dead = sum(1 for h in hosts if not h.wildcard and not h.ips)
+        n_wild = sum(1 for h in hosts if h.wildcard)
+        if n_dead or n_wild:
+            log(f"[i] scope sheet ({csv_path.split('/')[-1]}): excluded "
+                f"{n_dead} non-resolving and {n_wild} wildcard host(s) — they remain in "
+                f"the full report/JSON, just not on the approval list")
 
     outputs = [json_path, md_path, html_path, live_path, csv_path]
     people = res.get("people") or []
