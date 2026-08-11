@@ -10,12 +10,23 @@ from .common import *
 STATE_DIR = Path.home() / ".local" / "share" / "lrecon"
 
 
-def _state_key(domains) -> str:
-    return "_".join(sorted(domains)).replace("/", "_")[:120]
+def _state_key(domains, ip_targets=None) -> str:
+    key = "_".join(sorted(domains))
+    if ip_targets:
+        # Fold the IP/CIDR scope into the key so IP-only runs don't all share one
+        # empty-domain snapshot, and two runs on the same domain with different
+        # IP scopes don't overwrite each other. Hashed rather than joined so a
+        # large CIDR expansion stays a fixed-width, collision-safe suffix instead
+        # of a truncated IP list. Domain-only runs keep their original key
+        # byte-for-byte, so existing snapshots stay continuous.
+        import hashlib
+        digest = hashlib.sha1("_".join(sorted(ip_targets)).encode()).hexdigest()[:12]
+        key = f"{key}_ip-{digest}" if key else f"ip-{digest}"
+    return key.replace("/", "_")[:120]
 
 
-def load_prev_snapshot(domains) -> dict:
-    p = STATE_DIR / f"{_state_key(domains)}.snapshot.json"
+def load_prev_snapshot(domains, ip_targets=None) -> dict:
+    p = STATE_DIR / f"{_state_key(domains, ip_targets)}.snapshot.json"
     if p.exists():
         try:
             return json.loads(p.read_text())
@@ -24,11 +35,11 @@ def load_prev_snapshot(domains) -> dict:
     return {}
 
 
-def save_snapshot(domains, hosts) -> None:
+def save_snapshot(domains, hosts, ip_targets=None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     snap = {"ts": datetime.now(timezone.utc).isoformat(),
             "hosts": {h.subdomain: {"ips": h.ips, "ports": h.ports} for h in hosts}}
-    (STATE_DIR / f"{_state_key(domains)}.snapshot.json").write_text(json.dumps(snap))
+    (STATE_DIR / f"{_state_key(domains, ip_targets)}.snapshot.json").write_text(json.dumps(snap))
 
 
 def diff_snapshot(prev: dict, hosts) -> dict:

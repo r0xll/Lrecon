@@ -211,6 +211,14 @@ lrecon client.com client.net --resolvers 1.1.1.1,9.9.9.9 -o client
 # any positional domains, deduped)
 lrecon -iL client_domains.txt -o client
 
+# IPs and CIDRs are accepted too — mixed with domains or on their own, in the
+# file or positionally. An IP/CIDR skips subdomain enumeration and DNS
+# resolution and goes straight to enrichment (ports/CVE, ASN/org, rDNS) and
+# the HTTP/port probe. A CIDR expands to its host addresses (capped by
+# --ip-cap, default 1024).
+lrecon 203.0.113.9 203.0.113.0/24 -o client_ips
+lrecon client.com 203.0.113.0/28 -iL client_targets.txt -o client
+
 # everything OSINT/informational — buckets, dorking, VirusTotal, NVD CVEs,
 # ASN expansion — each still skips on its own if its key/binary isn't
 # configured. --active-ports/--verify-emails/--nuclei stay opt-in even
@@ -234,7 +242,8 @@ nuclei -l client.origin_ips.txt -o client_origin_nuclei.txt
 
 | Flag | Effect |
 |---|---|
-| `-iL, --domains-file` | read domains from a file, one per line, merged with positional domains |
+| `-iL, --domains-file` | read targets (domains, IPs, CIDRs) from a file, one per line, merged with positional targets |
+| `--ip-cap N` | max host addresses to expand from a single CIDR target (default 1024) |
 | `--passive-only` | OSINT sources + host lookup only; no resolution/HTTP/portscan |
 | `--all` | turn on every OSINT/informational check that's otherwise opt-in only due to quota/speed/binary availability — `--buckets --dork --vt --nvd --asn-expand`. Does **not** enable `--active-ports`/`--verify-emails`/`--nuclei` (those send live traffic at the target and stay explicit — see below) |
 | `--active-ports` | async TCP connect scan of common ports (aggressive; ROE-gated) |

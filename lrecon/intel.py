@@ -118,7 +118,11 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
     # Cloudflare", which a shared host or a default vhost can do by accident.
     # A cert match also settles it without sending a request beyond the
     # handshake, so the confirmed case touches the target less than before.
-    if active and cands:
+    # `domains` gates this: the cert-scope match and the spoofed `Host: primary`
+    # header both need a domain to be meaningful, and `domains[0]` would raise on
+    # a domainless (IP-only) scope. The caller already skips CF-origin for such
+    # scopes; this keeps the function safe if some other caller does not.
+    if active and cands and domains:
         primary = domains[0]
         for ip in list(cands):
             cert = await fetch_cert(ip)
