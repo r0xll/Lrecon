@@ -88,7 +88,7 @@ async def cloudflare_origin_analysis(client, probe_client, domains, hosts, keys,
             try:
                 for rr in await res.resolve(d, "MX"):
                     mx = str(rr.exchange).rstrip(".")
-                    mxips, _ = await resolve_full(mx, resolver_ns)
+                    mxips, _cname, _nx = await resolve_full(mx, resolver_ns)
                     for ip in mxips:
                         if not in_cf(ip, cf_nets):
                             cands[ip]["sources"].add(f"mx:{mx}")

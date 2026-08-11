@@ -3669,6 +3669,40 @@ def test_write_csv_single_ip_host_falls_back_to_scalar_org():
     assert rows[0]["org"] == "Google LLC"
 
 
+def test_every_resolve_full_caller_unpacks_three_values():
+    """resolve_full() returns (ips, cname, nxdomain). This shipped a crash once
+    already — the #46 signature change updated 3 of 5 callers, and the other two
+    (`detect_wildcard`, the email MX path) raised ValueError on the first real
+    run. A source-level check catches every caller at once, including any added
+    later, which is the property that failed."""
+    import re as _re
+    root = Path(__file__).resolve().parent.parent / "lrecon"
+    offenders = []
+    for pyf in root.glob("*.py"):
+        for i, line in enumerate(pyf.read_text().splitlines(), 1):
+            if "await resolve_full(" not in line or line.lstrip().startswith("#"):
+                continue
+            # The assignment target, left of '='. Must unpack exactly three names.
+            lhs = line.split("=")[0]
+            if lhs.count(",") != 2:
+                offenders.append(f"{pyf.name}:{i}: {line.strip()}")
+    assert offenders == [], "resolve_full callers not unpacking 3 values:\n" + "\n".join(offenders)
+
+
+async def test_detect_wildcard_unpacks_resolve_full(monkeypatch):
+    """Directly exercises the caller that crashed the user's run: it must unpack
+    resolve_full's real 3-tuple, not raise ValueError."""
+    class _R:
+        async def resolve(self, name, rtype):
+            if rtype == "A":
+                return ["1.2.3.4"]
+            raise Exception("no answer")
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    monkeypatch.setattr(sources, "_HAVE_DNS", True)
+    out = await sources.detect_wildcard("x.com", None)
+    assert out == {"1.2.3.4"}                         # ran to completion, no ValueError
+
+
 async def test_resolve_full_flags_nxdomain_but_not_transient_failure(monkeypatch):
     """The scope-sheet drop hinges on this: an empty IP list from NXDOMAIN means
     dead, but an empty list from a timeout/SERVFAIL is inconclusive and must not
