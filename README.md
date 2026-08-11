@@ -629,12 +629,22 @@ tunnel).
 **Favicon pivot (Shodan).** A custom favicon is a company fingerprint — hosts
 serving the same icon are very likely the same org's, *even when their names look
 nothing like the seed domains*, which is exactly the shadow estate ordinary
-subdomain enum misses. lrecon hashes each live host's favicon (mmh3, the format
-Shodan indexes) and searches `http.favicon.hash:` for others. Each match is
-reported with the evidence needed to judge ownership — IP, hostnames, org, cert
-CN, page title — and tagged **in-scope**, **cross-domain**, or **ip-only**;
-Cloudflare hosts are flagged, not dropped, since an origin answering on a shared
-icon is worth seeing. The table filters like the attack surface.
+subdomain enum misses. lrecon hashes the favicon (mmh3, the format Shodan
+indexes) and searches `http.favicon.hash:` for others. Each match is reported
+with the evidence needed to judge ownership — IP, hostnames, org, cert CN, page
+title — and tagged **in-scope**, **cross-domain**, or **ip-only**; Cloudflare
+hosts are flagged, not dropped, since an origin answering on a shared icon is
+worth seeing. The report shows the **searched icon itself** in an Icon column
+(inline, titled with the seed host it came from) so you can confirm at a glance
+it's the org's logo and not a framework default. The table filters like the
+attack surface.
+
+**It pivots only on the seed domains' favicons** (and their `www`), never on
+enumerated subdomains. A subdomain running GitLab, cPanel or Google Workspace
+serves *that vendor's* stock icon, and pivoting on it would flood the results
+with every unrelated host running the same software — the icon is a company
+fingerprint only when it's the company's, served by a domain you named. `www` is
+included because it's the same canonical site, not a vendor subdomain.
 
 Two guards matter here:
 

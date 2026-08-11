@@ -558,17 +558,30 @@ async def run(domains, args, keys) -> list:
         # unrelated domain is only *evidence* of ownership, never proof — so
         # cross-domain hosts are reported with that evidence but not probed
         # unless the operator opts in with --favicon-expand (see below).
+        #
+        # Seed the pivot ONLY from the seed domains (and their www), never from
+        # enumerated subdomains: a subdomain running GitLab, cPanel or Google
+        # Workspace serves that vendor's stock favicon, and pivoting on it drags
+        # in every unrelated host running the same software. A favicon is a
+        # company fingerprint only when it is the company's — i.e. served by the
+        # domains the operator actually named.
         favicon_pivots = {}
         if shodan_key and not args.passive_only:
             if not cf_nets:
                 cf_nets = await load_cf_ranges(client)
-            hashes = {h.favicon_hash for h in hosts.values() if h.favicon_hash}
+            fav_sources = seed_favicon_sources(hosts.values(), domains)
+            # The searched icon itself, so a report reader can confirm each hash
+            # is the org's logo. One fetch per hash (a handful), backend-agnostic.
+            fav_images = {}
+            for fh, srcs in fav_sources.items():
+                fav_images[fh] = await favicon_data_uri(probe_client, f"https://{sorted(srcs)[0]}")
             expand_hosts = {}
-            for fh in hashes:
+            for fh in fav_sources:
+                meta = {"sources": sorted(fav_sources[fh]), "image": fav_images.get(fh)}
                 res_fp = await shodan_favicon_pivot(client, fh, shodan_key, cf_nets,
                                                     limiter=shodan_limiter)
                 if res_fp.get("skipped"):
-                    favicon_pivots[fh] = {"skipped": res_fp["skipped"]}
+                    favicon_pivots[fh] = {"skipped": res_fp["skipped"], **meta}
                     log(f"[i] favicon {fh}: {res_fp['skipped']:,} matches — too common to "
                         f"be a company marker, skipped")
                     continue
@@ -577,7 +590,7 @@ async def run(domains, args, keys) -> list:
                     continue
                 matches, expand = classify_favicon_matches(matches, domains, name_in_scope)
                 expand_hosts.update({n: ip for n, ip in expand.items() if n not in expand_hosts})
-                favicon_pivots[fh] = {"matches": matches}
+                favicon_pivots[fh] = {"matches": matches, **meta}
 
             # --favicon-expand: pull the cross-domain matches into the active
             # pipeline. Off by default and loud when on, because a shared icon is

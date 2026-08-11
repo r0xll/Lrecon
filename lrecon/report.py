@@ -825,12 +825,16 @@ def write_markdown(hosts, domains, res, path) -> None:
     if fp:
         lines += ["## Favicon pivots (shadow assets sharing favicon)", ""]
         for fh, entry in fp.items():
+            src = ", ".join(entry.get("sources") or []) or "seed domain"
+            icon = (f'<img src="{entry["image"]}" width="20" alt="favicon"> '
+                    if entry.get("image") else "")
             if entry.get("skipped"):
-                lines.append(f"- hash `{fh}` — **{entry['skipped']:,} matches**, too common "
-                             f"to be a company marker (likely a framework/CDN default); skipped")
+                lines.append(f"- {icon}hash `{fh}` (served by {src}) — **{entry['skipped']:,} "
+                             f"matches**, too common to be a company marker (likely a "
+                             f"framework/CDN default); skipped")
                 continue
             matches = entry.get("matches") or []
-            lines.append(f"- hash `{fh}` — {len(matches)} host(s):")
+            lines.append(f"- {icon}hash `{fh}` (served by {src}) — {len(matches)} host(s):")
             lines.append("")
             lines.append("| IP | Hostnames | Org | Cert CN | Title | Scope |")
             lines.append("|---|---|---|---|---|---|")
@@ -1511,14 +1515,27 @@ def write_html(hosts, domains, res, path) -> None:
 
     # ---- Favicon pivots ----
     if fp:
-        fav_cols = ["Hash", "IP", "Hostnames", "Org", "Cert CN", "Title", "Scope"]
+        fav_cols = ["Icon", "Hash", "IP", "Hostnames", "Org", "Cert CN", "Title", "Scope"]
+
+        def _icon_cell(entry):
+            img, src = entry.get("image"), ", ".join(entry.get("sources") or [])
+            if not img:
+                return "—"
+            # title names the seed host the icon was served by, so the operator
+            # can confirm it's the org's own logo.
+            return (f'<img src="{esc(img)}" width="24" height="24" alt="favicon" '
+                    f'title="served by {esc(src)}" style="vertical-align:middle">')
+
         rows = []
         skipped_lines = []
         for fh, entry in fp.items():
+            icon = _icon_cell(entry)
+            src = ", ".join(entry.get("sources") or []) or "seed domain"
             if entry.get("skipped"):
                 skipped_lines.append(
-                    f'<li>hash <code>{esc(fh)}</code> — <strong>{entry["skipped"]:,} '
-                    f'matches</strong>, too common to be a company marker; skipped</li>')
+                    f'<li>{icon} hash <code>{esc(fh)}</code> (served by {esc(src)}) — '
+                    f'<strong>{entry["skipped"]:,} matches</strong>, too common to be a '
+                    f'company marker; skipped</li>')
                 continue
             for m in (entry.get("matches") or [])[:50]:
                 names = ", ".join(m.get("hostnames") or []) or "—"
@@ -1528,7 +1545,8 @@ def write_html(hosts, domains, res, path) -> None:
                 cls = "bad" if m.get("scope") == "cross-domain" else ""
                 ipport = esc(m["ip"]) + (f":{esc(m['port'])}" if m.get("port") else "")
                 rows.append(
-                    f'<tr><td><code>{esc(fh)}</code></td><td><code>{ipport}</code></td>'
+                    f'<tr><td>{icon}</td><td><code>{esc(fh)}</code></td>'
+                    f'<td><code>{ipport}</code></td>'
                     f'<td>{esc(names)}</td><td>{esc(m.get("org"))}</td>'
                     f'<td>{esc(m.get("cert_cn"))}</td><td>{esc((m.get("title") or "")[:60])}</td>'
                     f'<td class="{cls}">{scope}</td></tr>')
