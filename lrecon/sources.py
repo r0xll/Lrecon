@@ -537,7 +537,7 @@ async def detect_wildcard(domain: str, nameservers) -> set:
     if not _HAVE_DNS:
         return set()
     rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
-    ips, _ = await resolve_full(f"{rand}.{domain}", nameservers)
+    ips, _cname, _nx = await resolve_full(f"{rand}.{domain}", nameservers)
     if ips:
         log(f"[!] wildcard DNS on {domain} -> {', '.join(ips)} (filtering phantoms)")
     return set(ips)
