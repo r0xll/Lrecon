@@ -162,6 +162,69 @@ async def favicon_hash(client, base_url: str):
     return None
 
 
+# Favicons are tiny; a big body at /favicon.ico is a mislabelled page or an
+# error doc, not an icon. Cap so a self-contained HTML report can't be bloated
+# by a stray multi-MB response embedded as a data URI.
+FAVICON_MAX_BYTES = 64 * 1024
+
+
+def seed_favicon_sources(hosts, domains) -> dict:
+    """`{favicon_hash: [seed host(s) serving it]}`, restricted to the seed
+    domains and their `www`.
+
+    Deliberately NOT every enumerated host: a subdomain running GitLab, cPanel
+    or Google Workspace serves that vendor's stock favicon, and pivoting on it
+    floods the results with unrelated hosts running the same software. A favicon
+    is a company fingerprint only when it's the company's — served by a domain
+    the operator actually named. `www.<seed>` is included because it's the same
+    canonical site, not a vendor subdomain.
+    """
+    import collections
+    seed_hosts = set(domains) | {f"www.{d}" for d in domains}
+    out = collections.defaultdict(list)
+    for h in hosts:
+        if getattr(h, "favicon_hash", None) and h.subdomain in seed_hosts:
+            out[h.favicon_hash].append(h.subdomain)
+    return {fh: sorted(srcs) for fh, srcs in out.items()}
+
+
+def favicon_fetch_base(host) -> str:
+    """Origin to fetch a seed host's favicon from, on the scheme it actually
+    answered on (`http` or `https`), falling back to https when unknown.
+
+    Hardcoding https makes an http-only host burn the full favicon timeout and
+    render no icon, stalling a multi-domain scan — the recorded scheme avoids
+    that. Kept pure so the scheme choice is unit-testable without the pipeline.
+    """
+    scheme = getattr(host, "scheme", None) or "https"
+    return f"{scheme}://{host.subdomain}"
+
+
+async def favicon_data_uri(client, base_url: str) -> str | None:
+    """The favicon a host serves, as a `data:` URI for inline display — so a
+    report reader can see the icon a pivot hash actually corresponds to and
+    confirm it's the org's logo rather than a framework default.
+
+    Reuses the same `/favicon.ico` fetch as favicon_hash(); returns None on
+    non-200, an empty/oversized body, or any error. The MIME type comes from the
+    response so an SVG or PNG favicon renders correctly, defaulting to
+    `image/x-icon` for the classic `.ico`.
+    """
+    import base64
+    try:
+        r = await client.get(base_url.rstrip("/") + "/favicon.ico", timeout=10,
+                            follow_redirects=True)
+        if r.status_code != 200 or not r.content or len(r.content) > FAVICON_MAX_BYTES:
+            return None
+        mime = (r.headers.get("content-type") or "image/x-icon").split(";")[0].strip()
+        if not mime.startswith("image/"):
+            mime = "image/x-icon"
+        b64 = base64.b64encode(r.content).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+    except Exception:
+        return None
+
+
 # A favicon shared by more hosts than this is a framework/CDN default (stock
 # nginx, WordPress, a JS framework), not a company marker — pivoting on it drags
 # in tens of thousands of unrelated hosts. Shodan returns the total up front, so

@@ -558,17 +558,55 @@ async def run(domains, args, keys) -> list:
         # unrelated domain is only *evidence* of ownership, never proof — so
         # cross-domain hosts are reported with that evidence but not probed
         # unless the operator opts in with --favicon-expand (see below).
+        #
+        # Seed the pivot ONLY from the seed domains (and their www), never from
+        # enumerated subdomains: a subdomain running GitLab, cPanel or Google
+        # Workspace serves that vendor's stock favicon, and pivoting on it drags
+        # in every unrelated host running the same software. A favicon is a
+        # company fingerprint only when it is the company's — i.e. served by the
+        # domains the operator actually named.
         favicon_pivots = {}
         if shodan_key and not args.passive_only:
             if not cf_nets:
                 cf_nets = await load_cf_ranges(client)
-            hashes = {h.favicon_hash for h in hosts.values() if h.favicon_hash}
+            # Make sure each seed domain's own www is present and probed before
+            # seeding the pivot. A site whose apex is blank and whose canonical
+            # host is www serves its favicon only on www; if no passive source
+            # enumerated www it is otherwise absent here, and the pivot would run
+            # with no company favicon at all. Skip a www that doesn't resolve so
+            # a domain without one contributes nothing.
+            www_seeds = []
+            for d in domains:
+                w = f"www.{d}"
+                if w in hosts:
+                    continue
+                nh = Host(subdomain=w, source={"seed-www"})
+                nh.ips, nh.cname, nh.nxdomain = await resolve_full(w, ns)
+                if not nh.ips:
+                    continue
+                hosts[w] = nh
+                www_seeds.append(nh)
+            if www_seeds:
+                await probe_hosts(www_seeds, desc="probing seed www for favicon")
+
+            fav_sources = seed_favicon_sources(hosts.values(), domains)
+            # The searched icon itself, so a report reader can confirm each hash
+            # is the org's logo. One fetch per hash (a handful), backend-agnostic.
+            # Fetch on the scheme the seed host actually answered on — hardcoding
+            # https makes an http-only host burn the full 10s timeout and render
+            # no icon, stalling multi-domain scans.
+            fav_images = {}
+            for fh, srcs in fav_sources.items():
+                seed_h = hosts.get(srcs[0])
+                base = favicon_fetch_base(seed_h) if seed_h else f"https://{srcs[0]}"
+                fav_images[fh] = await favicon_data_uri(probe_client, base)
             expand_hosts = {}
-            for fh in hashes:
+            for fh in fav_sources:
+                meta = {"sources": sorted(fav_sources[fh]), "image": fav_images.get(fh)}
                 res_fp = await shodan_favicon_pivot(client, fh, shodan_key, cf_nets,
                                                     limiter=shodan_limiter)
                 if res_fp.get("skipped"):
-                    favicon_pivots[fh] = {"skipped": res_fp["skipped"]}
+                    favicon_pivots[fh] = {"skipped": res_fp["skipped"], **meta}
                     log(f"[i] favicon {fh}: {res_fp['skipped']:,} matches — too common to "
                         f"be a company marker, skipped")
                     continue
@@ -577,7 +615,7 @@ async def run(domains, args, keys) -> list:
                     continue
                 matches, expand = classify_favicon_matches(matches, domains, name_in_scope)
                 expand_hosts.update({n: ip for n, ip in expand.items() if n not in expand_hosts})
-                favicon_pivots[fh] = {"matches": matches}
+                favicon_pivots[fh] = {"matches": matches, **meta}
 
             # --favicon-expand: pull the cross-domain matches into the active
             # pipeline. Off by default and loud when on, because a shared icon is

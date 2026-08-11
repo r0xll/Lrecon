@@ -4670,6 +4670,79 @@ def test_favicon_report_renders_evidence_and_skip_lines():
     assert 'id="t-favicon" data-filterable="1"' in html_text
 
 
+def test_seed_favicon_sources_ignores_enumerated_subdomains():
+    """The pivot must seed only from the seed domains (+www), never from a
+    subdomain running a vendor app — that subdomain serves the vendor's stock
+    favicon (GitLab/cPanel/Google) and floods the pivot with unrelated hosts."""
+    hosts = [
+        Host("example.com", favicon_hash=111),          # the org's real favicon
+        Host("www.example.com", favicon_hash=111),      # same canonical site
+        Host("gitlab.example.com", favicon_hash=999),   # GitLab's stock icon
+        Host("cpanel.example.com", favicon_hash=888),   # cPanel's stock icon
+        Host("mail.example.com", favicon_hash=777),     # Google's
+        Host("nofav.example.com", favicon_hash=None),
+    ]
+    out = enrich.seed_favicon_sources(hosts, ["example.com"])
+    assert out == {111: ["example.com", "www.example.com"]}
+    assert 999 not in out and 888 not in out and 777 not in out
+
+
+async def test_favicon_data_uri_builds_an_inline_image(monkeypatch):
+    class _Resp:
+        def __init__(self, status, content, ctype):
+            self.status_code, self.content = status, content
+            self.headers = {"content-type": ctype} if ctype else {}
+
+    class _C:
+        def __init__(self, resp): self.resp = resp
+        async def get(self, url, **kwargs): return self.resp
+
+    # A PNG favicon keeps its mime type.
+    uri = await enrich.favicon_data_uri(_C(_Resp(200, b"\x89PNGdata", "image/png")), "https://x.com")
+    assert uri.startswith("data:image/png;base64,")
+    # The classic .ico with no content-type defaults sensibly.
+    uri = await enrich.favicon_data_uri(_C(_Resp(200, b"icobytes", None)), "https://x.com")
+    assert uri.startswith("data:image/x-icon;base64,")
+    # Non-200, empty, and oversized bodies yield nothing.
+    assert await enrich.favicon_data_uri(_C(_Resp(404, b"x", "image/png")), "https://x.com") is None
+    assert await enrich.favicon_data_uri(_C(_Resp(200, b"", "image/png")), "https://x.com") is None
+    big = b"x" * (enrich.FAVICON_MAX_BYTES + 1)
+    assert await enrich.favicon_data_uri(_C(_Resp(200, big, "image/png")), "https://x.com") is None
+
+
+def test_favicon_fetch_base_uses_the_recorded_scheme():
+    """The searched-icon fetch must follow the scheme the seed host actually
+    answered on. Hardcoding https makes an http-only host burn the full favicon
+    timeout and render no icon, stalling a multi-domain scan."""
+    assert enrich.favicon_fetch_base(Host("a.com", scheme="http")) == "http://a.com"
+    assert enrich.favicon_fetch_base(Host("b.com", scheme="https")) == "https://b.com"
+    # No probe scheme recorded (never reached over HTTP) falls back to https.
+    assert enrich.favicon_fetch_base(Host("c.com")) == "https://c.com"
+
+
+def test_favicon_report_shows_the_searched_icon():
+    data_uri = "data:image/png;base64,AAAA"
+    res = {"favicon_pivots": {
+        111: {"sources": ["example.com", "www.example.com"], "image": data_uri,
+              "matches": [{"ip": "203.0.113.9", "hostnames": ["shadow.other.net"],
+                           "org": "Acme", "scope": "cross-domain"}]},
+        222: {"skipped": 9001, "sources": ["example.com"], "image": data_uri},
+    }}
+    with tempfile.TemporaryDirectory() as d:
+        md, html = Path(d) / "r.md", Path(d) / "r.html"
+        report.write_markdown([Host("example.com")], ["example.com"], res, str(md))
+        report.write_html([Host("example.com")], ["example.com"], res, str(html))
+        md_text, html_text = md.read_text(), html.read_text()
+    # The icon is embedded and attributed to the seed host it came from.
+    assert "<th>Icon</th>" in html_text
+    assert html_text.count(data_uri) >= 2            # match row + skip line
+    assert "served by example.com" in html_text
+    assert data_uri in md_text and "served by example.com" in md_text
+    # Still filterable, and the skip line still shows.
+    assert 'id="t-favicon" data-filterable="1"' in html_text
+    assert "9,001" in html_text
+
+
 async def test_vt_ip_history_is_enriched_and_flags_origin_candidates():
     """A list of past IPs and dates says a domain moved, not what it moved
     between — and an old non-Cloudflare address is the red-team payload."""
