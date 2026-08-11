@@ -4710,6 +4710,16 @@ async def test_favicon_data_uri_builds_an_inline_image(monkeypatch):
     assert await enrich.favicon_data_uri(_C(_Resp(200, big, "image/png")), "https://x.com") is None
 
 
+def test_favicon_fetch_base_uses_the_recorded_scheme():
+    """The searched-icon fetch must follow the scheme the seed host actually
+    answered on. Hardcoding https makes an http-only host burn the full favicon
+    timeout and render no icon, stalling a multi-domain scan."""
+    assert enrich.favicon_fetch_base(Host("a.com", scheme="http")) == "http://a.com"
+    assert enrich.favicon_fetch_base(Host("b.com", scheme="https")) == "https://b.com"
+    # No probe scheme recorded (never reached over HTTP) falls back to https.
+    assert enrich.favicon_fetch_base(Host("c.com")) == "https://c.com"
+
+
 def test_favicon_report_shows_the_searched_icon():
     data_uri = "data:image/png;base64,AAAA"
     res = {"favicon_pivots": {

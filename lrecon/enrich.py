@@ -188,6 +188,18 @@ def seed_favicon_sources(hosts, domains) -> dict:
     return {fh: sorted(srcs) for fh, srcs in out.items()}
 
 
+def favicon_fetch_base(host) -> str:
+    """Origin to fetch a seed host's favicon from, on the scheme it actually
+    answered on (`http` or `https`), falling back to https when unknown.
+
+    Hardcoding https makes an http-only host burn the full favicon timeout and
+    render no icon, stalling a multi-domain scan — the recorded scheme avoids
+    that. Kept pure so the scheme choice is unit-testable without the pipeline.
+    """
+    scheme = getattr(host, "scheme", None) or "https"
+    return f"{scheme}://{host.subdomain}"
+
+
 async def favicon_data_uri(client, base_url: str) -> str | None:
     """The favicon a host serves, as a `data:` URI for inline display — so a
     report reader can see the icon a pivot hash actually corresponds to and
