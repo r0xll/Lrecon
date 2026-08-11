@@ -532,7 +532,11 @@ async def run(domains, args, keys) -> list:
         # ---- Cloudflare origin discovery ----
         cf = {"detected": False, "fronted": [], "candidates": {}}
         cf_nets = []
-        if not args.no_cf_origin and not args.passive_only:
+        # Skip on a domainless (IP-only) scope: origin discovery is inherently
+        # domain-based — it confirms a candidate with a cert-scope match against
+        # `domains` and a spoofed `Host: domains[0]` header, both meaningless
+        # (and the latter an IndexError) with no domains in scope.
+        if not args.no_cf_origin and not args.passive_only and domains:
             cf_nets = await load_cf_ranges(client)
             cf = await cloudflare_origin_analysis(
                 client, probe_client, domains, hosts, keys, cf_nets,
@@ -1004,9 +1008,10 @@ async def run(domains, args, keys) -> list:
 
     # ---- Diff vs previous run ----
     diff = {}
+    ip_targets = getattr(args, "ip_targets", None)
     if args.diff:
-        diff = diff_snapshot(load_prev_snapshot(domains), host_list)
-    save_snapshot(domains, host_list)
+        diff = diff_snapshot(load_prev_snapshot(domains, ip_targets), host_list)
+    save_snapshot(domains, host_list, ip_targets)
 
     return {"hosts": host_list, "per_source": dict(per_source), "cf": cf,
             "email": email, "github": github_findings, "buckets": buckets,

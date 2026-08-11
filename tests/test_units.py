@@ -3439,6 +3439,31 @@ async def test_cloudflare_origin_enriches_candidates_with_asn_org(monkeypatch):
     assert cand["org"] == "Linode, LLC"
 
 
+async def test_cloudflare_origin_skips_active_confirmation_without_domains():
+    # An IP-only scope has no domain for the cert-scope match or the spoofed
+    # `Host: domains[0]` header — the active-confirmation block must be skipped,
+    # not crash on domains[0]. (The caller also skips CF-origin entirely for a
+    # domainless scope; this guards the function itself.)
+    nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
+    hosts = {
+        "104.16.5.5":  Host("104.16.5.5", ips=["104.16.5.5"]),    # Cloudflare (fronted)
+        "45.79.10.20": Host("45.79.10.20", ips=["45.79.10.20"]),  # non-CF candidate
+    }
+
+    async def fake_get(url, timeout=None):
+        return _FakeResp(200, {"org": "AS63949 Linode, LLC"})
+    client = type("C", (), {"get": staticmethod(fake_get)})()
+
+    class _Boom:                                  # probe_client must not be touched
+        async def get(self, *a, **k):
+            raise AssertionError("active confirmation must not run without domains")
+
+    res = await intel.cloudflare_origin_analysis(
+        client, _Boom(), [], hosts, {}, nets, active=True, resolver_ns=None)
+    assert res["detected"] is True
+    assert res["candidates"]["45.79.10.20"]["confirmed"] is False
+
+
 # --------------------------------------------------------------------------- #
 # State: diffing
 # --------------------------------------------------------------------------- #
@@ -3453,6 +3478,21 @@ def test_diff_snapshot_new_gone_and_ports():
     assert d["new_hosts"] == ["new.x.com"]
     assert d["gone_hosts"] == ["old.x.com"]
     assert d["new_ports"] == {"a.x.com": [443]}
+
+
+def test_state_key_folds_ip_targets_and_keeps_domain_only_stable():
+    # A domain-only key is unchanged (existing snapshots stay continuous).
+    assert state._state_key(["x.com"]) == "x.com"
+    assert state._state_key(["x.com"], []) == "x.com"
+    # IP targets fold in, so an IP-only run isn't keyed on the empty domain set
+    # and two IP scopes get distinct keys instead of overwriting each other.
+    ip_only = state._state_key([], ["1.1.1.1"])
+    assert ip_only and ip_only != state._state_key([], ["2.2.2.2"])
+    assert state._state_key([]) == ""            # no scope at all, still empty
+    # Same domain, different CIDR expansions must not collide.
+    a = state._state_key(["x.com"], ["10.0.0.1", "10.0.0.2"])
+    b = state._state_key(["x.com"], ["10.0.1.1", "10.0.1.2"])
+    assert a != b and a.startswith("x.com_ip-") and b.startswith("x.com_ip-")
 
 
 # --------------------------------------------------------------------------- #
