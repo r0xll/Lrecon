@@ -5181,6 +5181,66 @@ def test_merge_domains_dedupes_and_preserves_order():
     assert cli.merge_domains(["a.com"], []) == ["a.com"]
 
 
+def test_split_targets_partitions_domains_ips_and_cidrs():
+    domains, ips = cli.split_targets(
+        ["example.com", "203.0.113.9", "10.0.0.0/30", "1", "sub.example.com"], ip_cap=1024)
+    # A bare integer has no '.'/':' so it stays a domain (guards the
+    # ip_network("1") -> 0.0.0.1 footgun); real domains stay domains.
+    assert domains == ["example.com", "1", "sub.example.com"]
+    # A bare IP is one address; a /30 expands to its two usable hosts (.1/.2).
+    assert ips == ["203.0.113.9", "10.0.0.1", "10.0.0.2"]
+
+
+def test_split_targets_handles_ipv6_and_dedupes():
+    domains, ips = cli.split_targets(
+        ["2001:db8::1", "2001:db8::1", "example.com", "example.com"], ip_cap=1024)
+    assert domains == ["example.com"]
+    assert ips == ["2001:db8::1"]
+
+
+def test_split_targets_caps_a_wide_cidr():
+    # /24 = 254 usable hosts; the cap must bound the expansion.
+    _domains, ips = cli.split_targets(["192.0.2.0/24"], ip_cap=5)
+    assert len(ips) == 5
+    assert ips[0] == "192.0.2.1"
+
+
+def test_cli_accepts_an_ip_only_scope(monkeypatch):
+    # An IP/CIDR-only invocation must not trip the "provide a domain" guard, and
+    # the addresses must land on args.ip_targets (not args.domains).
+    captured = {}
+
+    def fake_run(domains, args, keys):
+        captured["domains"] = domains
+        captured["ip_targets"] = args.ip_targets
+        raise SystemExit(0)                             # bail before output writing
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(sys, "argv",
+                        ["lrecon", "--passive-only", "--config", "/nonexistent",
+                         "203.0.113.9", "198.51.100.0/30"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["domains"] == []                    # nothing domain-scoped
+    assert captured["ip_targets"] == ["203.0.113.9", "198.51.100.1", "198.51.100.2"]
+
+
+def test_cli_mixed_domain_and_ip_scope_keeps_them_separate(monkeypatch):
+    captured = {}
+
+    def fake_run(domains, args, keys):
+        captured["domains"] = domains
+        captured["ip_targets"] = args.ip_targets
+        raise SystemExit(0)
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(sys, "argv",
+                        ["lrecon", "--passive-only", "--config", "/nonexistent",
+                         "example.com", "203.0.113.9"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["domains"] == ["example.com"]       # IP kept out of the domain lane
+    assert captured["ip_targets"] == ["203.0.113.9"]
+
+
 def test_apply_all_flag_enables_osint_checks_not_active_ones():
     args = argparse.Namespace(all=True, buckets=False, dork=False, vt=False, nvd=False,
                               nuclei=False, asn_expand=False, active_ports=False,

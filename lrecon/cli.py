@@ -30,6 +30,46 @@ def merge_domains(positional: list, file_domains: list) -> list:
     return list(dict.fromkeys(list(positional) + list(file_domains)))
 
 
+def split_targets(tokens: list, ip_cap: int) -> tuple:
+    """Partition seed tokens into `(domains, ips)`.
+
+    A token that parses as an IP address or CIDR *and* contains `.`/`:` is an IP
+    target; everything else is a domain. The char gate guards the
+    `ipaddress.ip_network("1")` -> `0.0.0.1/32` footgun: a domain fails the
+    parse and a bare integer fails the char gate, so both stay domains. A single
+    host (`/32`, `/128`, or a bare IP) contributes one address; a wider net is
+    expanded via `.hosts()` and truncated to `ip_cap` (same truncate posture as
+    `--asn-cap`). Both lists are deduped with order preserved.
+    """
+    import ipaddress
+    domains, ips = [], []
+    for tok in tokens:
+        t = tok.strip()
+        if not t:
+            continue
+        if "." not in t and ":" not in t:
+            domains.append(t)
+            continue
+        try:
+            net = ipaddress.ip_network(t, strict=False)
+        except ValueError:
+            domains.append(t)
+            continue
+        if net.num_addresses == 1:
+            ips.append(str(net.network_address))
+            continue
+        hosts = net.hosts()
+        added = 0
+        for ip in hosts:
+            if added >= ip_cap:
+                log(f"[!] {t}: expands to {net.num_addresses} addresses — capped at "
+                    f"{ip_cap} (raise with --ip-cap)")
+                break
+            ips.append(str(ip))
+            added += 1
+    return list(dict.fromkeys(domains)), list(dict.fromkeys(ips))
+
+
 def apply_all_flag(args) -> None:
     """
     --all turns on every OSINT/informational check that's otherwise opt-in
@@ -73,10 +113,13 @@ def main() -> None:
 
 def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap = argparse.ArgumentParser(description="LRecon (Let's Recon) v3.2 — external recon (authorized use only)")
-    ap.add_argument("domains", nargs="*", help="root domain(s) in scope")
+    ap.add_argument("domains", nargs="*",
+                    help="root domain(s) in scope; bare IPs and CIDRs (e.g. 203.0.113.9, "
+                         "203.0.113.0/24) are also accepted and enriched/probed directly")
     ap.add_argument("-iL", "--domains-file",
-                    help="read domains from a file, one per line (# comments and blank "
-                         "lines skipped) — merged with any positional domains, deduped")
+                    help="read targets from a file, one per line (# comments and blank "
+                         "lines skipped) — domains, IPs and CIDRs; merged with any "
+                         "positional targets, deduped")
     ap.add_argument("--check-backends", action="store_true",
                     help="validate optional backends (ProjectDiscovery tools + psql) + "
                          "parser mapping, then exit")
@@ -99,6 +142,8 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--asn-expand", action="store_true",
                     help="expand scope via ASN->netblocks + reverse-DNS sweep (aggressive)")
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
+    ap.add_argument("--ip-cap", type=int, default=1024,
+                    help="max host addresses to expand from a single CIDR target (default 1024)")
     ap.add_argument("--favicon-expand", action="store_true",
                     help="actively probe hosts on OTHER domains that share a target favicon "
                          "(needs Shodan; ROE-gated — a shared icon is weak ownership evidence, "
@@ -223,8 +268,18 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
             ap.error(f"--domains-file: {e}")
         args.domains = merge_domains(args.domains, file_domains)
 
-    if not args.domains:
-        ap.error("provide at least one domain (or use --check-backends)")
+    # Split IPs/CIDRs out of the seed list into their own lane — they skip
+    # subdomain enumeration and DNS resolution and join the pipeline at the
+    # (already IP-keyed) enrichment phase. Keeping them out of args.domains is
+    # load-bearing: every domain-scoped step (whois, wildcard, www favicon
+    # seeding, endswith scope checks) would choke on an IP literal.
+    args.domains, args.ip_targets = split_targets(args.domains, args.ip_cap)
+    if args.ip_targets:
+        log(f"[i] {len(args.ip_targets)} IP target(s) in scope — enriched and probed "
+            f"directly, no subdomain enumeration")
+
+    if not args.domains and not args.ip_targets:
+        ap.error("provide at least one domain or IP/CIDR (or use --check-backends)")
 
     if args.active_ports and args.passive_only:
         ap.error("--active-ports conflicts with --passive-only")

@@ -252,8 +252,13 @@ async def run(domains, args, keys) -> list:
         ipinfo_token = keys.get("ipinfo")
 
         # ---- Phase 1: passive enum (with source attribution) ----
-        host_sources, per_source, failed_sources = await passive_enum(
-            client, domains, keys, no_pd=args.no_pd)
+        # Skip entirely on an IP-only run (no domains) — the passive sources are
+        # all domain-keyed (crt.sh, OTX, wayback…) and have nothing to query.
+        if domains:
+            host_sources, per_source, failed_sources = await passive_enum(
+                client, domains, keys, no_pd=args.no_pd)
+        else:
+            host_sources, per_source, failed_sources = {}, {}, {}
         hosts = {n: Host(subdomain=n, source=set(srcs)) for n, srcs in host_sources.items()}
         breakdown = "  ".join(f"{s}={per_source[s]}" for s in sorted(per_source)) or "none"
         log(f"[+] {len(hosts)} unique subdomains  |  by source: {breakdown}")
@@ -363,6 +368,21 @@ async def run(domains, args, keys) -> list:
                 if n_dangling:
                     log(f"[!] {n_dangling} dangling CNAME(s) — subdomain-takeover "
                         f"candidate(s) with a non-existent target")
+
+        # ---- Seed operator-supplied IP / CIDR targets ----
+        # These skip Phase 1 (nothing to enumerate) and Phase 2 (no DNS on an IP
+        # literal) and join here with their address already attached, so the
+        # IP-keyed enrichment below and the Phase 4 active probe run on them
+        # unchanged. Added outside the --passive-only guard so they're enriched
+        # (Shodan/InternetDB + IPinfo, all passive API lookups) just like any
+        # IP a domain resolved to.
+        n_ip_seed = 0
+        for ip in getattr(args, "ip_targets", []):
+            if ip not in hosts:
+                hosts[ip] = Host(subdomain=ip, ips=[ip], source={"ip-seed"})
+                n_ip_seed += 1
+        if n_ip_seed:
+            log(f"[+] {n_ip_seed} IP target(s) added directly for enrichment/probe")
 
         # ---- Phase 3: enrichment on UNIQUE IPs ----
         ip_to_hosts = defaultdict(list)
