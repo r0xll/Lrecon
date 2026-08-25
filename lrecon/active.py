@@ -1,7 +1,10 @@
 from __future__ import annotations
 import asyncio
+import re
+from urllib.parse import urljoin
 import httpx
 from .common import *
+from .secrets import scan_text
 
 # --------------------------------------------------------------------------- #
 # Phase 4 — active
@@ -231,6 +234,79 @@ async def verify_wayback_paths(client, host: Host, paths, sem) -> None:
                 host.endpoints.append({"path": path, "status": r.status_code,
                                        "source": "wayback"})
     await asyncio.gather(*(one(p) for p in paths))
+
+
+# Common API-documentation / spec routes worth a direct probe. The spec files
+# (openapi/swagger/api-docs/graphql) are entry points when exposed;
+# robots/sitemap/security.txt are recorded as context, not raised.
+_APIDOC_PATHS = ("/openapi.json", "/swagger.json", "/swagger-ui.html", "/api-docs",
+                 "/v2/api-docs", "/v3/api-docs", "/graphql", "/robots.txt",
+                 "/sitemap.xml", "/.well-known/security.txt")
+_SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
+_JS_MAX_BYTES = 512 * 1024        # a bundle bigger than this is scanned truncated
+
+
+def _same_origin(url: str, host: str) -> bool:
+    netloc = url.split("://", 1)[-1].split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+    return netloc == host.lower()
+
+
+async def discover_endpoints(client, host: Host, sem, js_max: int = 8) -> None:
+    """API-doc probing + same-origin JS secret/endpoint scan on a live host.
+
+    Probes a fixed set of API-doc routes (200 → `host.endpoints`), then fetches
+    the page, pulls its same-origin `<script src>` bundles (bounded), and scans
+    each for secret leads (`host.js_secrets`) and a source-map reference. Only
+    same-origin JS is fetched — a third-party CDN bundle is out of scope and
+    pure noise. All findings are leads to verify, never confirmations.
+    """
+    if not (host.scheme and host.http_status):
+        return
+    base = f"{host.scheme}://{host.subdomain}"
+
+    async def probe_doc(path):
+        async with sem:
+            try:
+                r = await client.get(base + path, timeout=8, follow_redirects=False)
+            except Exception:
+                return
+            if r.status_code == 200:
+                host.endpoints.append({"path": path, "status": 200, "source": "api-doc"})
+    await asyncio.gather(*(probe_doc(p) for p in _APIDOC_PATHS))
+
+    try:
+        root = await client.get(base, timeout=10, follow_redirects=True)
+        body = root.text[:200000]
+    except Exception:
+        return
+    js_urls, seen = [], set()
+    for src in _SCRIPT_SRC_RE.findall(body):
+        u = urljoin(base + "/", src)
+        if u.startswith(("http://", "https://")) and _same_origin(u, host.subdomain) and u not in seen:
+            seen.add(u)
+            js_urls.append(u)
+
+    async def scan_js(u):
+        async with sem:
+            try:
+                jr = await client.get(u, timeout=8, follow_redirects=True)
+            except Exception:
+                return
+            if jr.status_code != 200:
+                return
+            content = jr.text[:_JS_MAX_BYTES]
+        for f in scan_text(content, u):
+            if f not in host.js_secrets:
+                host.js_secrets.append(f)
+        if "sourceMappingURL=" in content:
+            mref = content.split("sourceMappingURL=", 1)[1].split()[0].strip()
+            mpath = urljoin(u, mref)
+            if _same_origin(mpath, host.subdomain):
+                ep = {"path": "/" + mpath.split("://", 1)[-1].split("/", 1)[-1],
+                      "status": 200, "source": "js-sourcemap"}
+                if ep not in host.endpoints:
+                    host.endpoints.append(ep)
+    await asyncio.gather(*(scan_js(u) for u in js_urls[:js_max]))
 
 
 async def tcp_scan(host: Host, ports, sem) -> None:

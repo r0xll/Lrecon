@@ -445,6 +445,61 @@ def test_rediscovered_sensitive_path_becomes_an_entry_point():
     assert targets == {"a.example.com/admin": "high", "a.example.com/wp-admin": "medium"}
 
 
+def test_scan_text_flags_known_secret_shapes_and_masks_them():
+    from lrecon import secrets
+    text = ('const a="AKIAIOSFODNN7EXAMPLE";'
+            'g="AIza' + "b" * 35 + '";'
+            'jwt="eyJ' + "a" * 12 + "." + "b" * 12 + "." + "c" * 12 + '";'
+            'api_key = "s3cr3tvalue0123456789";')
+    found = {f["kind"] for f in secrets.scan_text(text, "https://x/app.js")}
+    assert {"aws-access-key", "google-api-key", "jwt", "generic-secret-assignment"} <= found
+    # Values are masked, never reproduced in full.
+    aws = next(f for f in secrets.scan_text(text) if f["kind"] == "aws-access-key")
+    assert "AKIAIOSFODNN7EXAMPLE" not in aws["masked"] and aws["masked"].startswith("AKIA")
+
+
+def test_scan_text_is_quiet_on_benign_text():
+    from lrecon import secrets
+    assert secrets.scan_text("just some ordinary page text with a url /api/v1/users") == []
+
+
+async def test_discover_endpoints_finds_api_docs_and_same_origin_js_secrets():
+    from lrecon import active
+    host = Host("a.example.com", ips=["1.2.3.4"], http_status=200, scheme="https")
+    base = "https://a.example.com"
+    html = ('<html><script src="/app.js"></script>'
+            '<script src="https://cdn.other.com/vendor.js"></script></html>')
+    js = 'var k="AKIAIOSFODNN7EXAMPLE";\n//# sourceMappingURL=/app.js.map'
+    routes = {base + "/openapi.json": (200, ""), base: (200, html), base + "/app.js": (200, js)}
+
+    class _C:
+        async def get(self, url, **kwargs):
+            if "cdn.other.com" in url:
+                raise AssertionError("third-party JS must not be fetched")
+            status, text = routes.get(url, (404, ""))
+            return _FakeRespText(status, text)
+    await active.discover_endpoints(_C(), host, asyncio.Semaphore(4))
+    paths = {e["path"] for e in host.endpoints}
+    assert "/openapi.json" in paths                                  # api-doc probe
+    assert any(e["source"] == "js-sourcemap" for e in host.endpoints)  # sourcemap ref
+    assert any(s["kind"] == "aws-access-key" for s in host.js_secrets)  # same-origin JS
+
+
+def test_js_secret_and_open_api_doc_become_entry_points():
+    from lrecon import intel
+    h = Host("a.example.com", http_status=200, scheme="https",
+             endpoints=[{"path": "/openapi.json", "status": 200, "source": "api-doc"},
+                        {"path": "/robots.txt", "status": 200, "source": "api-doc"}],
+             js_secrets=[{"kind": "aws-access-key", "url": "https://a.example.com/app.js",
+                          "masked": "AKIA…MPLE (20 chars)"}])
+    eps = intel.summarize_entry_points([h], {}, [], {}, [], [])
+    types = {e["type"] for e in eps}
+    assert "leaked-secret" in types                       # JS secret -> entry point
+    exposed = {e["target"] for e in eps if e["type"] == "exposed-endpoint"}
+    assert "a.example.com/openapi.json" in exposed         # spec flagged
+    assert "a.example.com/robots.txt" not in exposed       # robots is not a lead
+
+
 def test_crtsh_name_in_scope_enforces_label_boundary():
     # A bare endswith() accepts testexample.com for example.com — confirmed
     # live that crt.sh's %.example.com pattern returns such names.
@@ -5410,6 +5465,13 @@ def test_cli_wayback_paths_conflicts_with_passive_only(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         cli.main()
     assert "--wayback-paths conflicts with --passive-only" in capsys.readouterr().err
+
+
+def test_cli_api_scan_conflicts_with_passive_only(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["lrecon", "--passive-only", "--api-scan", "x.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--api-scan conflicts with --passive-only" in capsys.readouterr().err
 
 
 def test_cli_brute_bad_wordlist_path_errors(monkeypatch, capsys):

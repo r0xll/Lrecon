@@ -435,6 +435,7 @@ async def run(domains, args, keys) -> list:
         certs = []
         if not args.passive_only:
             port_sem = asyncio.Semaphore(300)
+            api_sem = asyncio.Semaphore(30)      # bounds --api-scan HTTP fan-out
             active_hosts = [h for h in hosts.values() if h.ips and not h.wildcard]
 
             # port scan backend: naabu > pure-python tcp_scan
@@ -468,6 +469,10 @@ async def run(domains, args, keys) -> list:
                     await http_probe(probe_client, h)
                     if h.http_status and h.scheme and h.favicon_hash is None:
                         h.favicon_hash = await favicon_hash(probe_client, f"{h.scheme}://{h.subdomain}")
+                # API-doc + same-origin JS secret discovery on live hosts (opt-in).
+                if getattr(args, "api_scan", False) and h.http_status and h.scheme:
+                    await discover_endpoints(probe_client, h, api_sem,
+                                             js_max=getattr(args, "js_max", 8))
                 return h
 
             # One probe pass over an arbitrary host list — the seed set now, the
@@ -487,6 +492,13 @@ async def run(domains, args, keys) -> list:
                                             desc, use_prog)
 
             await probe_hosts(active_hosts)
+
+            if getattr(args, "api_scan", False):
+                n_docs = sum(1 for h in active_hosts for e in h.endpoints
+                             if e.get("source") in ("api-doc", "js-sourcemap"))
+                n_sec = sum(len(h.js_secrets) for h in active_hosts)
+                log(f"[+] api-scan: {n_docs} API-doc/sourcemap endpoint(s), {n_sec} secret "
+                    f"lead(s) in JS bundles" + (" — verify per ROE" if n_sec else ""))
 
             # ---- Wayback stale-endpoint hunt (opt-in --wayback-paths) ----
             # Mine archived paths per in-scope host (keyless CDX), then
