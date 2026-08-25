@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
 from .core import run
+from .sources import load_wordlist
 from .dorking import configured_dork_providers, select_dork_provider
 from .report import (write_markdown, write_html, write_live_hosts, write_csv, write_users_csv,
                      write_origin_ips, screenshot_hosts)
@@ -139,6 +140,16 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--active-ports", action="store_true",
                     help="async TCP connect scan of common ports (aggressive; ROE-gated)")
     ap.add_argument("--ports", help="comma-separated ports for --active-ports")
+    ap.add_argument("--brute", action="store_true",
+                    help="active DNS brute-force + permutation of the seed domains "
+                         "(aggressive; ROE-gated — sends many queries at the domain's "
+                         "authoritative NS). Resolved hits are wildcard-filtered like any "
+                         "other host. Never enabled by --all")
+    ap.add_argument("--wordlist",
+                    help="subdomain wordlist for --brute (one label per line); defaults to a "
+                         "compact bundled list — point at a SecLists file for depth")
+    ap.add_argument("--brute-cap", type=int, default=5000,
+                    help="max brute-force candidate names to resolve (default 5000)")
     ap.add_argument("--asn-expand", action="store_true",
                     help="expand scope via ASN->netblocks + reverse-DNS sweep (aggressive)")
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
@@ -286,6 +297,19 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     if args.verify_emails and args.passive_only:
         ap.error("--verify-emails conflicts with --passive-only (it opens an SMTP "
                  "connection to the target's own MX)")
+    if args.brute and args.passive_only:
+        ap.error("--brute conflicts with --passive-only (it sends active DNS queries "
+                 "at the target's authoritative nameservers)")
+    # Load the brute wordlist up front so a bad --wordlist path fails fast, not
+    # mid-run. args.brute_words is the resolved label list core.run() uses.
+    args.brute_words = []
+    if args.brute:
+        try:
+            args.brute_words = load_wordlist(args.wordlist)
+        except OSError as e:
+            ap.error(f"--wordlist: {e}")
+        log(f"[i] --brute: {len(args.brute_words)} wordlist label(s) loaded"
+            + (f" from {args.wordlist}" if args.wordlist else " (bundled default)"))
     args.ports = [int(p) for p in args.ports.split(",")] if args.ports else TOP_PORTS
 
     if not _HAVE_DNS and not args.passive_only:

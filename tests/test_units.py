@@ -346,6 +346,54 @@ async def test_passive_enum_filter_also_rejects_lookalikes(monkeypatch):
     assert per_source["otx"] == 1
 
 
+def test_brute_candidates_expands_wordlist_and_permutes_known_labels():
+    cands = sources.brute_candidates(
+        ["example.com"],
+        known_hosts={"example.com", "app.example.com"},
+        wordlist=["www", "api", "www"],           # dupe collapses
+        permute=True)
+    # wordlist x domain
+    assert "www.example.com" in cands and "api.example.com" in cands
+    # permutations of the known leftmost label `app`
+    assert "app-dev.example.com" in cands
+    assert "dev-app.example.com" in cands
+    assert "dev.app.example.com" in cands
+    # already-known hosts are not re-queued
+    assert "app.example.com" not in cands and "example.com" not in cands
+
+
+def test_brute_candidates_stays_in_scope_and_respects_cap():
+    # A lookalike wordlist entry can't widen scope, and the cap bounds the set.
+    cands = sources.brute_candidates(
+        ["example.com"], known_hosts=set(),
+        wordlist=["ok", "..evil"], permute=False)
+    assert "ok.example.com" in cands
+    assert all(sources.name_in_scope(c, "example.com") for c in cands)
+    capped = sources.brute_candidates(
+        ["example.com"], known_hosts=set(),
+        wordlist=[f"w{i}" for i in range(100)], permute=False, cap=10)
+    assert len(capped) == 10
+
+
+def test_brute_candidates_prioritises_base_wordlist_under_a_tight_cap():
+    # A large known-host set produces many permutations; a tight cap must still
+    # run the base wordlist sweep rather than being flooded by permutations.
+    known = {f"h{i}.example.com" for i in range(50)}
+    cands = sources.brute_candidates(
+        ["example.com"], known_hosts=known, wordlist=["www", "api"],
+        permute=True, cap=2)
+    assert cands == {"www.example.com", "api.example.com"}
+
+
+def test_load_wordlist_reads_bundled_default_and_custom_path(tmp_path):
+    default = sources.load_wordlist()
+    assert "www" in default and "api" in default        # bundled labels
+    assert all(not w.startswith("#") for w in default)  # comments skipped
+    p = tmp_path / "wl.txt"
+    p.write_text("# header\nadmin\n\nportal\n")
+    assert sources.load_wordlist(str(p)) == ["admin", "portal"]
+
+
 def test_crtsh_name_in_scope_enforces_label_boundary():
     # A bare endswith() accepts testexample.com for example.com — confirmed
     # live that crt.sh's %.example.com pattern returns such names.
@@ -5279,6 +5327,39 @@ def test_cli_mixed_domain_and_ip_scope_keeps_them_separate(monkeypatch):
         cli.main()
     assert captured["domains"] == ["example.com"]       # IP kept out of the domain lane
     assert captured["ip_targets"] == ["203.0.113.9"]
+
+
+def test_cli_brute_conflicts_with_passive_only(monkeypatch, capsys):
+    # --brute sends active DNS at the target's NS — rejected under --passive-only.
+    monkeypatch.setattr(sys, "argv", ["lrecon", "--passive-only", "--brute", "x.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--brute conflicts with --passive-only" in capsys.readouterr().err
+
+
+def test_cli_brute_loads_the_bundled_wordlist_into_args(monkeypatch):
+    # --brute with no --wordlist loads the bundled default onto args.brute_words.
+    captured = {}
+
+    def fake_run(domains, args, keys):
+        captured["words"] = args.brute_words
+        captured["brute"] = args.brute
+        raise SystemExit(0)
+    monkeypatch.setattr(cli, "run", fake_run)
+    monkeypatch.setattr(sys, "argv",
+                        ["lrecon", "--brute", "--config", "/nonexistent", "example.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert captured["brute"] is True
+    assert "www" in captured["words"] and len(captured["words"]) > 20
+
+
+def test_cli_brute_bad_wordlist_path_errors(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv",
+                        ["lrecon", "--brute", "--wordlist", "/nonexistent/wl.txt", "x.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--wordlist" in capsys.readouterr().err
 
 
 def test_apply_all_flag_enables_osint_checks_not_active_ones():

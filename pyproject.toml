@@ -28,6 +28,11 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["lrecon*"]
 
+# Ship the bundled brute-force wordlist inside the wheel so --brute works with
+# no SecLists install (loaded via importlib.resources).
+[tool.setuptools.package-data]
+lrecon = ["data/*.txt"]
+
 [project.optional-dependencies]
 screenshots = ["playwright>=1.40"]
 # Kept as an empty extra so `pip install 'lrecon[tls]'` — in older docs, scripts

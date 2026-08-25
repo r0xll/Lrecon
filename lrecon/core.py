@@ -273,6 +273,24 @@ async def run(domains, args, keys) -> list:
                 "per-attempt statuses). Other CT sources (certspotter/OTX) cover this; "
                 "--no-pd skips the direct-Postgres tier if it is being slow.")
 
+        # ---- Active brute-force / permutation (opt-in --brute, ROE-gated) ----
+        # Candidates are queued into `hosts` here, before Phase 2, so they ride
+        # the existing resolver: detect_wildcard + _mark_wildcard filter the
+        # phantoms a wildcard domain would otherwise inflate them into, and the
+        # dnsx backend resolves the whole enlarged set in one batch. Only names
+        # that actually resolve survive into the report.
+        if getattr(args, "brute", False) and not args.passive_only and domains:
+            words = getattr(args, "brute_words", [])
+            cands = brute_candidates(domains, set(hosts), words,
+                                     cap=getattr(args, "brute_cap", 5000))
+            wl_set = {f"{w.lower()}.{d.lower()}" for w in words for d in domains}
+            for name in cands:
+                hosts[name] = Host(subdomain=name,
+                                   source={"brute" if name in wl_set else "permutation"})
+            n_perm = sum(1 for c in cands if c not in wl_set)
+            log(f"[!] --brute: {len(cands)} candidate name(s) queued "
+                f"({n_perm} from permutation) — active DNS at the target's NS, confirm SOW")
+
         # ---- VirusTotal domain intelligence (opt-in --vt; needs VT key) ----
         # Explicit flag even with a key configured — VT's free tier is
         # rate-limited to 4 req/min and each domain costs two calls, so

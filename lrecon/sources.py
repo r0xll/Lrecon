@@ -543,6 +543,76 @@ async def detect_wildcard(domain: str, nameservers) -> set:
     return set(ips)
 
 
+# --------------------------------------------------------------------------- #
+# Active subdomain brute-force / permutation (opt-in, ROE-gated)
+# --------------------------------------------------------------------------- #
+# Affixes applied to already-known labels — the names an org actually uses tend
+# to have sibling environments (`app` -> `app-dev`, `dev.app`), which a flat
+# wordlist rarely reaches on its own.
+_PERMUTE_AFFIXES = ("dev", "test", "staging", "stage", "uat", "qa", "prod",
+                    "old", "new", "internal", "api", "admin", "beta", "demo")
+
+
+def load_wordlist(path: str | None = None) -> list:
+    """Brute-force labels — from `path`, else the bundled compact default.
+
+    One label per line; blank lines and `#`-comments skipped (same shape as the
+    domains file). The default ships with the package so `--brute` works with no
+    SecLists install; `--wordlist` points at a fuller list for depth.
+    """
+    if path:
+        text = Path(path).read_text()
+    else:
+        import importlib.resources
+        text = importlib.resources.files("lrecon").joinpath("data/subdomains.txt").read_text()
+    return [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def brute_candidates(domains, known_hosts, wordlist, permute: bool = True,
+                     cap: int = 5000) -> set:
+    """Candidate hostnames for the active brute-force phase.
+
+    Two sources, both kept strictly in-scope via `name_in_scope` (so a stray
+    wordlist entry or a lookalike known host can never widen scope):
+      * `word.domain` for every wordlist label × seed domain;
+      * permutations of the leftmost label of each already-known host
+        (`app.example.com` -> `app-dev`, `dev-app`, `dev.app.example.com`),
+        which catch sibling environments a flat list misses.
+
+    Pure and deterministic so the scope decision is unit-testable. Already-known
+    hosts are removed from the result (nothing to re-resolve). The base
+    wordlist sweep is prioritised over permutations when truncating to `cap`, so
+    a tight cap still runs the core list rather than being flooded by the
+    permutations of a large passively-enumerated host set.
+    """
+    words = list(dict.fromkeys(w.lower() for w in wordlist if w))
+    roots = [d.lower() for d in domains]
+    base = [f"{w}.{root}" for root in roots for w in words
+            if name_in_scope(f"{w}.{root}", root)]
+    perms = []
+    if permute:
+        for h in known_hosts:
+            hl = h.lower().rstrip(".")
+            root = next((r for r in roots if hl == r or hl.endswith("." + r)), None)
+            if not root or hl == root:
+                continue
+            sub = hl[: -(len(root) + 1)]           # label(s) left of the root
+            labels = sub.split(".")
+            first, tail = labels[0], ".".join(labels[1:])
+            suffix = (f"{tail}." if tail else "") + root
+            for aff in _PERMUTE_AFFIXES:
+                perms += [f"{first}-{aff}.{suffix}", f"{aff}-{first}.{suffix}",
+                          f"{aff}.{first}.{suffix}"]
+    known = {h.lower().rstrip(".") for h in known_hosts}
+    seen, ordered = set(), []
+    for name in base + perms:                      # base first, so the cap favours it
+        if name not in seen and name not in known:
+            seen.add(name)
+            ordered.append(name)
+    return set(ordered[:cap])
+
+
 
 # --------------------------------------------------------------------------- #
 # ASN / netblock expansion (RIPEstat, keyless) + reverse-DNS sweep
