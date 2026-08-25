@@ -406,6 +406,10 @@ class Host:
     # discovery. An "interesting" status on a sensitive path becomes an entry
     # point via summarize_entry_points.
     endpoints: list = field(default_factory=list)
+    # Secret leads found in this host's same-origin JS bundles:
+    # [{kind, url, masked}] — never the full secret. Leads, not confirmations;
+    # each becomes a (verify-me) entry point via summarize_entry_points.
+    js_secrets: list = field(default_factory=list)
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None

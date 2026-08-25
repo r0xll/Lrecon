@@ -157,6 +157,13 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                          "enabled by --all")
     ap.add_argument("--wayback-cap", type=int, default=400,
                     help="max archived paths to re-verify across all hosts (default 400)")
+    ap.add_argument("--api-scan", action="store_true",
+                    help="on live hosts, probe common API-doc routes (openapi/swagger/"
+                         "graphql) and scan same-origin JS bundles for secret leads "
+                         "(aggressive; ROE-gated — fetches from the target). Never "
+                         "enabled by --all")
+    ap.add_argument("--js-max", type=int, default=8,
+                    help="max same-origin JS bundles to scan per host for --api-scan (default 8)")
     ap.add_argument("--asn-expand", action="store_true",
                     help="expand scope via ASN->netblocks + reverse-DNS sweep (aggressive)")
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
@@ -310,6 +317,9 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     if args.wayback_paths and args.passive_only:
         ap.error("--wayback-paths conflicts with --passive-only (it re-requests archived "
                  "paths live against the target)")
+    if args.api_scan and args.passive_only:
+        ap.error("--api-scan conflicts with --passive-only (it fetches API docs and JS "
+                 "bundles live from the target)")
     # Load the brute wordlist up front so a bad --wordlist path fails fast, not
     # mid-run. args.brute_words is the resolved label list core.run() uses.
     args.brute_words = []

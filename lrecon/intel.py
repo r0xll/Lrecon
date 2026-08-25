@@ -1684,7 +1684,7 @@ _SENSITIVE_PATH_HINTS = (
     "/admin", "/wp-admin", "/.git", "/.env", "/.svn", "/.htpasswd", "/backup",
     "/phpmyadmin", "/adminer", "/manager", "/console", "/actuator", "/jenkins",
     "/server-status", "/debug", "/swagger", "/api-docs", "/graphql", "/.aws",
-    "/config", "/wp-config", "/.ds_store", "/dumps", "/phpinfo",
+    "/config", "/wp-config", "/.ds_store", "/dumps", "/phpinfo", "/openapi",
 )
 
 
@@ -1726,9 +1726,20 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
             out.append({"type": "exposed-endpoint",
                         "target": f"{h.subdomain}{ep['path']}",
                         "severity": "high" if ep["status"] == 200 else "medium",
-                        "summary": f"Archived path is live again — HTTP {ep['status']} on a "
+                        "summary": f"Live endpoint — HTTP {ep['status']} on a "
                                    f"sensitive route (via {ep.get('source', 'archive')})",
                         "attck": "T1190"})
+
+        # Secret leads found in the host's own JS bundles. Leads, not proof —
+        # a bundled key may be publishable or a placeholder, so the summary says
+        # so; the operator verifies.
+        for s in getattr(h, "js_secrets", []):
+            out.append({"type": "leaked-secret",
+                        "target": f"{h.subdomain} ({s['kind']})",
+                        "severity": "high",
+                        "summary": f"Possible secret in a JS bundle: {s['masked']} "
+                                   f"({s.get('url', '')}) — verify; may be a public/placeholder key",
+                        "attck": "T1552.001"})
 
     for domain, result in (axfr or {}).items():
         if not (result or {}).get("transferred"):

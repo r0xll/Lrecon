@@ -426,14 +426,29 @@ def write_markdown(hosts, domains, res, path) -> None:
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
     if ep_hosts:
         n_ep = sum(len(h.endpoints) for h in ep_hosts)
-        lines += [f"## Rediscovered endpoints ({n_ep})", "",
-                  "Archived paths (Wayback) that still respond on a live host — forgotten "
-                  "admin panels and old apps that no passive source surfaces directly.", "",
+        lines += [f"## Discovered endpoints ({n_ep})", "",
+                  "Live paths on in-scope hosts — archived paths (Wayback) that still "
+                  "respond, exposed API docs, and source-map references. Forgotten admin "
+                  "panels, old apps and API surface no passive source shows directly.", "",
                   "| Host | Path | Status | Source |", "|---|---|---|---|"]
         for h in ep_hosts:
             for ep in sorted(h.endpoints, key=lambda e: (e.get("status", 0), e.get("path", ""))):
                 lines.append(f"| {h.subdomain} | {ep.get('path','')} | {ep.get('status','')} "
                              f"| {ep.get('source','')} |")
+        lines.append("")
+
+    sec_hosts = [h for h in hosts if getattr(h, "js_secrets", None)]
+    if sec_hosts:
+        n_sec = sum(len(h.js_secrets) for h in sec_hosts)
+        lines += [f"## Secret leads in JS bundles ({n_sec})", "",
+                  "Possible secrets found in same-origin JavaScript. **Leads, not "
+                  "confirmations** — a bundled key may be publishable or a placeholder. "
+                  "Values are masked; verify per ROE.", "",
+                  "| Host | Kind | Value (masked) | Source URL |", "|---|---|---|---|"]
+        for h in sec_hosts:
+            for s in h.js_secrets:
+                lines.append(f"| {h.subdomain} | {s.get('kind','')} | `{s.get('masked','')}` "
+                             f"| {s.get('url','')} |")
         lines.append("")
 
     whois = res.get("whois") or {}
@@ -1042,7 +1057,7 @@ def write_html(hosts, domains, res, path) -> None:
         body = (f'<table id="t-sources"><tr><th>Source</th><th>In-scope hosts found</th></tr>{rows}</table>')
         sections.append(_html_section("sources", "Passive source contribution", len(per_source), body))
 
-    # ---- Rediscovered endpoints (Wayback -> live) ----
+    # ---- Discovered endpoints (Wayback + API docs -> live) ----
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
     if ep_hosts:
         n_ep = sum(len(h.endpoints) for h in ep_hosts)
@@ -1054,9 +1069,25 @@ def write_html(hosts, domains, res, path) -> None:
         body = (f'{_html_export_button("t-endpoints", "endpoints.csv")}'
                 f'<table id="t-endpoints"><tr><th>Host</th><th>Path</th><th>Status</th>'
                 f'<th>Source</th></tr>{rows}</table>'
-                f'<p class="note">Archived paths that still respond on a live host — forgotten '
-                f'admin panels and old apps no passive source surfaces. Validate per ROE.</p>')
-        sections.append(_html_section("endpoints", "Rediscovered endpoints", n_ep, body))
+                f'<p class="note">Live paths on in-scope hosts — archived (Wayback) paths that '
+                f'still respond, exposed API docs, and source-map references. Validate per ROE.</p>')
+        sections.append(_html_section("endpoints", "Discovered endpoints", n_ep, body))
+
+    # ---- Secret leads in JS bundles ----
+    sec_hosts = [h for h in hosts if getattr(h, "js_secrets", None)]
+    if sec_hosts:
+        n_sec = sum(len(h.js_secrets) for h in sec_hosts)
+        rows = "".join(
+            f"<tr><td>{esc(h.subdomain)}</td><td>{esc(s.get('kind'))}</td>"
+            f"<td><code>{esc(s.get('masked'))}</code></td><td>{esc(s.get('url'))}</td></tr>"
+            for h in sec_hosts for s in h.js_secrets)
+        body = (f'{_html_export_button("t-jssecrets", "js_secrets.csv")}'
+                f'<table id="t-jssecrets"><tr><th>Host</th><th>Kind</th><th>Value (masked)</th>'
+                f'<th>Source URL</th></tr>{rows}</table>'
+                f'<p class="note">Possible secrets in same-origin JavaScript — <strong>leads, '
+                f'not confirmations</strong>. A bundled key may be publishable or a placeholder. '
+                f'Values masked; verify per ROE.</p>')
+        sections.append(_html_section("jssecrets", "Secret leads in JS bundles", n_sec, body))
 
     # ---- Domain registration (WHOIS/RDAP) ----
     if whois:
