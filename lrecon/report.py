@@ -423,6 +423,19 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"| {s} | {per_source[s]} |")
         lines.append("")
 
+    ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
+    if ep_hosts:
+        n_ep = sum(len(h.endpoints) for h in ep_hosts)
+        lines += [f"## Rediscovered endpoints ({n_ep})", "",
+                  "Archived paths (Wayback) that still respond on a live host — forgotten "
+                  "admin panels and old apps that no passive source surfaces directly.", "",
+                  "| Host | Path | Status | Source |", "|---|---|---|---|"]
+        for h in ep_hosts:
+            for ep in sorted(h.endpoints, key=lambda e: (e.get("status", 0), e.get("path", ""))):
+                lines.append(f"| {h.subdomain} | {ep.get('path','')} | {ep.get('status','')} "
+                             f"| {ep.get('source','')} |")
+        lines.append("")
+
     whois = res.get("whois") or {}
     if whois:
         lines += ["## Domain registration (WHOIS/RDAP)", "",
@@ -1028,6 +1041,22 @@ def write_html(hosts, domains, res, path) -> None:
                        for s in sorted(per_source, key=lambda k: -per_source[k]))
         body = (f'<table id="t-sources"><tr><th>Source</th><th>In-scope hosts found</th></tr>{rows}</table>')
         sections.append(_html_section("sources", "Passive source contribution", len(per_source), body))
+
+    # ---- Rediscovered endpoints (Wayback -> live) ----
+    ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
+    if ep_hosts:
+        n_ep = sum(len(h.endpoints) for h in ep_hosts)
+        rows = "".join(
+            f"<tr><td>{esc(h.subdomain)}</td><td>{esc(ep.get('path'))}</td>"
+            f"<td>{esc(ep.get('status'))}</td><td>{esc(ep.get('source'))}</td></tr>"
+            for h in ep_hosts
+            for ep in sorted(h.endpoints, key=lambda e: (e.get("status", 0), e.get("path", ""))))
+        body = (f'{_html_export_button("t-endpoints", "endpoints.csv")}'
+                f'<table id="t-endpoints"><tr><th>Host</th><th>Path</th><th>Status</th>'
+                f'<th>Source</th></tr>{rows}</table>'
+                f'<p class="note">Archived paths that still respond on a live host — forgotten '
+                f'admin panels and old apps no passive source surfaces. Validate per ROE.</p>')
+        sections.append(_html_section("endpoints", "Rediscovered endpoints", n_ep, body))
 
     # ---- Domain registration (WHOIS/RDAP) ----
     if whois:

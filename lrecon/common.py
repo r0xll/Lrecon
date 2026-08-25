@@ -401,6 +401,11 @@ class Host:
     scheme: str | None = None
     final_url: str | None = None
     favicon_hash: int | None = None
+    # Live-verified paths on this host: [{path, status, source}]. Populated by
+    # the Wayback stale-endpoint hunt (source="wayback") and, later, API-doc/JS
+    # discovery. An "interesting" status on a sensitive path becomes an entry
+    # point via summarize_entry_points.
+    endpoints: list = field(default_factory=list)
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None

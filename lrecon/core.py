@@ -488,6 +488,39 @@ async def run(domains, args, keys) -> list:
 
             await probe_hosts(active_hosts)
 
+            # ---- Wayback stale-endpoint hunt (opt-in --wayback-paths) ----
+            # Mine archived paths per in-scope host (keyless CDX), then
+            # re-request them on live hosts now: a 200/401/403/500 on a path the
+            # site served years ago is a forgotten admin panel or old app no
+            # passive source surfaces. Active (touches the target), so gated and
+            # bounded by --wayback-cap total requests.
+            if getattr(args, "wayback_paths", False):
+                mined = defaultdict(list)
+                for d in domains:
+                    for host, paths in (await wayback_paths(client, d)).items():
+                        for p in paths:
+                            if p not in mined[host]:
+                                mined[host].append(p)
+                budget = getattr(args, "wayback_cap", 400)
+                wb_sem = asyncio.Semaphore(50)
+                n_checked, wb_tasks = 0, []
+                for h in active_hosts:
+                    if n_checked >= budget:
+                        break
+                    slice_ = mined.get(h.subdomain, [])[: budget - n_checked]
+                    if not slice_:
+                        continue
+                    n_checked += len(slice_)
+                    wb_tasks.append(verify_wayback_paths(probe_client, h, slice_, wb_sem))
+                if wb_tasks:
+                    await asyncio.gather(*wb_tasks)
+                    n_found = sum(len(h.endpoints) for h in active_hosts)
+                    log(f"[+] wayback endpoints: re-verified {n_checked} archived path(s), "
+                        f"{n_found} still responding (forgotten-app leads)")
+                elif mined:
+                    log("[i] wayback endpoints: archived paths found but no live host to "
+                        "re-verify them against")
+
             # ---- GitHub Pages: is the lead actually claimable? ----
             # *.github.io is wildcarded, so a dead Pages target never NXDOMAINs
             # and the body signature is the only thing that fires — and it reads

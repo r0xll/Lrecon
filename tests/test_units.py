@@ -394,6 +394,57 @@ def test_load_wordlist_reads_bundled_default_and_custom_path(tmp_path):
     assert sources.load_wordlist(str(p)) == ["admin", "portal"]
 
 
+async def test_wayback_paths_groups_in_scope_paths_and_drops_assets():
+    rows = [["original"],
+            ["https://app.example.com/admin"],
+            ["https://app.example.com/admin"],            # dupe collapses
+            ["https://app.example.com/login?next=/x"],    # query stripped
+            ["https://app.example.com/logo.png"],         # asset dropped
+            ["https://app.example.com/bundle.js"],        # asset dropped
+            ["https://m.testexample.com/secret"]]         # out of scope
+    out = await sources.wayback_paths(
+        _FakeEnumClient({"web.archive.org": _FakeResp(200, rows)}), "example.com")
+    assert out == {"app.example.com": ["/admin", "/login"]}
+    assert "m.testexample.com" not in out
+
+
+async def test_wayback_paths_caps_per_host():
+    rows = [["original"]] + [[f"https://a.example.com/p{i}"] for i in range(20)]
+    out = await sources.wayback_paths(
+        _FakeEnumClient({"web.archive.org": _FakeResp(200, rows)}),
+        "example.com", per_host_cap=5)
+    assert len(out["a.example.com"]) == 5
+
+
+async def test_verify_wayback_paths_keeps_live_drops_404():
+    from lrecon import active
+    host = Host("a.example.com", ips=["1.2.3.4"], http_status=200, scheme="https")
+    status_by_path = {"/admin": 200, "/old": 401, "/gone": 404, "/err": 500}
+
+    class _C:
+        async def get(self, url, **kwargs):
+            path = "/" + url.split("://", 1)[1].split("/", 1)[1]
+            return _FakeResp(status_by_path[path])
+    await active.verify_wayback_paths(_C(), host, list(status_by_path), asyncio.Semaphore(4))
+    got = {e["path"]: e["status"] for e in host.endpoints}
+    assert got == {"/admin": 200, "/old": 401, "/err": 500}   # 404 dropped
+    assert all(e["source"] == "wayback" for e in host.endpoints)
+
+
+def test_rediscovered_sensitive_path_becomes_an_entry_point():
+    from lrecon import intel
+    h = Host("a.example.com", http_status=200, scheme="https", endpoints=[
+        {"path": "/admin", "status": 200, "source": "wayback"},      # sensitive, live -> high
+        {"path": "/wp-admin", "status": 401, "source": "wayback"},   # sensitive, gated -> medium
+        {"path": "/login", "status": 200, "source": "wayback"},      # legit, not flagged
+        {"path": "/admin", "status": 404, "source": "wayback"},      # gone, not flagged
+    ])
+    eps = intel.summarize_entry_points([h], {}, [], {}, [], [])
+    exposed = [e for e in eps if e["type"] == "exposed-endpoint"]
+    targets = {e["target"]: e["severity"] for e in exposed}
+    assert targets == {"a.example.com/admin": "high", "a.example.com/wp-admin": "medium"}
+
+
 def test_crtsh_name_in_scope_enforces_label_boundary():
     # A bare endswith() accepts testexample.com for example.com — confirmed
     # live that crt.sh's %.example.com pattern returns such names.
@@ -5352,6 +5403,13 @@ def test_cli_brute_loads_the_bundled_wordlist_into_args(monkeypatch):
         cli.main()
     assert captured["brute"] is True
     assert "www" in captured["words"] and len(captured["words"]) > 20
+
+
+def test_cli_wayback_paths_conflicts_with_passive_only(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["lrecon", "--passive-only", "--wayback-paths", "x.com"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    assert "--wayback-paths conflicts with --passive-only" in capsys.readouterr().err
 
 
 def test_cli_brute_bad_wordlist_path_errors(monkeypatch, capsys):
