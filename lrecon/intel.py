@@ -1676,6 +1676,23 @@ def _cve_severity(cvss, has_poc: bool = False) -> str:
     return sev
 
 
+# Path fragments that make a live-again archived endpoint an initial-access
+# lead in its own right: admin panels, VCS/secret leaks, and management consoles.
+# A plain login/signin page is a legitimate, common endpoint and is deliberately
+# NOT here — it's still recorded on the host, just not raised as an entry point.
+_SENSITIVE_PATH_HINTS = (
+    "/admin", "/wp-admin", "/.git", "/.env", "/.svn", "/.htpasswd", "/backup",
+    "/phpmyadmin", "/adminer", "/manager", "/console", "/actuator", "/jenkins",
+    "/server-status", "/debug", "/swagger", "/api-docs", "/graphql", "/.aws",
+    "/config", "/wp-config", "/.ds_store", "/dumps", "/phpinfo",
+)
+
+
+def _is_sensitive_path(path: str) -> bool:
+    p = (path or "").lower()
+    return any(hint in p for hint in _SENSITIVE_PATH_HINTS)
+
+
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                            dorks=None, auth_surfaces=None, whois=None,
                            axfr=None) -> list:
@@ -1699,6 +1716,19 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
             out.append({"type": "subdomain-takeover", "target": h.subdomain, "severity": sev,
                        "summary": h.takeover, "attck": "T1584.001",
                        "confidence": h.takeover_confidence})
+
+        # Archived paths that answered live again on a sensitive route — a
+        # forgotten admin panel / old app is a real initial-access lead. A 200
+        # is worse than an auth-walled 401/403 (reachable without creds).
+        for ep in getattr(h, "endpoints", []):
+            if not _is_sensitive_path(ep.get("path", "")) or ep.get("status") not in (200, 401, 403):
+                continue
+            out.append({"type": "exposed-endpoint",
+                        "target": f"{h.subdomain}{ep['path']}",
+                        "severity": "high" if ep["status"] == 200 else "medium",
+                        "summary": f"Archived path is live again — HTTP {ep['status']} on a "
+                                   f"sensitive route (via {ep.get('source', 'archive')})",
+                        "attck": "T1190"})
 
     for domain, result in (axfr or {}).items():
         if not (result or {}).get("transferred"):

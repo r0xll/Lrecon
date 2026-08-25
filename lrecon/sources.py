@@ -327,6 +327,62 @@ def _retry_after_seconds(r) -> float | None:
         return None                     # HTTP-date form — fall back to backoff
 
 
+# Extensions that are static assets, not app paths — re-requesting them just
+# confirms a CDN serves images, never a forgotten admin panel. Dropped from the
+# stale-endpoint verify set (`.map`/`.js` are handled by the later JS scan).
+_WAYBACK_ASSET_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css",
+                      ".woff", ".woff2", ".ttf", ".eot", ".webp", ".mp4", ".webm",
+                      ".pdf", ".zip", ".gz", ".map", ".js")
+
+
+def _wayback_split(raw: str):
+    """`(host, path)` from a raw archived URL, path query/fragment stripped."""
+    rest = raw.split("://", 1)[-1]
+    hostpart, _, pathpart = rest.partition("/")
+    host = hostpart.split("@")[-1].split(":")[0].lower()
+    path = "/" + pathpart.split("#")[0].split("?")[0]
+    return host, path
+
+
+async def wayback_paths(client, domain: str, per_host_cap: int = 50,
+                        attempts: int = 4) -> dict:
+    """Archived URL *paths* per in-scope host, from the Wayback CDX index.
+
+    Extends the subdomain-only `enum_wayback` to keep the full path, grouped by
+    host: the raw material for hunting forgotten admin panels and old apps that
+    no passive source surfaces directly. Static-asset paths are dropped, paths
+    are deduped, and each host is capped. Returns `{host: [path, ...]}`; `{}` on
+    a total failure (same 429/backoff handling as `enum_wayback`).
+    """
+    url = (f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
+           f"&output=json&fl=original&collapse=urlkey&limit=20000")
+    for attempt in range(attempts):
+        try:
+            r = await client.get(url, timeout=45, follow_redirects=True)
+            if r.status_code == 200:
+                out, seen = defaultdict(list), defaultdict(set)
+                for row in (r.json() or [])[1:]:
+                    host, path = _wayback_split(row[0])
+                    if not name_in_scope(host, domain):
+                        continue
+                    if any(path.lower().endswith(e) for e in _WAYBACK_ASSET_EXT):
+                        continue
+                    if path in seen[host] or len(out[host]) >= per_host_cap:
+                        continue
+                    seen[host].add(path)
+                    out[host].append(path)
+                return dict(out)
+            if r.status_code not in _WAYBACK_RETRY_STATUS:
+                break
+            delay = _retry_after_seconds(r)
+        except Exception:
+            delay = None
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay if delay is not None
+                                else min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
+    return {}
+
+
 async def enum_shodan_dns(client, domain: str, key: str) -> set:
     out = set()
     try:

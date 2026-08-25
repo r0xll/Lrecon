@@ -150,6 +150,13 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                          "compact bundled list — point at a SecLists file for depth")
     ap.add_argument("--brute-cap", type=int, default=5000,
                     help="max brute-force candidate names to resolve (default 5000)")
+    ap.add_argument("--wayback-paths", action="store_true",
+                    help="mine archived URL paths from the Wayback Machine and re-request "
+                         "them on live hosts to surface forgotten admin panels / old apps "
+                         "(aggressive; ROE-gated — sends live HTTP at the target). Never "
+                         "enabled by --all")
+    ap.add_argument("--wayback-cap", type=int, default=400,
+                    help="max archived paths to re-verify across all hosts (default 400)")
     ap.add_argument("--asn-expand", action="store_true",
                     help="expand scope via ASN->netblocks + reverse-DNS sweep (aggressive)")
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
@@ -300,6 +307,9 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     if args.brute and args.passive_only:
         ap.error("--brute conflicts with --passive-only (it sends active DNS queries "
                  "at the target's authoritative nameservers)")
+    if args.wayback_paths and args.passive_only:
+        ap.error("--wayback-paths conflicts with --passive-only (it re-requests archived "
+                 "paths live against the target)")
     # Load the brute wordlist up front so a bad --wordlist path fails fast, not
     # mid-run. args.brute_words is the resolved label list core.run() uses.
     args.brute_words = []

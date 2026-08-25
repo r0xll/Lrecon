@@ -207,6 +207,32 @@ def _check_takeover(host: Host, body_lower: str, status: int | None = None) -> N
         return
 
 
+# Statuses worth recording for a re-requested archived path: a live app
+# response (200), an auth wall (401/403 — a real endpoint, just gated), or a
+# server error (500 — the code still runs). A 404 means it's genuinely gone.
+_WAYBACK_KEEP_STATUS = (200, 401, 403, 500)
+
+
+async def verify_wayback_paths(client, host: Host, paths, sem) -> None:
+    """Re-request archived paths on a live host now; record the ones that still
+    respond with something other than 404 onto `host.endpoints`. This is the
+    forgotten-admin-panel / old-app find that no passive source surfaces."""
+    if not (host.scheme and host.http_status and paths):
+        return
+    base = f"{host.scheme}://{host.subdomain}"
+
+    async def one(path):
+        async with sem:
+            try:
+                r = await client.get(base + path, timeout=8, follow_redirects=False)
+            except Exception:
+                return
+            if r.status_code in _WAYBACK_KEEP_STATUS:
+                host.endpoints.append({"path": path, "status": r.status_code,
+                                       "source": "wayback"})
+    await asyncio.gather(*(one(p) for p in paths))
+
+
 async def tcp_scan(host: Host, ports, sem) -> None:
     async def probe(ip, port):
         async with sem:
