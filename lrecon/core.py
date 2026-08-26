@@ -16,6 +16,7 @@ from .vt import *
 from . import backends
 from . import tlsinfo
 from .tlsinfo import TLS_PORTS, fetch_cert, in_scope_cert_names
+from .kev import load_kev, epss_scores
 
 # --------------------------------------------------------------------------- #
 # Orchestration
@@ -1024,6 +1025,24 @@ async def run(domains, args, keys) -> list:
                     for c in (h.nvd_cves or []):
                         if c.get("id") in poc_cache:
                             c["poc"] = poc_cache[c["id"]]
+
+                # ---- CISA KEV + EPSS: rank by real-world exploitability ----
+                # KEV = known exploited in the wild (the strongest lead); EPSS =
+                # probability of exploitation. Both keyless, fetched once for all
+                # resolved CVEs and annotated onto each nvd_cves dict.
+                kev_set = await load_kev(client)
+                epss = await epss_scores(client, unique_cve_ids)
+                for h in nvd_hosts:
+                    for c in (h.nvd_cves or []):
+                        cid = c.get("id")
+                        if cid in kev_set:
+                            c["kev"] = True
+                        if cid in epss:
+                            c["epss"] = epss[cid]
+                n_kev = len(set(unique_cve_ids) & kev_set)
+                if n_kev:
+                    log(f"[!] {n_kev} resolved CVE(s) in the CISA KEV catalog "
+                        f"(known exploited in the wild) — prioritise these")
 
         # ---- nuclei templated vuln scan (opt-in; ProjectDiscovery backend) ----
         nuclei = []

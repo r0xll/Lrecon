@@ -1660,7 +1660,7 @@ NON_WEB_PORT_INFO = {
 }
 
 
-def _cve_severity(cvss, has_poc: bool = False) -> str:
+def _cve_severity(cvss, has_poc: bool = False, kev: bool = False) -> str:
     if cvss is None:
         sev = "medium"                               # no CVSS data (e.g. Shodan/InternetDB vulns list)
     else:
@@ -1673,6 +1673,11 @@ def _cve_severity(cvss, has_poc: bool = False) -> str:
     # alone — floor at "high" rather than leaving it at medium/low.
     if has_poc and ENTRY_SEVERITY_ORDER[sev] > ENTRY_SEVERITY_ORDER["high"]:
         sev = "high"
+    # In the CISA KEV catalog = exploited in the wild: the strongest signal
+    # there is, above CVSS and PoC. Raise to critical (the caller still caps it
+    # to high when the tech stack couldn't be confirmed live).
+    if kev:
+        sev = "critical"
     return sev
 
 
@@ -1813,9 +1818,11 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
         cve_ids = all_ids - dos_ids
         if not cve_ids:
             continue
-        # PoC-confirmed CVEs first — a working public exploit outranks raw
-        # CVSS as a red-team signal — then by CVSS descending, unscored last.
+        # KEV (exploited in the wild) first, then PoC-confirmed, then CVSS
+        # descending, unscored last — real-world exploitability outranks the
+        # base score as a red-team signal.
         ranked = sorted(cve_ids, key=lambda cid: (
+            0 if nvd_by_id.get(cid, {}).get("kev") else 1,
             0 if nvd_by_id.get(cid, {}).get("poc") else 1,
             -(nvd_by_id.get(cid, {}).get("cvss") if nvd_by_id.get(cid, {}).get("cvss") is not None else -1),
             cid))
@@ -1823,6 +1830,10 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                        if nvd_by_id.get(cid, {}).get("cvss") is not None]
         max_cvss = max(cvss_values) if cvss_values else None
         poc_ids = [cid for cid in cve_ids if nvd_by_id.get(cid, {}).get("poc")]
+        kev_ids = [cid for cid in cve_ids if nvd_by_id.get(cid, {}).get("kev")]
+        epss_values = [nvd_by_id[cid]["epss"] for cid in cve_ids
+                       if nvd_by_id.get(cid, {}).get("epss") is not None]
+        max_epss = max(epss_values) if epss_values else None
         unscored = len(cve_ids) - len(cvss_values)
 
         # An entry point is a claim that this is worth working *now*, and that
@@ -1837,7 +1848,9 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
             continue
 
         severity = min(
-            (_cve_severity(nvd_by_id.get(cid, {}).get("cvss"), has_poc=bool(nvd_by_id.get(cid, {}).get("poc")))
+            (_cve_severity(nvd_by_id.get(cid, {}).get("cvss"),
+                           has_poc=bool(nvd_by_id.get(cid, {}).get("poc")),
+                           kev=bool(nvd_by_id.get(cid, {}).get("kev")))
              for cid in cve_ids),
             key=lambda s: ENTRY_SEVERITY_ORDER.get(s, 9))
         if h.tech_confirmed is None and severity == "critical":
@@ -1848,6 +1861,8 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
             severity = "high"
 
         cvss_note = f" (max CVSS {max_cvss})" if max_cvss is not None else ""
+        kev_note = f" [{len(kev_ids)} in CISA KEV — exploited in the wild]" if kev_ids else ""
+        epss_note = f" [max EPSS {round(max_epss * 100)}%]" if max_epss is not None else ""
         poc_note = f" [{len(poc_ids)} with public PoC]" if poc_ids else ""
         dos_note = f" [{len(dos_ids)} DoS-only CVE(s) excluded]" if dos_ids else ""
         unscored_note = f" [{unscored} unscored — run --nvd for full data]" if unscored and not cvss_values else \
@@ -1861,6 +1876,8 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                      "to compare the reported CPEs against]")
         detail = "; ".join(
             cid + (f" (CVSS {nvd_by_id[cid]['cvss']})" if nvd_by_id.get(cid, {}).get("cvss") is not None else "")
+            + (" [KEV]" if nvd_by_id.get(cid, {}).get("kev") else "")
+            + (f" [EPSS {round(nvd_by_id[cid]['epss'] * 100)}%]" if nvd_by_id.get(cid, {}).get("epss") is not None else "")
             + (" [PoC]" if nvd_by_id.get(cid, {}).get("poc") else "")
             + (f" — {nvd_by_id[cid]['desc']}" if nvd_by_id.get(cid, {}).get("desc") else "")
             for cid in ranked[:known_cve_cap])
@@ -1868,8 +1885,8 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
             detail += f"; +{len(ranked) - known_cve_cap} more"
         out.append({"type": "known-cve", "target": h.subdomain,
                    "severity": severity,
-                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{poc_note}{dos_note}"
-                              f"{unscored_note}{tech_note}: {detail}",
+                   "summary": f"{len(ranked)} known CVE(s){cvss_note}{kev_note}{epss_note}"
+                              f"{poc_note}{dos_note}{unscored_note}{tech_note}: {detail}",
                    "attck": "T1190"})
 
     # Non-web open ports — services lrecon's HTTP probe never touches, so

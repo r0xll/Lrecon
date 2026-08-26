@@ -364,6 +364,15 @@ def _tech_confirmed_label(h) -> str:
     return ""
 
 
+def _exploit_summary(h):
+    """`(kev_count, max_epss|None)` from a host's resolved CVEs — the real-world
+    exploitability signals (CISA KEV membership, EPSS probability)."""
+    nvd = getattr(h, "nvd_cves", None) or []
+    kev_n = sum(1 for c in nvd if c.get("kev"))
+    epss_v = [c["epss"] for c in nvd if c.get("epss") is not None]
+    return kev_n, (max(epss_v) if epss_v else None)
+
+
 def _format_ports_md(ports: list) -> str:
     """Bold any port outside WEB_PORTS — a non-HTTP service the probe
     pipeline never looks at, so it needs a manual look."""
@@ -934,7 +943,10 @@ def write_markdown(hosts, domains, res, path) -> None:
     if vulns:
         lines += ["", "## CVE hits (validate before reporting)", ""]
         for h in vulns:
-            lines.append(f"- **{h.subdomain}** ({', '.join(h.ips)}) {_tech_confirmed_label(h)}: "
+            kev_n, max_epss = _exploit_summary(h)
+            tag = (f" **[KEV×{kev_n}]**" if kev_n else "") + \
+                  (f" [max EPSS {round(max_epss * 100)}%]" if max_epss is not None else "")
+            lines.append(f"- **{h.subdomain}** ({', '.join(h.ips)}) {_tech_confirmed_label(h)}{tag}: "
                          f"{', '.join(h.vulns)}")
         engine = "Shodan" if any("shodan" in h.enrich_src for h in hosts) else "InternetDB"
         n_unconfirmed = sum(1 for h in vulns if h.tech_confirmed is False)
@@ -1707,9 +1719,18 @@ def write_html(hosts, domains, res, path) -> None:
                 return '<span class="sev sev-medium">UNCONFIRMED</span>'
             return "—"
 
+        def _exploit_badge(h) -> str:
+            kev_n, max_epss = _exploit_summary(h)
+            parts = []
+            if kev_n:
+                parts.append(f'<span class="sev sev-critical">KEV×{kev_n}</span>')
+            if max_epss is not None:
+                parts.append(f'EPSS {round(max_epss * 100)}%')
+            return " ".join(parts) or "—"
+
         rows = "".join(
             f'<tr><td>{esc(h.subdomain)}</td><td>{esc(", ".join(h.ips))}</td>'
-            f'<td>{_tech_confirmed_badge(h)}</td>'
+            f'<td>{_tech_confirmed_badge(h)}</td><td>{_exploit_badge(h)}</td>'
             f'<td>{esc(", ".join(h.vulns))}</td></tr>' for h in vulns)
         engine = "Shodan" if any("shodan" in h.enrich_src for h in hosts) else "InternetDB"
         n_unconfirmed = sum(1 for h in vulns if h.tech_confirmed is False)
@@ -1722,7 +1743,7 @@ def write_html(hosts, domains, res, path) -> None:
                      f'TECH-CONFIRMED hosts first.</p>')
         body = (f'{_html_export_button("t-cve", "cve_hits.csv")}'
                 f'<table id="t-cve"><tr><th>Subdomain</th><th>IP(s)</th><th>Tech-stack</th>'
-                f'<th>CVEs</th></tr>{rows}</table>{note}')
+                f'<th>Exploitability</th><th>CVEs</th></tr>{rows}</table>{note}')
         sections.append(_html_section("cve", "CVE hits (validate before reporting)", len(vulns), body))
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
