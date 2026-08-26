@@ -15,6 +15,7 @@ from .report import (write_markdown, write_html, write_live_hosts, write_csv, wr
                      write_origin_ips, screenshot_hosts)
 from .backends import available_backends
 from . import backends
+from . import cache
 from . import llm as _llm
 
 _SUBCOMMANDS = ("dossier", "enum", "full-report")
@@ -218,6 +219,11 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--nuclei", action="store_true",
                     help="run nuclei templated vuln scan on live hosts (needs nuclei binary)")
     ap.add_argument("--nuclei-severity", help="min nuclei severity (e.g. medium,high,critical)")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="bypass the on-disk enrichment cache — always fetch fresh "
+                         "(IPinfo/Shodan/NVD/KEV/EPSS/VT)")
+    ap.add_argument("--cache-ttl", type=int,
+                    help="override the enrichment-cache TTL in seconds for all namespaces")
     ap.add_argument("--no-pd", action="store_true",
                     help="force pure-Python/HTTP paths; ignore ProjectDiscovery binaries "
                          "and the psql-based crt.sh direct-DB accelerator")
@@ -378,9 +384,16 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
         active = [t for t, ok in bk.items() if ok]
         log(f"[i] optional backends: {', '.join(active) if active else 'none on PATH (pure-Python)'}")
 
+    cache.configure(enabled=not args.no_cache, ttl_override=args.cache_ttl)
+    if args.no_cache:
+        log("[i] enrichment cache: disabled (--no-cache)")
+
     t0 = time.time()
     res = asyncio.run(run(args.domains, args, keys))
     hosts = res["hosts"]
+    cst = cache.stats()
+    if not args.no_cache and (cst["hit"] or cst["miss"]):
+        log(f"[i] enrichment cache: {cst['hit']} hit(s), {cst['miss']} miss(es)")
 
     out_base = f"{args.out}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
     json_path = f"{out_base}.json"

@@ -1,4 +1,6 @@
 from __future__ import annotations
+from . import cache as _cache
+from .cache import cached
 
 # --------------------------------------------------------------------------- #
 # Real-world exploitability signals for CVE ranking (both keyless).
@@ -18,15 +20,19 @@ _EPSS_BATCH = 100                       # bounded so the query string stays sane
 
 async def load_kev(client) -> set:
     """The CISA KEV catalog as a set of CVE IDs. Empty set on any failure
-    (treated as "unknown", never as "not exploited")."""
-    try:
-        r = await client.get(CISA_KEV_URL, timeout=30)
-        if r.status_code == 200:
-            data = r.json() or {}
-            return {v.get("cveID") for v in data.get("vulnerabilities", []) if v.get("cveID")}
-    except Exception:
-        pass
-    return set()
+    (treated as "unknown", never as "not exploited"). Disk-cached (the catalog
+    is ~1MB and changes about daily)."""
+    async def _fetch():
+        try:
+            r = await client.get(CISA_KEV_URL, timeout=30)
+            if r.status_code == 200:
+                data = r.json() or {}
+                return sorted({v.get("cveID") for v in data.get("vulnerabilities", [])
+                               if v.get("cveID")})
+        except Exception:
+            pass
+        return []
+    return set(await cached("kev", "catalog", _fetch))
 
 
 async def epss_scores(client, cve_ids) -> dict:
@@ -36,9 +42,16 @@ async def epss_scores(client, cve_ids) -> dict:
     A failed batch is skipped, not fatal — partial data still ranks.
     """
     ids = [c for c in dict.fromkeys(cve_ids) if c]
-    out = {}
-    for i in range(0, len(ids), _EPSS_BATCH):
-        batch = ids[i:i + _EPSS_BATCH]
+    out, missing = {}, []
+    # Serve per-CVE from disk cache; only the misses need a network batch.
+    for cid in ids:
+        v = _cache.get("epss", cid)
+        if v is not None:
+            out[cid] = v
+        else:
+            missing.append(cid)
+    for i in range(0, len(missing), _EPSS_BATCH):
+        batch = missing[i:i + _EPSS_BATCH]
         try:
             r = await client.get(EPSS_URL, params={"cve": ",".join(batch)}, timeout=30)
             if r.status_code != 200:
@@ -46,9 +59,11 @@ async def epss_scores(client, cve_ids) -> dict:
             for row in (r.json() or {}).get("data", []):
                 cid = row.get("cve")
                 try:
-                    out[cid] = float(row.get("epss"))
+                    val = float(row.get("epss"))
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                out[cid] = val
+                _cache.put("epss", cid, val)
         except Exception:
             continue
     return out

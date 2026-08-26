@@ -812,6 +812,70 @@ async def test_epss_scores_parses_and_batches(monkeypatch):
     assert len(calls) == 2                                            # 3 ids / batch 2 -> 2 requests
 
 
+def _fresh_cache(tmp_path, monkeypatch, enabled=True):
+    from lrecon import cache
+    monkeypatch.setattr(cache, "CACHE_DIR", tmp_path)
+    monkeypatch.setattr(cache, "_enabled", enabled)      # auto-restored after test
+    monkeypatch.setattr(cache, "_ttl_override", None)
+    monkeypatch.setattr(cache, "_stats", {"hit": 0, "miss": 0})
+    return cache
+
+
+def test_cache_roundtrips_and_expires_past_ttl(tmp_path, monkeypatch):
+    cache = _fresh_cache(tmp_path, monkeypatch)
+    cache.cache_set("nvd", "cpe:x", [{"id": "CVE-1"}])
+    assert cache.cache_get("nvd", "cpe:x", ttl=100000) == [{"id": "CVE-1"}]
+    # An entry older than the TTL is a miss (age it to the epoch).
+    cache._path("nvd", "cpe:x").write_text('{"ts": 0, "value": [{"id": "CVE-1"}]}')
+    assert cache.cache_get("nvd", "cpe:x", ttl=100) is None
+
+
+async def test_cached_serves_second_call_from_disk(tmp_path, monkeypatch):
+    cache = _fresh_cache(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        return {"org": "Acme"}
+    a = await cache.cached("ipinfo", "1.2.3.4", fetch)
+    b = await cache.cached("ipinfo", "1.2.3.4", fetch)
+    assert a == b == {"org": "Acme"}
+    assert calls["n"] == 1                               # second call hit the cache
+    assert cache.stats() == {"hit": 1, "miss": 1}
+
+
+async def test_cached_disabled_always_fetches_and_never_stores_empty(tmp_path, monkeypatch):
+    cache = _fresh_cache(tmp_path, monkeypatch, enabled=False)
+    calls = {"n": 0}
+
+    async def fetch():
+        calls["n"] += 1
+        return {"x": 1}
+    await cache.cached("ipinfo", "9.9.9.9", fetch)
+    await cache.cached("ipinfo", "9.9.9.9", fetch)
+    assert calls["n"] == 2                               # disabled -> no caching
+
+    monkeypatch.setattr(cache, "_enabled", True)
+    async def empty():
+        return {}
+    await cache.cached("ipinfo", "8.8.8.8", empty)
+    assert cache.cache_get("ipinfo", "8.8.8.8", ttl=100000) is None   # empty never cached
+
+
+async def test_enrich_ipinfo_is_cached(tmp_path, monkeypatch):
+    cache = _fresh_cache(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    class _C:
+        async def get(self, url, **kw):
+            calls["n"] += 1
+            return _FakeResp(200, {"org": "AS1 Acme", "country": "US"})
+    await enrich.enrich_ipinfo(_C(), "1.1.1.1", None)
+    got = await enrich.enrich_ipinfo(_C(), "1.1.1.1", None)
+    assert got["org"] == "AS1 Acme"
+    assert calls["n"] == 1                               # second lookup served from cache
+
+
 def test_summarize_entry_points_poc_bump_raises_aggregate_severity():
     # Both CVEs are medium-tier on raw CVSS alone (neither reaches the 7.0
     # "high" threshold); the PoC bump should raise the host's overall severity

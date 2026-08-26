@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from .common import *
 from .enrich import enrich_ipinfo
 from .intel import in_cf
+from .cache import cached
 
 # --------------------------------------------------------------------------- #
 # VirusTotal domain intelligence — historical domain->IP resolutions ("hosting
@@ -186,13 +187,17 @@ def _ipinfo_asn_org(data: dict) -> tuple:
 async def vt_domain_intel(client, domain: str, api_key: str, limiter) -> dict:
     """Combined per-domain lookup — two calls against the shared rate limiter
     (VT free tier: 4 req/min). Returns {} if VT has nothing at all on the
-    domain (neither a WHOIS/DNS snapshot nor any historical resolutions)."""
-    await limiter.wait()
-    info = await vt_domain_lookup(client, domain, api_key)
-    await limiter.wait()
-    history = await vt_ip_history(client, domain, api_key)
-    if not info and not history:
-        return {}
-    info = dict(info)
-    info["ip_history"] = history
-    return info
+    domain (neither a WHOIS/DNS snapshot nor any historical resolutions).
+    Disk-cached per domain — the rate-limited two-call lookup is a prime
+    repeat-run cost."""
+    async def _fetch():
+        await limiter.wait()
+        info = await vt_domain_lookup(client, domain, api_key)
+        await limiter.wait()
+        history = await vt_ip_history(client, domain, api_key)
+        if not info and not history:
+            return {}
+        info = dict(info)
+        info["ip_history"] = history
+        return info
+    return await cached("vt", domain, _fetch)
