@@ -526,6 +526,33 @@ async def test_discover_endpoints_finds_api_docs_and_same_origin_js_secrets():
     assert any(s["kind"] == "aws-access-key" for s in host.js_secrets)  # same-origin JS
 
 
+def test_ssh_tech_extracts_openssh_version():
+    from lrecon import active
+    assert active._ssh_tech("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1") == "OpenSSH:8.9"
+    assert active._ssh_tech("SSH-2.0-Go") == "Go"
+    assert active._ssh_tech("garbage") is None
+
+
+async def test_grab_banners_captures_ssh_and_tls_and_feeds_tech(monkeypatch):
+    from lrecon import active
+    h = Host("a.x.com", ips=["1.2.3.4"], ports=[22, 443, 80])
+
+    async def fake_read(ip, port, timeout=4.0):
+        return {22: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3", 80: None}.get(port)
+
+    async def fake_cert(ip, port, **kw):
+        return {"cn": "a.x.com", "issuer": "Let's Encrypt",
+                "not_after": "2026-12-31T00:00:00"}
+    monkeypatch.setattr(active, "_read_banner", fake_read)
+    monkeypatch.setattr(active, "fetch_cert", fake_cert)
+    await active.grab_banners(h, h.ports, asyncio.Semaphore(4))
+    by_port = {b["port"]: b for b in h.banners}
+    assert by_port[22]["service"] == "ssh" and "OpenSSH_8.9" in by_port[22]["banner"]
+    assert by_port[443]["service"] == "tls" and "Let's Encrypt" in by_port[443]["banner"]
+    assert 80 not in by_port                       # a silent HTTP port yields nothing
+    assert "OpenSSH:8.9" in h.tech                 # SSH version feeds CVE confirmation
+
+
 def test_js_secret_and_open_api_doc_become_entry_points():
     from lrecon import intel
     h = Host("a.example.com", http_status=200, scheme="https",

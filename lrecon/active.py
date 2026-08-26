@@ -6,6 +6,7 @@ import httpx
 from .common import *
 from .secrets import scan_text
 from .techfp import fingerprint
+from .tlsinfo import fetch_cert, TLS_PORTS
 
 # --------------------------------------------------------------------------- #
 # Phase 4 — active
@@ -313,6 +314,72 @@ async def discover_endpoints(client, host: Host, sem, js_max: int = 8) -> None:
                 if ep not in host.endpoints:
                     host.endpoints.append(ep)
     await asyncio.gather(*(scan_js(u) for u in js_urls[:js_max]))
+
+
+_SSH_PORTS = (22, 2222)
+
+
+def _ssh_tech(banner: str) -> str | None:
+    """A tech entry from an SSH ident line, so `OpenSSH_8.9p1` feeds
+    confirm_tech_stack() the same way an HTTP fingerprint does."""
+    m = re.search(r"OpenSSH[_/]([0-9][0-9.]*)", banner or "", re.I)
+    if m:
+        return f"OpenSSH:{m.group(1)}"
+    parts = (banner or "").split("-", 2)
+    tok = parts[2].split()[0] if len(parts) > 2 and parts[2].split() else ""
+    return tok or None
+
+
+async def _read_banner(ip, port, timeout: float = 4.0) -> str | None:
+    """First bytes a service volunteers on connect (SSH/SMTP/FTP greet; HTTP
+    stays silent and yields nothing)."""
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port),
+                                                timeout=timeout)
+        data = await asyncio.wait_for(reader.read(256), timeout=timeout)
+        return data.decode("latin-1", "replace").strip() or None
+    except Exception:
+        return None
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def grab_banners(host: Host, ports, sem) -> None:
+    """Grab a service banner on each open port: a TLS cert summary on TLS ports,
+    the SSH ident on 22/2222, otherwise the first line the service volunteers.
+    Records onto `host.banners`; an SSH version also lands in `host.tech`."""
+    if not host.ips:
+        return
+    ip = host.ips[0]
+
+    async def one(port):
+        async with sem:
+            if port in TLS_PORTS:
+                cert = await fetch_cert(ip, port)
+                if cert:
+                    exp = (cert.get("not_after") or "")[:10]
+                    banner = (f"TLS cert: CN={cert.get('cn') or '?'}"
+                              f" issuer={cert.get('issuer') or '?'}"
+                              + (f" expires={exp}" if exp else ""))
+                    host.banners.append({"port": port, "service": "tls", "banner": banner})
+                    return
+            line = await _read_banner(ip, port)
+            if not line:
+                return
+            is_ssh = port in _SSH_PORTS or line.startswith("SSH-")
+            host.banners.append({"port": port, "service": "ssh" if is_ssh else "banner",
+                                 "banner": line[:200]})
+            if is_ssh:
+                t = _ssh_tech(line)
+                if t:
+                    host.tech = list(dict.fromkeys((host.tech or []) + [t]))
+    await asyncio.gather(*(one(p) for p in ports))
 
 
 async def tcp_scan(host: Host, ports, sem) -> None:

@@ -140,6 +140,9 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--active-ports", action="store_true",
                     help="async TCP connect scan of common ports (aggressive; ROE-gated)")
     ap.add_argument("--ports", help="comma-separated ports for --active-ports")
+    ap.add_argument("--no-banners", action="store_true",
+                    help="with --active-ports, skip grabbing service banners (SSH/TLS/"
+                         "greeting) on the open ports")
     ap.add_argument("--brute", action="store_true",
                     help="active DNS brute-force + permutation of the seed domains "
                          "(aggressive; ROE-gated — sends many queries at the domain's "
