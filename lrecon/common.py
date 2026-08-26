@@ -410,6 +410,10 @@ class Host:
     # [{kind, url, masked}] — never the full secret. Leads, not confirmations;
     # each becomes a (verify-me) entry point via summarize_entry_points.
     js_secrets: list = field(default_factory=list)
+    # Service banners grabbed on open ports: [{port, service, banner}] (SSH
+    # ident, TLS cert summary, generic first line). An SSH version also feeds
+    # host.tech for CVE tech-confirmation.
+    banners: list = field(default_factory=list)
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None

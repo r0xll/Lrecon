@@ -436,6 +436,7 @@ async def run(domains, args, keys) -> list:
         if not args.passive_only:
             port_sem = asyncio.Semaphore(300)
             api_sem = asyncio.Semaphore(30)      # bounds --api-scan HTTP fan-out
+            banner_sem = asyncio.Semaphore(100)  # bounds banner-grab connections
             active_hosts = [h for h in hosts.values() if h.ips and not h.wildcard]
 
             # port scan backend: naabu > pure-python tcp_scan
@@ -449,6 +450,11 @@ async def run(domains, args, keys) -> list:
                             h.ports = sorted(set(h.ports) | set(np))
                     else:
                         await tcp_scan(h, args.ports, port_sem)
+                    # Banner-grab the open ports for service/version evidence
+                    # (SSH ident, TLS cert, greeting). Same ROE tier as the scan
+                    # that just found them; --no-banners suppresses.
+                    if h.ports and not getattr(args, "no_banners", False):
+                        await grab_banners(h, h.ports, banner_sem)
                 if httpx_data is not None:
                     d = httpx_data.get(h.subdomain)
                     if d:
@@ -492,6 +498,11 @@ async def run(domains, args, keys) -> list:
                                             desc, use_prog)
 
             await probe_hosts(active_hosts)
+
+            if args.active_ports and not getattr(args, "no_banners", False):
+                n_ban = sum(len(h.banners) for h in active_hosts)
+                if n_ban:
+                    log(f"[+] banners: {n_ban} service banner(s) grabbed on open ports")
 
             if getattr(args, "api_scan", False):
                 n_docs = sum(1 for h in active_hosts for e in h.endpoints

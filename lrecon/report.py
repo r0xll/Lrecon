@@ -451,6 +451,20 @@ def write_markdown(hosts, domains, res, path) -> None:
                              f"| {s.get('url','')} |")
         lines.append("")
 
+    ban_hosts = [h for h in hosts if getattr(h, "banners", None)]
+    if ban_hosts:
+        n_ban = sum(len(h.banners) for h in ban_hosts)
+        lines += [f"## Service banners ({n_ban})", "",
+                  "Banners grabbed on open ports (SSH ident, TLS certificate, service "
+                  "greeting) — service/version evidence for triage and CVE confirmation.", "",
+                  "| Host | Port | Service | Banner |", "|---|---|---|---|"]
+        for h in ban_hosts:
+            for b in sorted(h.banners, key=lambda x: x.get("port", 0)):
+                banner = str(b.get("banner", "")).replace("|", "\\|")
+                lines.append(f"| {h.subdomain} | {b.get('port','')} | {b.get('service','')} "
+                             f"| {banner} |")
+        lines.append("")
+
     whois = res.get("whois") or {}
     if whois:
         lines += ["## Domain registration (WHOIS/RDAP)", "",
@@ -1088,6 +1102,22 @@ def write_html(hosts, domains, res, path) -> None:
                 f'not confirmations</strong>. A bundled key may be publishable or a placeholder. '
                 f'Values masked; verify per ROE.</p>')
         sections.append(_html_section("jssecrets", "Secret leads in JS bundles", n_sec, body))
+
+    # ---- Service banners ----
+    ban_hosts = [h for h in hosts if getattr(h, "banners", None)]
+    if ban_hosts:
+        n_ban = sum(len(h.banners) for h in ban_hosts)
+        rows = "".join(
+            f"<tr><td>{esc(h.subdomain)}</td><td>{esc(b.get('port'))}</td>"
+            f"<td>{esc(b.get('service'))}</td><td><code>{esc(b.get('banner'))}</code></td></tr>"
+            for h in ban_hosts
+            for b in sorted(h.banners, key=lambda x: x.get("port", 0)))
+        body = (f'{_html_export_button("t-banners", "banners.csv")}'
+                f'<table id="t-banners"><tr><th>Host</th><th>Port</th><th>Service</th>'
+                f'<th>Banner</th></tr>{rows}</table>'
+                f'<p class="note">Banners on open ports (SSH ident, TLS cert, service '
+                f'greeting) — service/version evidence for triage and CVE confirmation.</p>')
+        sections.append(_html_section("banners", "Service banners", n_ban, body))
 
     # ---- Domain registration (WHOIS/RDAP) ----
     if whois:
