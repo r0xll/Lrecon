@@ -762,6 +762,56 @@ def test_summarize_entry_points_poc_confirmed_cve_ranks_ahead_of_higher_cvss():
     assert "[PoC]" in summary
 
 
+def test_cve_severity_kev_forces_critical():
+    assert intel._cve_severity(5.0, kev=True) == "critical"           # medium -> critical
+    assert intel._cve_severity(2.0, kev=True) == "critical"           # low -> critical
+    assert intel._cve_severity(5.0, has_poc=True, kev=False) == "high"  # poc only, no KEV
+
+
+def test_summarize_entry_points_kev_cve_ranks_first_and_is_noted():
+    h = Host("legacy.x.com", tech_confirmed=True, nvd_cves=[
+        {"id": "CVE-2024-HIGH", "cvss": 8.8},
+        {"id": "CVE-2021-KEV", "cvss": 5.0, "kev": True, "epss": 0.97},
+    ])
+    eps = intel.summarize_entry_points([h], {"detected": False, "candidates": {}}, [], {}, [], [])
+    assert len(eps) == 1
+    ep = eps[0]
+    assert ep["severity"] == "critical"                              # KEV floors to critical
+    s = ep["summary"]
+    assert s.index("CVE-2021-KEV") < s.index("CVE-2024-HIGH")        # KEV ranks first
+    assert "CISA KEV" in s and "EPSS 97%" in s
+
+
+def test_kev_cve_is_capped_to_high_when_tech_unconfirmed():
+    # tech_confirmed defaults to None (no live tech data) — a KEV CVE stays a
+    # lead but must not outrank a confirmed finding, so it caps at high.
+    h = Host("legacy.x.com", nvd_cves=[{"id": "CVE-2021-KEV", "cvss": 5.0, "kev": True}])
+    eps = intel.summarize_entry_points([h], {"detected": False, "candidates": {}}, [], {}, [], [])
+    assert eps[0]["severity"] == "high"
+
+
+async def test_load_kev_parses_the_catalog():
+    from lrecon import kev
+    class _C:
+        async def get(self, url, **kw):
+            return _FakeResp(200, {"vulnerabilities": [{"cveID": "CVE-1"}, {"cveID": "CVE-2"}, {}]})
+    assert await kev.load_kev(_C()) == {"CVE-1", "CVE-2"}
+
+
+async def test_epss_scores_parses_and_batches(monkeypatch):
+    from lrecon import kev
+    monkeypatch.setattr(kev, "_EPSS_BATCH", 2)
+    calls = []
+    class _C:
+        async def get(self, url, params=None, **kw):
+            calls.append(params["cve"])
+            return _FakeResp(200, {"data": [{"cve": c, "epss": "0.5"}
+                                            for c in params["cve"].split(",")]})
+    out = await kev.epss_scores(_C(), ["CVE-1", "CVE-2", "CVE-3"])
+    assert out == {"CVE-1": 0.5, "CVE-2": 0.5, "CVE-3": 0.5}
+    assert len(calls) == 2                                            # 3 ids / batch 2 -> 2 requests
+
+
 def test_summarize_entry_points_poc_bump_raises_aggregate_severity():
     # Both CVEs are medium-tier on raw CVSS alone (neither reaches the 7.0
     # "high" threshold); the PoC bump should raise the host's overall severity
