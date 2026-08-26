@@ -2,46 +2,53 @@ from __future__ import annotations
 import asyncio, base64, ipaddress, json
 import httpx
 from .common import *
+from .cache import cached
 
 # --------------------------------------------------------------------------- #
 # Phase 3 — enrichment per UNIQUE IP
 # --------------------------------------------------------------------------- #
 async def enrich_ipinfo(client, ip, token) -> dict:
     """ASN / org / reverse-DNS / geo. Reliable regardless of scan coverage."""
-    url = f"https://ipinfo.io/{ip}/json" + (f"?token={token}" if token else "")
-    try:
-        r = await client.get(url, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return {}
+    async def _fetch():
+        url = f"https://ipinfo.io/{ip}/json" + (f"?token={token}" if token else "")
+        try:
+            r = await client.get(url, timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return {}
+    return await cached("ipinfo", ip, _fetch)
 
 
 async def enrich_shodan_host(client, ip, key, limiter) -> dict:
-    for attempt in range(3):
-        await limiter.wait()
-        try:
-            r = await client.get(f"https://api.shodan.io/shodan/host/{ip}?key={key}", timeout=20)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                await asyncio.sleep(2 * (attempt + 1))
-                continue
-            return {}
-        except Exception:
-            return {}
-    return {}
+    async def _fetch():
+        for attempt in range(3):
+            await limiter.wait()
+            try:
+                r = await client.get(f"https://api.shodan.io/shodan/host/{ip}?key={key}", timeout=20)
+                if r.status_code == 200:
+                    return r.json()
+                if r.status_code == 429:
+                    await asyncio.sleep(2 * (attempt + 1))
+                    continue
+                return {}
+            except Exception:
+                return {}
+        return {}
+    return await cached("shodan", ip, _fetch)
 
 
 async def enrich_internetdb(client, ip) -> dict:
-    try:
-        r = await client.get(f"https://internetdb.shodan.io/{ip}", timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except Exception:
-        pass
-    return {}
+    async def _fetch():
+        try:
+            r = await client.get(f"https://internetdb.shodan.io/{ip}", timeout=15)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return {}
+    return await cached("internetdb", ip, _fetch)
 
 
 def apply_ipinfo(h: Host, data: dict, ip: str | None = None) -> None:
@@ -363,21 +370,25 @@ def _parse_nvd_vuln(v: dict) -> dict:
 
 async def nvd_lookup(client, cpe: str, cache: dict, limiter) -> list:
     key = _cpe23(cpe)
-    if key in cache:
+    if key in cache:                        # per-run in-memory dedup
         return cache[key]
-    await limiter.wait()
-    out = []
-    try:
-        r = await client.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
-                            params={"virtualMatchString": key, "resultsPerPage": 20},
-                            timeout=30)
-        if r.status_code == 200:
-            for v in r.json().get("vulnerabilities", []):
-                parsed = _parse_nvd_vuln(v)
-                if parsed["id"]:
-                    out.append(parsed)
-    except Exception:
-        pass
+
+    async def _fetch():
+        await limiter.wait()
+        out = []
+        try:
+            r = await client.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                                params={"virtualMatchString": key, "resultsPerPage": 20},
+                                timeout=30)
+            if r.status_code == 200:
+                for v in r.json().get("vulnerabilities", []):
+                    parsed = _parse_nvd_vuln(v)
+                    if parsed["id"]:
+                        out.append(parsed)
+        except Exception:
+            pass
+        return out
+    out = await cached("nvd", key, _fetch)   # cross-run disk cache (dominant win)
     cache[key] = out
     return out
 
@@ -390,17 +401,20 @@ async def nvd_lookup_by_id(client, cve_id: str, cache: dict, limiter) -> dict | 
     """
     if cve_id in cache:
         return cache[cve_id]
-    await limiter.wait()
-    out = None
-    try:
-        r = await client.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
-                            params={"cveId": cve_id}, timeout=30)
-        if r.status_code == 200:
-            vulns = r.json().get("vulnerabilities", [])
-            if vulns:
-                out = _parse_nvd_vuln(vulns[0])
-    except Exception:
-        pass
+
+    async def _fetch():
+        await limiter.wait()
+        try:
+            r = await client.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
+                                params={"cveId": cve_id}, timeout=30)
+            if r.status_code == 200:
+                vulns = r.json().get("vulnerabilities", [])
+                if vulns:
+                    return _parse_nvd_vuln(vulns[0])
+        except Exception:
+            pass
+        return None
+    out = await cached("nvd_id", cve_id, _fetch)
     cache[cve_id] = out
     return out
 
