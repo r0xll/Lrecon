@@ -5,6 +5,7 @@ from urllib.parse import urljoin
 import httpx
 from .common import *
 from .secrets import scan_text
+from .techfp import fingerprint
 
 # --------------------------------------------------------------------------- #
 # Phase 4 — active
@@ -24,8 +25,13 @@ async def http_probe(client, host: Host) -> None:
             # previously only ever got data on runs where PD httpx was on PATH,
             # which meant CVE tech-confirmation silently did nothing for anyone
             # on the pure-Python path — always None, never True or False.
-            host.tech = [t for t in (host.server, host.powered_by) if t]
             body = r.text[:30000]
+            # Server/X-Powered-By plus a real fingerprint of the served page, so
+            # confirm_tech_stack() has meaningful vendor/product names to match a
+            # CVE's CPE against — headers alone almost never carried them.
+            base_tech = [t for t in (host.server, host.powered_by) if t]
+            fp = fingerprint(r.headers, body, list(getattr(r, "cookies", {}).keys()))
+            host.tech = list(dict.fromkeys(base_tech + fp))
             lo = body.lower()
             if "<title" in lo:
                 s = lo.find(">", lo.find("<title")) + 1

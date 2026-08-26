@@ -173,6 +173,47 @@ async def test_http_probe_populates_tech_so_cve_confirmation_can_run():
     assert enrich.confirm_tech_stack(h) is True
 
 
+def test_fingerprint_detects_cms_and_frameworks():
+    from lrecon import techfp
+    # WordPress via body marker + meta generator version + cookie
+    wp = techfp.fingerprint({}, '<meta name="generator" content="WordPress 6.4.2">'
+                            '<link href="/wp-content/x.css">', ["wordpress_logged_in_abc"])
+    assert "WordPress:6.4.2" in wp
+    # Drupal via header; Next.js via body marker; ASP.NET version via header
+    assert "Drupal" in techfp.fingerprint({"X-Drupal-Cache": "HIT"}, "", [])
+    assert "Next.js" in techfp.fingerprint({}, '<script id="__NEXT_DATA__">{}</script>', [])
+    assert "ASP.NET:4.0.30319" in techfp.fingerprint({"X-AspNet-Version": "4.0.30319"}, "", [])
+    # Django via cookie
+    assert "Django" in techfp.fingerprint({}, "", ["csrftoken", "sessionid"])
+
+
+def test_fingerprint_is_quiet_on_a_plain_page_and_ignores_powered_by():
+    from lrecon import techfp
+    # A bare page yields nothing; X-Powered-By is left to the caller's base tech.
+    assert techfp.fingerprint({"X-Powered-By": "PHP/7.4"},
+                              "<html><body>hello</body></html>", []) == []
+
+
+async def test_http_probe_fingerprints_the_body_for_cve_confirmation():
+    from lrecon import active, enrich
+    class _Resp:
+        status_code = 200
+        headers = {"server": "Apache"}
+        text = '<html><meta name="generator" content="WordPress 6.4.2">' \
+               '<div class="wp-content"></div></html>'
+        url = "https://a.x.com/"
+        cookies = {"wordpress_test": "1"}
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _Resp()
+    h = Host("a.x.com", cpes=["cpe:2.3:a:wordpress:wordpress:6.4.2:*:*:*:*:*:*:*"])
+    await active.http_probe(_C(), h)
+    assert any(t.startswith("WordPress") for t in h.tech)
+    # Was None before (headers alone never named WordPress); now confirms live.
+    assert enrich.confirm_tech_stack(h) is True
+
+
 def test_confirm_tech_stack_none_when_no_live_tech_or_no_cpes():
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=["cpe:2.3:a:x:y:1:*"], tech=[])) is None
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=[], tech=["nginx"])) is None
