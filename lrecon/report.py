@@ -935,8 +935,8 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append("")
 
     lines += ["## Attack surface", "",
-              "| Subdomain | IP(s) | ASN / Org | Country | Open Ports | Tech | HTTP | CVEs |",
-              "|---|---|---|---|---|---|---|---|"]
+              "| Subdomain | IP(s) | ASN / Org | Country | Open Ports | Tech | WAF/CDN | HTTP | CVEs |",
+              "|---|---|---|---|---|---|---|---|---|"]
     for h in hosts:
         if h.wildcard:
             continue
@@ -947,7 +947,7 @@ def write_markdown(hosts, domains, res, path) -> None:
         http = f"{h.scheme} {h.http_status}" if h.http_status else "—"
         v = ", ".join(h.vulns[:5]) + ("…" if len(h.vulns) > 5 else "") if h.vulns else "—"
         lines.append(f"| {h.subdomain} | {ips} | {asn_org} | {host_countries(h)} | {ports} "
-                     f"| {tech} | {http} | {v} |")
+                     f"| {tech} | {getattr(h, 'waf', None) or '—'} | {http} | {v} |")
     if any(non_web_ports(h.ports) for h in hosts if not h.wildcard):
         lines.append("")
         lines.append("> **Bold** ports are non-web services (SSH, RDP, databases, etc.) — the "
@@ -1724,9 +1724,11 @@ def write_html(hosts, domains, res, path) -> None:
             f"<td>{esc(host_countries(h))}</td>"
             f"<td>{_format_ports_html(h.ports)}</td>"
             f"<td>{esc(h.server or h.powered_by or None)}</td>"
+            f"<td>{esc(getattr(h, 'waf', None))}</td>"
             f"<td>{(str(h.http_status) if h.http_status else '—')}</td>"
             f"<td>{esc(cves)}</td></tr>")
-    as_cols = ["Subdomain", "IP(s)", "ASN/Org", "Country", "Open Ports", "Tech", "HTTP", "CVEs"]
+    as_cols = ["Subdomain", "IP(s)", "ASN/Org", "Country", "Open Ports", "Tech", "WAF/CDN",
+               "HTTP", "CVEs"]
     body = (f'{_html_export_button("t-attacksurface", "attack_surface.csv")}'
             f'{_html_filter_toolbar("t-attacksurface")}'
             f'<table id="t-attacksurface" data-filterable="1">'

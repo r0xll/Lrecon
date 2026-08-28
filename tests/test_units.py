@@ -260,6 +260,42 @@ async def test_http_probe_captures_security_headers():
     assert h.sec_headers["cookies"][0]["secure"] is True
 
 
+def test_fingerprint_waf_identifies_major_cdns():
+    from lrecon import waf
+    assert waf.fingerprint_waf({"CF-Ray": "abc", "Server": "cloudflare"}) == "Cloudflare"
+    assert waf.fingerprint_waf({"X-Akamai-Transformed": "9", "Server": "AkamaiGHost"}) == "Akamai"
+    assert waf.fingerprint_waf({"X-Amz-Cf-Id": "xyz", "Via": "1.1 x.cloudfront.net"}) == "CloudFront"
+    assert waf.fingerprint_waf({"X-Served-By": "cache-lhr", "Via": "1.1 varnish"}) == "Fastly"
+    assert waf.fingerprint_waf({"X-Iinfo": "1-2-3"}) == "Imperva Incapsula"
+    assert waf.fingerprint_waf({"X-Sucuri-ID": "1", "Server": "Sucuri/Cloudproxy"}) == "Sucuri"
+    assert waf.fingerprint_waf({"Server": "nginx"}) is None
+
+
+def test_fingerprint_waf_falls_back_to_cloudflare_ip_range():
+    import ipaddress
+    from lrecon import waf
+    from lrecon.common import CF_FALLBACK
+    nets = [ipaddress.ip_network(c) for c in CF_FALLBACK]
+    assert waf.fingerprint_waf({"Server": "nginx"}, ip="104.16.5.5", cf_nets=nets) == "Cloudflare"
+
+
+async def test_http_probe_captures_waf():
+    from lrecon import active
+    class _Resp:
+        status_code = 200
+        headers = {"server": "cloudflare", "cf-ray": "7a-LHR"}
+        text = "<html></html>"
+        url = "https://a.x.com/"
+        cookies = {}
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _Resp()
+    h = Host("a.x.com")
+    await active.http_probe(_C(), h)
+    assert h.waf == "Cloudflare"
+
+
 def test_confirm_tech_stack_none_when_no_live_tech_or_no_cpes():
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=["cpe:2.3:a:x:y:1:*"], tech=[])) is None
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=[], tech=["nginx"])) is None
@@ -4323,7 +4359,7 @@ def test_attack_surface_table_is_filterable():
     # One input per column of *this* table — a mismatch silently shifts every
     # filter onto the wrong column.
     table = content.split('id="t-attacksurface"')[1].split("</table>")[0]
-    assert table.count("<th>") == table.count('class="filter-input"') == 8
+    assert table.count("<th>") == table.count('class="filter-input"') == 9
     assert 'class="filtercount" data-for="t-attacksurface"' in content
     assert "resetFilters('t-attacksurface')" in content
     # The syntax is explained *above* the boxes it describes, not in a note

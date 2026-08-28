@@ -432,6 +432,9 @@ class Host:
     # HTTP security posture of the response: CSP/HSTS/X-Frame-Options/etc. and
     # per-cookie Secure/HttpOnly/SameSite flags (see headers.security_headers).
     sec_headers: dict = field(default_factory=dict)
+    # CDN/WAF fronting the host, from response headers (Cloudflare, Akamai,
+    # Fastly, CloudFront, Imperva, Sucuri) — see waf.fingerprint_waf.
+    waf: str | None = None
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None
