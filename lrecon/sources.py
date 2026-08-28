@@ -479,6 +479,20 @@ def get_resolver(nameservers):
     return _RESOLVER
 
 
+async def ns_records(name: str, nameservers) -> list:
+    """The delegated nameserver hostnames for `name` (its NS RRset), lowercased.
+    Empty on NXDOMAIN/NoAnswer/failure — the caller decides what an absence
+    means."""
+    if not _HAVE_DNS:
+        return []
+    res = get_resolver(nameservers)
+    try:
+        ans = await res.resolve(name, "NS")
+        return sorted({str(r.target).rstrip(".").lower() for r in ans})
+    except Exception:
+        return []
+
+
 async def resolve_full(subdomain: str, nameservers) -> tuple:
     """Resolve a name to `(ips, cname, nxdomain)`.
 
