@@ -1707,6 +1707,40 @@ async def test_email_security_keeps_full_records_and_dkim_selector(monkeypatch):
     assert out["grade"] == "PASS" and out["issues"] == []
 
 
+async def test_email_security_flags_spf_softfail_and_records_dane(monkeypatch):
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord("v=spf1 ip4:1.2.3.4 ~all")],
+        ("x.test", "MX"): [_FakeMXRecord("mail.x.test", 10)],
+        ("_25._tcp.mail.x.test", "TLSA"): [object()],
+    }
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    # Grade-neutral advisory, not a graded issue (~all is common/deliberate).
+    assert any("~all (softfail)" in n for n in out["notes"])
+    assert not any("softfail" in i for i in out["issues"])
+    assert out["dane"] is True and out["dane_mx"] == ["mail.x.test"]
+
+
+async def test_email_security_no_softfail_note_on_hardfail_and_dane_absent(monkeypatch):
+    answers = {
+        ("x.test", "TXT"): [_FakeTXTRecord("v=spf1 ip4:1.2.3.4 -all")],
+        ("x.test", "MX"): [_FakeMXRecord("mail.x.test", 10)],   # no TLSA configured
+    }
+    monkeypatch.setattr(intel, "get_resolver", lambda ns: _FakeDNSResolver(answers))
+    out = await intel.email_security("x.test", None)
+    assert not any("softfail" in i for i in out["issues"])
+    assert out["dane"] is False and out["dane_mx"] == []
+
+
+def test_mx_banner_suggestion_only_for_self_hosted_mx():
+    assert intel.mx_banner_suggestion([{"host": "aspmx.l.google.com", "provider": "Google"}]) is None
+    s = intel.mx_banner_suggestion([{"host": "mail.corp.test", "provider": None}])
+    assert s and "mail.corp.test" in s and "SMTP banner" in s
+    # RFC 7505 null MX (MX 0 .) -> empty host, no provider: the domain accepts
+    # no mail, so it must not be treated as a self-hosted banner-grab target.
+    assert intel.mx_banner_suggestion([{"host": "", "provider": None}]) is None
+
+
 def test_parse_spf_marks_its_lookup_count_incomplete_when_the_record_delegates():
     """parse_spf is deliberately I/O-free, so its count covers only the apex
     record. That is the complete figure when nothing delegates, and a lower bound
