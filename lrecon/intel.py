@@ -623,7 +623,8 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
            "dkim_selectors_checked": list(DKIM_SELECTORS),
            "spf_parsed": {}, "dmarc_parsed": {}, "issues": [],
            "mta_sts": None, "mta_sts_policy": None, "mta_sts_mode": None,
-           "tls_rpt": None, "lookup_errors": [],
+           "tls_rpt": None, "lookup_errors": [], "dane": None, "dane_mx": [],
+           "notes": [],
            "spf_include_health": [], "spf_vendors": [], "dmarc_vendors": []}
 
     async def txt(name):
@@ -666,6 +667,12 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
         out["issues"].append("SPF +all — permits any sender (critical)")
     elif "~all" not in spf and "-all" not in spf:
         out["issues"].append("SPF missing hard/soft fail (~all/-all)")
+    elif "~all" in spf and "-all" not in spf:
+        # A grade-neutral advisory, not an issue: ~all is common and often a
+        # deliberate choice, so flagging it as a defect would inflate every such
+        # domain to WARN. Surface it so the operator sees the weaker posture.
+        out["notes"].append("SPF ~all (softfail) — weaker than -all (hardfail); "
+                            "receivers may still accept unauthenticated mail")
     if spf:
         # Expand include:/redirect= so the lookup budget is measured the way a
         # receiver spends it. Without this the count is top-level only, and the
@@ -788,6 +795,27 @@ async def email_security(domain: str, resolver_ns, client=None) -> dict:
                 "MTA-STS mode=testing — TLS failures are reported, not enforced")
         elif out["mta_sts_mode"] == "none":
             out["issues"].append("MTA-STS mode=none — the policy is explicitly disabled")
+
+    # ---- DANE / TLSA on the MX hosts ----
+    # TLSA records let a sender cryptographically pin the MX's TLS certificate
+    # (RFC 7672), closing the same STARTTLS-stripping gap MTA-STS addresses.
+    # Like MTA-STS, plain absence is the norm and is reported as a field, not an
+    # issue (which would inflate every domain's grade) — only presence is noted.
+    mx_hosts = []
+    try:
+        mx_ans = await res.resolve(domain, "MX")
+        mx_hosts = sorted({str(r.exchange).rstrip(".").lower() for r in mx_ans})
+    except Exception:
+        pass
+    dane_mx = []
+    for mx in mx_hosts:
+        try:
+            await res.resolve(f"_25._tcp.{mx}", "TLSA")
+            dane_mx.append(mx)
+        except Exception:
+            pass
+    out["dane"] = bool(dane_mx)
+    out["dane_mx"] = dane_mx
 
     sev = len([i for i in out["issues"] if "risk" in i or "critical" in i])
     out["grade"] = "FAIL" if sev else ("WARN" if out["issues"] else "PASS")
@@ -954,6 +982,19 @@ def _classify_mail_provider(mx_host: str) -> str | None:
         if any(p in h for p in patterns):
             return name
     return None
+
+
+def mx_banner_suggestion(mail_infra) -> str | None:
+    """A self-hosted MX (not a recognised SaaS provider) is worth an SMTP banner
+    grab to fingerprint the mail-server software/version. Returns a report
+    recommendation, or None when every MX is a managed provider."""
+    self_hosted = [e["host"] for e in (mail_infra or []) if not e.get("provider")]
+    if not self_hosted:
+        return None
+    shown = ", ".join(self_hosted[:3]) + (f", +{len(self_hosted) - 3} more"
+                                          if len(self_hosted) > 3 else "")
+    return (f"Self-hosted MX ({shown}) — grab the SMTP banner (ports 25/465/587 "
+            f"via --active-ports) to fingerprint the mail-server version")
 
 
 async def mail_infra_lookup(client, mx_records: list, ipinfo_token: str | None, resolver_ns) -> list:

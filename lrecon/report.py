@@ -3,7 +3,7 @@ import asyncio, csv, json
 from datetime import datetime, timezone
 from pathlib import Path
 from .common import *
-from .intel import DKIM_SELECTORS, SPF_MAX_LOOKUPS
+from .intel import DKIM_SELECTORS, SPF_MAX_LOOKUPS, mx_banner_suggestion
 from .headers import header_gaps
 
 # --------------------------------------------------------------------------- #
@@ -796,6 +796,12 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"- **TLS-RPT:** "
                          + (f"`{e['tls_rpt']}`" if e.get("tls_rpt")
                             else "not published — no reporting of SMTP TLS failures"))
+            lines.append(f"- **DANE/TLSA:** "
+                         + (f"present on {', '.join(e['dane_mx'])}" if e.get("dane")
+                            else "not published — MX certs not DNS-pinned"))
+            mx_sugg = mx_banner_suggestion((res.get("mail_infra") or {}).get(d))
+            if mx_sugg:
+                lines.append(f"- **Recommendation:** {mx_sugg}")
             services = _email_services(e)
             if services:
                 lines.append("- **Detected services:** "
@@ -810,6 +816,10 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines += ["**Issues:**", ""]
             lines += [f"- {i}" for i in issues] if issues else ["- none"]
             lines.append("")
+            notes = e.get("notes") or []
+            if notes:
+                lines += ["**Notes (advisory, grade-neutral):**", ""]
+                lines += [f"- {n}" for n in notes] + [""]
             if e.get("lookup_errors"):
                 lines += [f"> DNS lookups failed for this domain "
                           f"({'; '.join(e['lookup_errors'])}) — the affected mechanisms are "
@@ -1620,6 +1630,11 @@ def write_html(hosts, domains, res, path) -> None:
             details.append("MTA-STS: " + _md_emph_to_html(_mta_sts_text(e)))
             details.append("TLS-RPT: " + (f"<code>{esc(e['tls_rpt'])}</code>"
                                           if e.get("tls_rpt") else "not published"))
+            details.append("DANE/TLSA: " + (f"present on {esc(', '.join(e['dane_mx']))}"
+                                            if e.get("dane") else "not published"))
+            mx_sugg = mx_banner_suggestion(mail_infra.get(d))
+            if mx_sugg:
+                details.append(f"<strong>Recommendation:</strong> {esc(mx_sugg)}")
             for kind, names in _email_services(e):
                 details.append(f"Detected {esc(kind)}: "
                                + ", ".join(f"<strong>{esc(n)}</strong>" for n in names))
@@ -1633,6 +1648,9 @@ def write_html(hosts, domains, res, path) -> None:
                      + ("".join(f"<li>{esc(i)}</li>" for i in issues)
                         if issues else "<li>none</li>")
                      + "</ul>"
+                     + ((f'<p><strong>Notes (advisory, grade-neutral):</strong></p><ul>'
+                         + "".join(f"<li>{esc(n)}</li>" for n in (e.get("notes") or []))
+                         + "</ul>") if e.get("notes") else "")
                      + (f'<p><strong>Phishing posture:</strong> '
                         f'{_md_emph_to_html((e.get("phishing_posture") or {})["summary"])}</p>'
                         if (e.get("phishing_posture") or {}).get("summary") else "")
