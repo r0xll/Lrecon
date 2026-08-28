@@ -214,6 +214,52 @@ async def test_http_probe_fingerprints_the_body_for_cve_confirmation():
     assert enrich.confirm_tech_stack(h) is True
 
 
+def test_security_headers_parses_headers_and_cookie_flags():
+    from lrecon import headers
+    hdr = {"Strict-Transport-Security": "max-age=63072000; includeSubDomains; preload",
+           "Content-Security-Policy": "default-src 'self'", "X-Content-Type-Options": "nosniff"}
+    cookies = ["sid=abc; Path=/; Secure; HttpOnly; SameSite=Lax", "trk=1; Path=/"]
+    sec = headers.security_headers(hdr, cookies)
+    assert sec["hsts"] == {"max_age": 63072000, "include_subdomains": True, "preload": True}
+    assert sec["csp"] == "default-src 'self'"
+    by = {c["name"]: c for c in sec["cookies"]}
+    assert by["sid"]["secure"] and by["sid"]["httponly"] and by["sid"]["samesite"] == "lax"
+    assert not by["trk"]["secure"] and not by["trk"]["httponly"]
+
+
+def test_header_gaps_flags_missing_and_clears_when_hardened():
+    from lrecon import headers
+    sec = headers.security_headers({"Content-Security-Policy": "x"}, ["sid=1; Path=/"])
+    gaps = headers.header_gaps(sec, scheme="https")
+    assert "no HSTS" in gaps and "no X-Content-Type-Options" in gaps
+    assert any("cookie 'sid' missing" in g for g in gaps)
+    assert not any("X-Frame-Options" in g for g in gaps)      # CSP supersedes XFO
+    hardened = headers.security_headers({
+        "Strict-Transport-Security": "max-age=1", "Content-Security-Policy": "x",
+        "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer", "Permissions-Policy": "geolocation=()"}, [])
+    assert headers.header_gaps(hardened, "https") == []
+
+
+async def test_http_probe_captures_security_headers():
+    from lrecon import active
+    class _Resp:
+        status_code = 200
+        headers = {"server": "nginx", "Strict-Transport-Security": "max-age=100",
+                   "set-cookie": "sid=1; Secure; HttpOnly"}
+        text = "<html></html>"
+        url = "https://a.x.com/"
+        cookies = {}
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _Resp()
+    h = Host("a.x.com")
+    await active.http_probe(_C(), h)
+    assert h.sec_headers["hsts"]["max_age"] == 100
+    assert h.sec_headers["cookies"][0]["secure"] is True
+
+
 def test_confirm_tech_stack_none_when_no_live_tech_or_no_cpes():
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=["cpe:2.3:a:x:y:1:*"], tech=[])) is None
     assert enrich.confirm_tech_stack(Host("a.x.com", cpes=[], tech=["nginx"])) is None

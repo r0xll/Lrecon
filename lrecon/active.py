@@ -6,7 +6,18 @@ import httpx
 from .common import *
 from .secrets import scan_text
 from .techfp import fingerprint
+from .headers import security_headers
 from .tlsinfo import fetch_cert, TLS_PORTS
+
+
+def _set_cookie_list(r) -> list:
+    """Every Set-Cookie header on the response (httpx multidict or a plain
+    dict stub in tests)."""
+    h = r.headers
+    if hasattr(h, "get_list"):
+        return h.get_list("set-cookie")
+    v = h.get("set-cookie") if hasattr(h, "get") else None
+    return [v] if v else []
 
 # --------------------------------------------------------------------------- #
 # Phase 4 — active
@@ -33,6 +44,7 @@ async def http_probe(client, host: Host) -> None:
             base_tech = [t for t in (host.server, host.powered_by) if t]
             fp = fingerprint(r.headers, body, list(getattr(r, "cookies", {}).keys()))
             host.tech = list(dict.fromkeys(base_tech + fp))
+            host.sec_headers = security_headers(r.headers, _set_cookie_list(r))
             lo = body.lower()
             if "<title" in lo:
                 s = lo.find(">", lo.find("<title")) + 1
