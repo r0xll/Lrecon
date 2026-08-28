@@ -2509,6 +2509,27 @@ def test_mark_dangling_cname_confirms_only_a_claimable_provider():
     assert "s3.amazonaws.com" in h.takeover and "claimable" in h.takeover
 
 
+def test_takeover_table_covers_new_providers():
+    # SELF_SERVE provider (re-registrable) -> confirmed; ACCOUNT_BOUND
+    # (domain-verified) -> possible. Extends the table, reuses the logic.
+    h = Host("dev.x.com", cname="myrepo.bitbucket.io")
+    active.mark_dangling_cname(h, "nxdomain")
+    assert h.takeover_confidence == "confirmed"          # bitbucket.io is SELF_SERVE
+    h2 = Host("app.x.com", cname="app.netlify.app")
+    active.mark_dangling_cname(h2, "nxdomain")
+    assert h2.takeover_confidence == "possible"          # netlify.app is ACCOUNT_BOUND
+
+
+def test_ns_takeover_becomes_a_zone_level_entry_point():
+    from lrecon import intel
+    h = Host("example.com", ns_takeover="Delegated nameserver ns1.dead.example does "
+             "not exist (NXDOMAIN); ... controls this zone's DNS")
+    eps = intel.summarize_entry_points([h], {"detected": False, "candidates": {}}, [], {}, [], [])
+    ns = [e for e in eps if e["type"] == "ns-takeover"]
+    assert len(ns) == 1 and ns[0]["severity"] == "high"
+    assert ns[0]["attck"] == "T1584.002"
+
+
 def test_mark_dangling_cname_does_not_claim_an_unknown_target_is_takeable():
     """Regression for the critical-severity false positive: a broken CNAME to a
     typo under a partner's domain is NXDOMAIN, but nobody outside that partner

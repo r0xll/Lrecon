@@ -1722,6 +1722,13 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                        "summary": h.takeover, "attck": "T1584.001",
                        "confidence": h.takeover_confidence})
 
+        if getattr(h, "ns_takeover", None):
+            # A dangling NS delegation is a zone-level takeover — worse reach
+            # than a single record, but claimability of the NS name is unverified
+            # here, so it's a high lead rather than an auto-critical.
+            out.append({"type": "ns-takeover", "target": h.subdomain, "severity": "high",
+                       "summary": h.ns_takeover, "attck": "T1584.002"})
+
         # Archived paths that answered live again on a sensitive route — a
         # forgotten admin panel / old app is a real initial-access lead. A 200
         # is worse than an auth-walled 401/403 (reachable without creds).

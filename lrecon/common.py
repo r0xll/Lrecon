@@ -220,6 +220,21 @@ TAKEOVER_SIGS = {
     # ID are AWS-assigned. Deleting the load balancer retires the name for good;
     # no one, including the account that owned it, can ask for it back.
     "elb.amazonaws.com":    (NOT_CLAIMABLE, []),
+    # --- Common PaaS/SaaS providers (extends the table, not the logic) ---
+    # First-come claimable subdomains: an unclaimed name is re-registrable by
+    # anyone, so a dead CNAME here is a confirmed takeover.
+    "gitlab.io":            (SELF_SERVE,    ["the page you're looking for could not be found"]),
+    "web.app":              (SELF_SERVE,    ["site not found", "the specified bucket does not exist"]),
+    "firebaseapp.com":      (SELF_SERVE,    ["site not found"]),
+    "bitbucket.io":         (SELF_SERVE,    ["repository not found"]),
+    "freshdesk.com":        (SELF_SERVE,    ["may have been moved or deleted"]),
+    # Provider-assigned / domain-verified: the hostname is attachable only after
+    # the provider's domain verification, so a dead CNAME here is "possible",
+    # not confirmed (mark_dangling_cname keeps it at that confidence).
+    "netlify.app":          (ACCOUNT_BOUND, ["not found - request id"]),
+    "vercel.app":           (ACCOUNT_BOUND, ["the deployment could not be found", "404: not_found"]),
+    "myshopify.com":        (ACCOUNT_BOUND, ["sorry, this shop is currently unavailable"]),
+    "statuspage.io":        (ACCOUNT_BOUND, []),
 }
 
 # Cloudflare published ranges (fallback if live fetch fails)
@@ -430,6 +445,9 @@ class Host:
     # an attacker, and filing it as a takeover lead sends someone chasing a name
     # that cannot be registered.
     stale_dns: str | None = None
+    # A delegated nameserver for this zone that no longer resolves — whoever can
+    # register the NS name controls the zone's DNS (a zone-level takeover).
+    ns_takeover: str | None = None
     wildcard: bool = False
     # Set only when resolution definitively returned NXDOMAIN — the name does not
     # exist. Deliberately distinct from "no IPs": a timeout or SERVFAIL also

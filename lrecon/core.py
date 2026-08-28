@@ -388,6 +388,30 @@ async def run(domains, args, keys) -> list:
                     log(f"[!] {n_dangling} dangling CNAME(s) — subdomain-takeover "
                         f"candidate(s) with a non-existent target")
 
+            # ---- Dangling-NS (zone) takeover leads ----
+            # A delegated nameserver whose own name no longer resolves means
+            # whoever can register that NS name controls this zone's DNS — a
+            # takeover a level above the per-record CNAME case. Bounded to the
+            # seed domains (their apex NS RRset), where a broken delegation is
+            # most impactful; DNS-only, same touch tier as resolution.
+            n_ns = 0
+            for d in domains:
+                seed = hosts.get(d)
+                if not seed:
+                    continue
+                for nsname in await ns_records(d, ns):
+                    _ips, _cn, ns_nx = await resolve_full(nsname, ns)
+                    if ns_nx:
+                        seed.ns_takeover = (
+                            f"Delegated nameserver {nsname} does not exist (NXDOMAIN); "
+                            f"if its name is registrable, an attacker who registers it "
+                            f"controls this zone's DNS — verify claimability")
+                        n_ns += 1
+                        break
+            if n_ns:
+                log(f"[!] {n_ns} domain(s) with a dangling NS delegation — potential "
+                    f"zone takeover")
+
         # ---- Seed operator-supplied IP / CIDR targets ----
         # These skip Phase 1 (nothing to enumerate) and Phase 2 (no DNS on an IP
         # literal) and join here with their address already attached, so the
