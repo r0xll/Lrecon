@@ -414,6 +414,9 @@ class Host:
     # ident, TLS cert summary, generic first line). An SSH version also feeds
     # host.tech for CVE tech-confirmation.
     banners: list = field(default_factory=list)
+    # HTTP security posture of the response: CSP/HSTS/X-Frame-Options/etc. and
+    # per-cookie Secure/HttpOnly/SameSite flags (see headers.security_headers).
+    sec_headers: dict = field(default_factory=dict)
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None

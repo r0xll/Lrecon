@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from .common import *
 from .intel import DKIM_SELECTORS, SPF_MAX_LOOKUPS
+from .headers import header_gaps
 
 # --------------------------------------------------------------------------- #
 # Reporting
@@ -472,6 +473,18 @@ def write_markdown(hosts, domains, res, path) -> None:
                 banner = str(b.get("banner", "")).replace("|", "\\|")
                 lines.append(f"| {h.subdomain} | {b.get('port','')} | {b.get('service','')} "
                              f"| {banner} |")
+        lines.append("")
+
+    sh_rows = [(h, header_gaps(h.sec_headers, h.scheme or "https"))
+               for h in hosts if getattr(h, "sec_headers", None)]
+    sh_rows = [(h, g) for h, g in sh_rows if g]
+    if sh_rows:
+        lines += [f"## Security headers ({len(sh_rows)} host(s) with gaps)", "",
+                  "Missing HTTP hardening headers and insecure cookie flags on live hosts "
+                  "— defensive gaps, not initial-access vectors.", "",
+                  "| Host | Missing / weak |", "|---|---|"]
+        for h, gaps in sh_rows:
+            lines.append(f"| {h.subdomain} | {'; '.join(gaps)} |")
         lines.append("")
 
     whois = res.get("whois") or {}
@@ -1130,6 +1143,21 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<p class="note">Banners on open ports (SSH ident, TLS cert, service '
                 f'greeting) — service/version evidence for triage and CVE confirmation.</p>')
         sections.append(_html_section("banners", "Service banners", n_ban, body))
+
+    # ---- Security headers ----
+    sh_rows = [(h, header_gaps(h.sec_headers, h.scheme or "https"))
+               for h in hosts if getattr(h, "sec_headers", None)]
+    sh_rows = [(h, g) for h, g in sh_rows if g]
+    if sh_rows:
+        rows = "".join(
+            f"<tr><td>{esc(h.subdomain)}</td><td>{esc('; '.join(gaps))}</td></tr>"
+            for h, gaps in sh_rows)
+        body = (f'{_html_export_button("t-secheaders", "security_headers.csv")}'
+                f'<table id="t-secheaders"><tr><th>Host</th><th>Missing / weak</th></tr>'
+                f'{rows}</table>'
+                f'<p class="note">Missing HTTP hardening headers and insecure cookie flags '
+                f'on live hosts — defensive gaps, not initial-access vectors.</p>')
+        sections.append(_html_section("secheaders", "Security headers", len(sh_rows), body))
 
     # ---- Domain registration (WHOIS/RDAP) ----
     if whois:
