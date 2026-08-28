@@ -988,7 +988,11 @@ def mx_banner_suggestion(mail_infra) -> str | None:
     """A self-hosted MX (not a recognised SaaS provider) is worth an SMTP banner
     grab to fingerprint the mail-server software/version. Returns a report
     recommendation, or None when every MX is a managed provider."""
-    self_hosted = [e["host"] for e in (mail_infra or []) if not e.get("provider")]
+    # Skip a null MX (RFC 7505 `MX 0 .`): dns_lookup stores its exchange as an
+    # empty host, which has no provider — but the domain has explicitly declared
+    # it accepts no mail, so there is nothing to banner-grab.
+    self_hosted = [h for e in (mail_infra or [])
+                   if not e.get("provider") and (h := (e.get("host") or "").strip())]
     if not self_hosted:
         return None
     shown = ", ".join(self_hosted[:3]) + (f", +{len(self_hosted) - 3} more"

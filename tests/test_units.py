@@ -1736,6 +1736,9 @@ def test_mx_banner_suggestion_only_for_self_hosted_mx():
     assert intel.mx_banner_suggestion([{"host": "aspmx.l.google.com", "provider": "Google"}]) is None
     s = intel.mx_banner_suggestion([{"host": "mail.corp.test", "provider": None}])
     assert s and "mail.corp.test" in s and "SMTP banner" in s
+    # RFC 7505 null MX (MX 0 .) -> empty host, no provider: the domain accepts
+    # no mail, so it must not be treated as a self-hosted banner-grab target.
+    assert intel.mx_banner_suggestion([{"host": "", "provider": None}]) is None
 
 
 def test_parse_spf_marks_its_lookup_count_incomplete_when_the_record_delegates():
