@@ -438,6 +438,10 @@ class Host:
     # Analytics/marketing IDs on the page ({ga/gtm/fb: [ids]}) — an ownership
     # fingerprint; hosts sharing one are the same team's (see pixels.py).
     tracking_ids: dict = field(default_factory=dict)
+    # Composite attack-surface score (0-100) and its human-readable contributors,
+    # computed in core.run from this host's signals (see intel.risk_score).
+    risk_score: int = 0
+    risk_factors: list = field(default_factory=list)
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None

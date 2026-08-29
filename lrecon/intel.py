@@ -1757,6 +1757,70 @@ def correlate_tracking_ids(hosts) -> dict:
     return {tid: sorted(hs) for tid, hs in by_id.items() if len(hs) > 1}
 
 
+def entry_points_for_host(host, entry_points) -> list:
+    """The subset of `entry_points` attributable to `host`. Host-derived entries
+    set `target` to the subdomain, or the subdomain followed by a path (`/…`) or
+    a qualifier (` (…)`); domain-level entries (AXFR, CF origin, buckets, breach)
+    are not host-scoped and are left out of a host's score."""
+    sub = host.subdomain
+    out = []
+    for ep in entry_points or []:
+        t = ep.get("target", "")
+        if t == sub or t.startswith(sub + "/") or t.startswith(sub + " "):
+            out.append(ep)
+    return out
+
+
+# Weight each severity band contributes to a host's composite score. Critical
+# dominates so a single confirmed vector floats the host to the top; the lower
+# bands accumulate so a host with many medium/low leads still ranks.
+_RISK_SEVERITY_WEIGHTS = {"critical": 40, "high": 25, "medium": 10, "low": 3}
+
+
+def risk_score(host, host_entry_points) -> tuple:
+    """`(score, factors)` — a pure, capped-at-100 composite of the signals already
+    collected for `host`, so the report can lead with "work these first". `factors`
+    is the human-readable list of contributors, so the score is auditable rather
+    than a black box. `host_entry_points` is this host's slice of the run's entry
+    points (see entry_points_for_host)."""
+    from .headers import header_gaps
+    score = 0
+    factors = []
+
+    # Severity-ranked entry points dominate — they are the actual initial-access
+    # leads summarize_entry_points already surfaced.
+    by_sev = {}
+    for ep in host_entry_points or []:
+        by_sev[ep.get("severity")] = by_sev.get(ep.get("severity"), 0) + 1
+    for sev, weight in _RISK_SEVERITY_WEIGHTS.items():
+        n = by_sev.get(sev, 0)
+        if n:
+            score += weight * n
+            factors.append(f"{n} {sev} entry point{'s' if n > 1 else ''} (+{weight * n})")
+
+    # Open non-web ports — service surface the HTTP pipeline never touches.
+    nwp = non_web_ports(host.ports)
+    if nwp:
+        score += 8
+        factors.append(f"{len(nwp)} non-web port(s) open: {', '.join(map(str, nwp))} (+8)")
+
+    live_web = bool(host.http_status) and not host.wildcard
+    if live_web:
+        # A live web host with no WAF/CDN in front is directly reachable.
+        if not host.waf:
+            score += 3
+            factors.append("no WAF/CDN on a live web host (+3)")
+        # Missing security headers, capped so a bare host can't dominate on gaps
+        # alone (they matter less than an actual entry point).
+        gaps = header_gaps(host.sec_headers, host.scheme or "https")
+        if gaps:
+            pts = min(len(gaps), 8)
+            score += pts
+            factors.append(f"{len(gaps)} missing security header(s) (+{pts})")
+
+    return min(score, 100), factors
+
+
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                            dorks=None, auth_surfaces=None, whois=None,
                            axfr=None) -> list:

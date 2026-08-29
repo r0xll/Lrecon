@@ -426,6 +426,21 @@ def write_markdown(hosts, domains, res, path) -> None:
                   "No high-confidence entry points identified from this pass "
                   "(passive/keyless sources only surface leads, not confirmations).", ""]
 
+    heat = [h for h in hosts if getattr(h, "risk_score", 0) > 0]
+    if heat:
+        heat.sort(key=lambda h: (-h.risk_score, h.subdomain))
+        lines += [f"## Attack-surface heat ({len(heat)})", "",
+                  "Hosts ranked by a composite of the signals already collected — entry "
+                  "points (severity-weighted), open non-web ports, missing WAF, and "
+                  "security-header gaps. Score is capped at 100; the factors name every "
+                  "contributor so the ranking is auditable. Work the top of this list first.",
+                  "",
+                  "| Score | Host | Factors |", "|---|---|---|"]
+        for h in heat:
+            lines.append(f"| {h.risk_score} | {h.subdomain} | "
+                         f"{'; '.join(h.risk_factors) or '—'} |")
+        lines.append("")
+
     if per_source:
         lines += ["## Passive source contribution", "",
                   "| Source | In-scope hosts found |", "|---|---|"]
@@ -1112,6 +1127,22 @@ def write_html(hosts, domains, res, path) -> None:
         body = '<p class="note">No high-confidence entry points identified from this pass.</p>'
     sections.append(_html_section("entrypoints", "⚠ Potential entry points", len(entry_points),
                                   body, open_default=True))
+
+    # ---- Attack-surface heat (composite risk ranking) ----
+    heat = [h for h in hosts if getattr(h, "risk_score", 0) > 0]
+    if heat:
+        heat.sort(key=lambda h: (-h.risk_score, h.subdomain))
+        rows = "".join(
+            f"<tr><td>{h.risk_score}</td><td>{esc(h.subdomain)}</td>"
+            f"<td>{esc('; '.join(h.risk_factors))}</td></tr>"
+            for h in heat)
+        body = (f'{_html_export_button("t-heat", "attack_surface_heat.csv")}'
+                f'<table id="t-heat"><tr><th>Score</th><th>Host</th><th>Factors</th></tr>{rows}</table>'
+                f'<p class="note">Hosts ranked by a composite of signals already collected — '
+                f'severity-weighted entry points, open non-web ports, missing WAF, and '
+                f'security-header gaps (capped at 100). The factors name every contributor, so '
+                f'the ranking is auditable. Work the top of this list first.</p>')
+        sections.append(_html_section("heat", "Attack-surface heat", len(heat), body))
 
     # ---- Passive source contribution ----
     if per_source:
