@@ -6695,6 +6695,67 @@ def test_correlate_tracking_ids_groups_shared_and_drops_singletons():
 
 
 # --------------------------------------------------------------------------- #
+# Composite attack-surface score (#13)
+# --------------------------------------------------------------------------- #
+def test_risk_score_ranks_entry_point_host_above_headers_only():
+    # A host with a critical + high entry point (e.g. KEV CVE + leaked secret).
+    hot = Host(subdomain="hot.example.com", http_status=200, scheme="https", waf="Cloudflare")
+    hot_eps = [{"severity": "critical", "target": "hot.example.com"},
+               {"severity": "high", "target": "hot.example.com (aws)"}]
+    hot_score, hot_factors = intel.risk_score(hot, hot_eps)
+
+    # A live host with only missing security headers — real but far lower.
+    cold = Host(subdomain="cold.example.com", http_status=200, scheme="https",
+                sec_headers={"server": "nginx"})  # truthy but no protections set
+    cold_score, cold_factors = intel.risk_score(cold, [])
+
+    assert hot_score == 40 + 25              # critical + high, WAF present so no +3
+    assert cold_score > 0 and hot_score > cold_score
+    # Factors name the contributors, so the score is auditable.
+    assert any("critical entry point" in f for f in hot_factors)
+    assert any("missing security header" in f for f in cold_factors)
+
+
+def test_risk_score_clean_host_scores_zero_and_caps_at_100():
+    clean = Host(subdomain="clean.example.com", http_status=200, scheme="https",
+                 waf="Akamai", sec_headers={"hsts": True, "csp": "default-src 'self'",
+                 "x_content_type_options": "nosniff", "x_frame_options": "DENY",
+                 "referrer_policy": "no-referrer", "permissions_policy": "geolocation=()"})
+    score, factors = intel.risk_score(clean, [])
+    assert score == 0 and factors == []
+
+    # Many critical entry points still cap at 100, not run away.
+    loud = Host(subdomain="loud.example.com")
+    eps = [{"severity": "critical", "target": "loud.example.com"}] * 5
+    capped, _ = intel.risk_score(loud, eps)
+    assert capped == 100
+
+
+def test_risk_score_counts_non_web_ports_and_missing_waf():
+    h = Host(subdomain="svc.example.com", http_status=200, scheme="https",
+             ports=[80, 443, 22, 3306])  # 22 and 3306 are non-web
+    score, factors = intel.risk_score(h, [])
+    # +8 non-web ports, +3 no WAF (live web host, waf unset), +0 headers (none probed)
+    assert score == 8 + 3
+    assert any("non-web port" in f for f in factors)
+    assert any("no WAF" in f for f in factors)
+
+
+def test_entry_points_for_host_matches_own_targets_only():
+    h = Host(subdomain="app.example.com")
+    eps = [
+        {"target": "app.example.com", "severity": "high"},          # exact
+        {"target": "app.example.com/admin", "severity": "high"},    # path
+        {"target": "app.example.com (stripe)", "severity": "high"}, # qualifier
+        {"target": "other.example.com", "severity": "critical"},    # different host
+        {"target": "example.com", "severity": "medium"},            # domain-level
+    ]
+    mine = intel.entry_points_for_host(h, eps)
+    assert len(mine) == 3
+    assert all(m["target"].startswith("app.example.com") for m in mine)
+
+
+# --------------------------------------------------------------------------- #
 # Repo hygiene
 # --------------------------------------------------------------------------- #
 def test_no_recon_output_is_tracked_in_the_repo():

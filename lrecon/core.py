@@ -1123,6 +1123,10 @@ async def run(domains, args, keys) -> list:
     else:
         log("[+] no high-confidence entry points identified this pass")
 
+    # ---- Composite attack-surface score (rank hosts: work these first) ----
+    for h in host_list:
+        h.risk_score, h.risk_factors = risk_score(h, entry_points_for_host(h, entry_points))
+
     # ---- In-scope tracking-pixel correlation (shared analytics = shared owner) ----
     tracking_correlation = correlate_tracking_ids(host_list)
     if tracking_correlation:
