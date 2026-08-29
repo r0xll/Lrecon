@@ -433,6 +433,20 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"| {s} | {per_source[s]} |")
         lines.append("")
 
+    tracking = res.get("tracking_correlation") or {}
+    if tracking:
+        lines += [f"## Shared tracking IDs ({len(tracking)})", "",
+                  "Analytics/marketing IDs (GA/GA4, GTM, Facebook Pixel) present on "
+                  "**more than one** in-scope host. A shared ID means the pages are the "
+                  "same team's assets — useful for confirming ownership and spotting "
+                  "shadow-IT. Correlated within the scanned scope only; no third-party "
+                  "lookup.", "",
+                  "| Tracking ID | Hosts sharing it |", "|---|---|"]
+        for tid in sorted(tracking):
+            hs = tracking[tid]
+            lines.append(f"| `{tid}` | {', '.join(hs)} |")
+        lines.append("")
+
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
     if ep_hosts:
         n_ep = sum(len(h.endpoints) for h in ep_hosts)
@@ -1105,6 +1119,21 @@ def write_html(hosts, domains, res, path) -> None:
                        for s in sorted(per_source, key=lambda k: -per_source[k]))
         body = (f'<table id="t-sources"><tr><th>Source</th><th>In-scope hosts found</th></tr>{rows}</table>')
         sections.append(_html_section("sources", "Passive source contribution", len(per_source), body))
+
+    # ---- Shared tracking IDs (in-scope analytics correlation) ----
+    tracking = res.get("tracking_correlation") or {}
+    if tracking:
+        rows = "".join(
+            f"<tr><td><code>{esc(tid)}</code></td><td>{esc(', '.join(tracking[tid]))}</td></tr>"
+            for tid in sorted(tracking))
+        body = (f'{_html_export_button("t-tracking", "tracking_ids.csv")}'
+                f'<table id="t-tracking"><tr><th>Tracking ID</th><th>Hosts sharing it</th>'
+                f'</tr>{rows}</table>'
+                f'<p class="note">Analytics/marketing IDs (GA/GA4, GTM, Facebook Pixel) on '
+                f'<strong>more than one</strong> in-scope host — shared ID means shared owner, '
+                f'useful for confirming ownership and spotting shadow-IT. Correlated within the '
+                f'scanned scope only; no third-party lookup.</p>')
+        sections.append(_html_section("tracking", "Shared tracking IDs", len(tracking), body))
 
     # ---- Discovered endpoints (Wayback + API docs -> live) ----
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]

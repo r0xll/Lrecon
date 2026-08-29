@@ -6661,6 +6661,40 @@ def test_summarize_entry_points_whois_finding_from_naive_date_only_expiry():
 
 
 # --------------------------------------------------------------------------- #
+# Tracking-pixel extraction + in-scope correlation (#14, keyless)
+# --------------------------------------------------------------------------- #
+def test_extract_tracking_ids_pulls_ga_gtm_and_fb():
+    from lrecon.pixels import extract_tracking_ids
+    body = """
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-ABC123XYZ"></script>
+    <script>gtag('config','UA-1234567-8');</script>
+    <!-- Google Tag Manager --><script>(function(w,d){})(window,document,'GTM-ABCD123');</script>
+    <script>fbq('init', '1234567890123456');</script>
+    """
+    out = extract_tracking_ids(body)
+    assert "G-ABC123XYZ" in out["ga"] and "UA-1234567-8" in out["ga"]
+    assert out["gtm"] == ["GTM-ABCD123"]
+    assert out["fb"] == ["1234567890123456"]
+
+
+def test_extract_tracking_ids_quiet_on_plain_page():
+    from lrecon.pixels import extract_tracking_ids
+    assert extract_tracking_ids("<html><body>hello, no analytics here</body></html>") == {}
+    assert extract_tracking_ids("") == {}
+    assert extract_tracking_ids(None) == {}
+
+
+def test_correlate_tracking_ids_groups_shared_and_drops_singletons():
+    a = Host(subdomain="a.example.com"); a.tracking_ids = {"gtm": ["GTM-SHARED1"], "ga": ["G-ONLYA0000"]}
+    b = Host(subdomain="b.example.com"); b.tracking_ids = {"gtm": ["GTM-SHARED1"]}
+    c = Host(subdomain="c.example.com")  # no tracking IDs at all
+    corr = intel.correlate_tracking_ids([a, b, c])
+    # shared GTM groups both hosts, sorted; the GA seen on one host only is dropped
+    assert corr == {"GTM-SHARED1": ["a.example.com", "b.example.com"]}
+    assert "G-ONLYA0000" not in corr
+
+
+# --------------------------------------------------------------------------- #
 # Repo hygiene
 # --------------------------------------------------------------------------- #
 def test_no_recon_output_is_tracked_in_the_repo():

@@ -410,7 +410,8 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     full = {k: res.get(k) for k in ("cf", "email", "github", "buckets", "breach",
                                     "asn", "favicon_pivots", "nuclei", "diff", "per_source",
                                     "entry_points", "whois", "dorks", "dns", "mail_infra", "vt",
-                                    "auth_surface", "certs", "axfr", "security_txt")}
+                                    "auth_surface", "certs", "axfr", "security_txt",
+                                    "tracking_correlation")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))

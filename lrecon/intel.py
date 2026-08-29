@@ -1743,6 +1743,20 @@ def _is_sensitive_path(path: str) -> bool:
     return any(hint in p for hint in _SENSITIVE_PATH_HINTS)
 
 
+def correlate_tracking_ids(hosts) -> dict:
+    """`{tracking_id: [host, ...]}` for analytics/marketing IDs seen on more than
+    one in-scope host — a shared GA property or GTM container means shared
+    ownership (useful for confirming assets and spotting shadow-IT). Singletons
+    are dropped: a host's own ID correlates nothing. Keyless, in-scope only."""
+    from collections import defaultdict
+    by_id = defaultdict(set)
+    for h in hosts:
+        for ids in (getattr(h, "tracking_ids", None) or {}).values():
+            for tid in ids:
+                by_id[tid].add(h.subdomain)
+    return {tid: sorted(hs) for tid, hs in by_id.items() if len(hs) > 1}
+
+
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                            dorks=None, auth_surfaces=None, whois=None,
                            axfr=None) -> list:

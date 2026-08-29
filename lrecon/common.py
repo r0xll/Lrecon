@@ -435,6 +435,9 @@ class Host:
     # CDN/WAF fronting the host, from response headers (Cloudflare, Akamai,
     # Fastly, CloudFront, Imperva, Sucuri) — see waf.fingerprint_waf.
     waf: str | None = None
+    # Analytics/marketing IDs on the page ({ga/gtm/fb: [ids]}) — an ownership
+    # fingerprint; hosts sharing one are the same team's (see pixels.py).
+    tracking_ids: dict = field(default_factory=dict)
     nvd_cves: list = field(default_factory=list)
     tech_confirmed: bool | None = None    # None=no live tech data to check; see enrich.confirm_tech_stack
     takeover: str | None = None
