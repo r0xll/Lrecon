@@ -24,6 +24,7 @@ dist/
 /lrecon_*.html
 /lrecon_*.txt
 /lrecon_*.csv
+/lrecon_*.sh
 /lrecon_*_shots/
 # Bare forms too, for anyone who overrides the basename to drop the timestamp.
 /lrecon.json
@@ -31,6 +32,7 @@ dist/
 /lrecon.html
 /lrecon.live.txt
 /lrecon.targets.csv
+/lrecon.handoff.sh
 *_shots/
 
 # local secrets / config

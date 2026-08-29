@@ -12,7 +12,7 @@ from .core import run
 from .sources import load_wordlist
 from .dorking import configured_dork_providers, select_dork_provider
 from .report import (write_markdown, write_html, write_live_hosts, write_csv, write_users_csv,
-                     write_origin_ips, screenshot_hosts)
+                     write_origin_ips, screenshot_hosts, write_handoff)
 from .backends import available_backends
 from . import backends
 from . import cache
@@ -403,6 +403,7 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     csv_path = f"{out_base}.targets.csv"
     users_path = f"{out_base}.users.csv"
     origin_path = f"{out_base}.origin_ips.txt"
+    handoff_path = f"{out_base}.handoff.sh"
 
     # Every result key the JSON export carries. Anything added to run()'s return
     # value has to be listed here too, or it renders in the Markdown/HTML report
@@ -416,7 +417,6 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
     write_markdown(hosts, args.domains, res, md_path)
-    write_html(hosts, args.domains, res, html_path)
     n_live = write_live_hosts(hosts, live_path)
     n_targets = write_csv(hosts, csv_path)
     # Say what was left off the scope sheet, so a shorter list never reads as
@@ -438,13 +438,24 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     n_origin = write_origin_ips(res.get("cf") or {}, origin_path)
     if n_origin:
         outputs.append(origin_path)
+
+    # Screenshots run before write_html so their PNGs can be embedded as
+    # self-contained evidence in the HTML report (gated on --screenshots).
+    shots_dir = None
     if args.screenshots:
         urls = [l for l in Path(live_path).read_text().splitlines() if l]
         shot_dir = f"{out_base}_shots"
         n = asyncio.run(screenshot_hosts(urls, shot_dir))
         if n:
+            shots_dir = shot_dir
             outputs.append(shot_dir + "/")
             log(f"[+] {n} screenshot(s) -> {shot_dir}/")
+    write_html(hosts, args.domains, res, html_path, shots_dir=shots_dir)
+
+    # Handoff pack: ready-to-run follow-up commands ordered by risk.
+    n_handoff = write_handoff(hosts, handoff_path)
+    if n_handoff:
+        outputs.append(handoff_path)
 
     if emit_dossier:
         outputs += _emit_dossier(res, args, keys, out_base)
