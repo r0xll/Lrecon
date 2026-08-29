@@ -99,6 +99,52 @@ async def test_enrich_ipinfo_includes_token_param_when_configured():
     assert out["org"] == "AS15169 Google LLC"
 
 
+async def test_enrich_ipinfo_batch_maps_ips_and_caches(tmp_path, monkeypatch):
+    cache = _fresh_cache(tmp_path, monkeypatch)
+    posts = {"n": 0}
+
+    class _C:
+        async def post(self, url, json=None, timeout=None):
+            posts["n"] += 1
+            assert url == "https://ipinfo.io/batch?token=tok"
+            return _FakeResp(200, {ip: {"org": f"AS1 {ip}", "country": "US"} for ip in json})
+
+    out = await enrich.enrich_ipinfo_batch(_C(), ["1.1.1.1", "2.2.2.2"], "tok")
+    assert out["1.1.1.1"]["org"] == "AS1 1.1.1.1"
+    assert posts["n"] == 1                                  # one /batch call, not per-IP
+    # Each row was written through to the cache: a repeat serves without a POST.
+    posts["n"] = 0
+    again = await enrich.enrich_ipinfo_batch(_C(), ["1.1.1.1", "2.2.2.2"], "tok")
+    assert again["2.2.2.2"]["country"] == "US"
+    assert posts["n"] == 0
+
+
+async def test_enrich_ipinfo_batch_falls_back_to_per_ip_on_batch_rejection(tmp_path, monkeypatch):
+    # A free token that disallows /batch (non-200) must still return the same
+    # data via the per-IP endpoint, so behaviour degrades gracefully.
+    _fresh_cache(tmp_path, monkeypatch)
+
+    class _C:
+        async def post(self, url, json=None, timeout=None):
+            return _FakeResp(403, None)
+        async def get(self, url, timeout=None):
+            return _FakeResp(200, {"org": "AS1 fallback"})
+
+    out = await enrich.enrich_ipinfo_batch(_C(), ["1.1.1.1"], "tok")
+    assert out["1.1.1.1"]["org"] == "AS1 fallback"
+
+
+def test_use_shodan_ports_threshold():
+    # No key → never Shodan (InternetDB keyless path).
+    assert enrich.use_shodan_ports(None, 5, 200) is False
+    # Key + within the cap → Shodan.
+    assert enrich.use_shodan_ports("key", 200, 200) is True
+    # Key + over the cap → InternetDB (the speedup switch).
+    assert enrich.use_shodan_ports("key", 201, 200) is False
+    # Cap of 0 disables the switch → always Shodan when a key is set.
+    assert enrich.use_shodan_ports("key", 100000, 0) is True
+
+
 def test_apply_ports_merges_and_tags_source():
     h = Host("a.x.com", ports=[80])
     enrich.apply_ports(h, {"ports": [443, 80], "vulns": ["CVE-2026-1"]}, "internetdb")
