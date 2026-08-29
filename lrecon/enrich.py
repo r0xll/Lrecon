@@ -3,6 +3,7 @@ import asyncio, base64, ipaddress, json
 import httpx
 from .common import *
 from .cache import cached
+from . import cache as _cache
 
 # --------------------------------------------------------------------------- #
 # Phase 3 — enrichment per UNIQUE IP
@@ -19,6 +20,61 @@ async def enrich_ipinfo(client, ip, token) -> dict:
             pass
         return {}
     return await cached("ipinfo", ip, _fetch)
+
+
+def use_shodan_ports(has_key, n_ips: int, max_ips: int) -> bool:
+    """Whether the ports/CVE layer should use the per-IP Shodan host API (a hard
+    1 req/s) rather than InternetDB (Shodan's free, unthrottled dataset). Shodan
+    only when a key is set and either the cap is disabled (0) or the set fits
+    under it — above the cap, InternetDB's near-equivalent data is worth the huge
+    speedup."""
+    return bool(has_key) and (max_ips == 0 or n_ips <= max_ips)
+
+
+_IPINFO_BATCH = 1000    # ipinfo's /batch accepts up to 1000 items per POST
+
+
+async def enrich_ipinfo_batch(client, ips, token) -> dict:
+    """`{ip: data}` for every IP, using ipinfo's token-only /batch endpoint so a
+    thousand IPs cost ~one request instead of a thousand. Serves per-IP from the
+    disk cache first (same namespace/TTL as enrich_ipinfo) and only batches the
+    misses. A chunk that errors or is rejected (a free token that disallows
+    batch) falls back to per-IP enrich_ipinfo, so data and behaviour are
+    unchanged — only slower. Requires a token; the keyless path has no batch and
+    should keep calling enrich_ipinfo per IP."""
+    uniq = list(dict.fromkeys(ips))
+    out, missing = {}, []
+    for ip in uniq:
+        v = _cache.get("ipinfo", ip)
+        if v is not None:
+            out[ip] = v
+        else:
+            missing.append(ip)
+
+    async def _fallback(chunk):
+        for ip in chunk:
+            out[ip] = await enrich_ipinfo(client, ip, token)
+
+    for i in range(0, len(missing), _IPINFO_BATCH):
+        chunk = missing[i:i + _IPINFO_BATCH]
+        try:
+            r = await client.post(f"https://ipinfo.io/batch?token={token}",
+                                  json=chunk, timeout=30)
+            if r.status_code != 200:
+                await _fallback(chunk)
+                continue
+            data = r.json() or {}
+        except Exception:
+            await _fallback(chunk)
+            continue
+        for ip in chunk:
+            row = data.get(ip)
+            if isinstance(row, dict):
+                out[ip] = row
+                _cache.put("ipinfo", ip, row)
+            else:
+                out[ip] = {}
+    return out
 
 
 async def enrich_shodan_host(client, ip, key, limiter) -> dict:

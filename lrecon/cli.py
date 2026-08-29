@@ -258,6 +258,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--domain", action="append", dest="extra_domains",
                     help="in-scope domain (repeatable); merged with positional domains and -iL")
     ap.add_argument("-c", "--concurrency", type=int, default=50)
+    ap.add_argument("--shodan-max-ips", type=int, default=200,
+                    help="above this many unique IPs, use InternetDB (Shodan's free "
+                         "dataset, unthrottled) for the ports/CVE layer instead of the "
+                         "1 req/s Shodan host API; 0 = always use Shodan")
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("-o", "--out", default="lrecon",
                     help="output basename — a UTC timestamp is appended so "

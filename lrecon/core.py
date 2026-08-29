@@ -435,18 +435,38 @@ async def run(domains, args, keys) -> list:
                     ip_to_hosts[ip].append(h)
         unique_ips = list(ip_to_hosts)
         if unique_ips:
-            ports_src = "shodan" if shodan_key else "internetdb"
+            # Shodan's host API is a hard 1 req/s, so per-IP Shodan on a large
+            # set crawls (~1000 IPs = ~17 min). InternetDB is Shodan's own free
+            # dataset (ports/CPEs/CVEs) with no per-second wall, and ASN/org come
+            # from ipinfo anyway — so above --shodan-max-ips, use InternetDB.
+            use_shodan = use_shodan_ports(shodan_key, len(unique_ips), args.shodan_max_ips)
+            if shodan_key and not use_shodan:
+                log(f"[i] {len(unique_ips)} unique IPs exceeds Shodan's 1 req/s budget "
+                    f"(~{len(unique_ips)}s) — using InternetDB (Shodan's free dataset) for "
+                    f"ports/CVEs; raise --shodan-max-ips to force per-IP Shodan")
+            ports_src = "shodan" if use_shodan else "internetdb"
             # IPinfo's /json endpoint works keylessly (lower, unauthenticated
             # rate limit) — always attempt it rather than skipping ASN/org/
-            # rDNS enrichment outright just because no token is configured.
-            layers = ["ports/CVE:" + ports_src, "ipinfo" + ("" if ipinfo_token else " (keyless)")]
+            # rDNS enrichment outright just because no token is configured. With
+            # a token, one /batch call replaces a per-IP GET each.
+            ipinfo_map = (await enrich_ipinfo_batch(client, unique_ips, ipinfo_token)
+                          if ipinfo_token else None)
+            layers = ["ports/CVE:" + ports_src,
+                      "ipinfo" + (" (batch)" if ipinfo_token else " (keyless)")]
             enrich_sem = asyncio.Semaphore(args.concurrency)
 
             async def enrich_ip(ip):
                 async with enrich_sem:
-                    ports_data = (await enrich_shodan_host(client, ip, shodan_key, shodan_limiter)
-                                  if shodan_key else await enrich_internetdb(client, ip))
-                    info = await enrich_ipinfo(client, ip, ipinfo_token)
+                    if use_shodan:
+                        ports_coro = enrich_shodan_host(client, ip, shodan_key, shodan_limiter)
+                    else:
+                        ports_coro = enrich_internetdb(client, ip)
+                    if ipinfo_map is not None:
+                        ports_data, info = await ports_coro, ipinfo_map.get(ip, {})
+                    else:
+                        # Keyless ipinfo: overlap the per-IP GET with the ports fetch.
+                        ports_data, info = await asyncio.gather(
+                            ports_coro, enrich_ipinfo(client, ip, ipinfo_token))
                 return ip, ports_data, info
             results = await _gather_with_progress(
                 (enrich_ip(ip) for ip in unique_ips),
