@@ -1123,6 +1123,11 @@ async def run(domains, args, keys) -> list:
     else:
         log("[+] no high-confidence entry points identified this pass")
 
+    # ---- In-scope tracking-pixel correlation (shared analytics = shared owner) ----
+    tracking_correlation = correlate_tracking_ids(host_list)
+    if tracking_correlation:
+        log(f"[+] {len(tracking_correlation)} tracking ID(s) shared across in-scope hosts")
+
     # ---- Diff vs previous run ----
     diff = {}
     ip_targets = getattr(args, "ip_targets", None)
@@ -1136,6 +1141,7 @@ async def run(domains, args, keys) -> list:
             "nuclei": nuclei, "diff": diff, "entry_points": entry_points, "people": people,
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
             "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs,
-            "axfr": axfr, "security_txt": security_txts}
+            "axfr": axfr, "security_txt": security_txts,
+            "tracking_correlation": tracking_correlation}
 
 
