@@ -326,6 +326,58 @@ def write_origin_ips(cf, path) -> int:
     return len(ips)
 
 
+def _live_url(h) -> str:
+    """The URL to hand a follow-up tool: the probe's final URL if it followed
+    redirects, else scheme://subdomain."""
+    return h.final_url or f"{h.scheme or 'https'}://{h.subdomain}"
+
+
+def handoff_commands(hosts) -> list:
+    """`[(host, [command, ...]), ...]` for each live, non-wildcard host, ordered
+    by composite risk score (highest first) so the operator's next manual phase
+    starts with the highest-value targets. Each host gets an nmap (service/version
+    against its resolved IP or name, scoped to the ports already found), an ffuf
+    content-discovery run, and a nuclei templated scan against the live URL.
+    Every command is active and target-touching — a scaffold to review and run
+    under ROE, never run from here."""
+    live = [h for h in hosts if h.http_status and not h.wildcard]
+    live.sort(key=lambda h: (-getattr(h, "risk_score", 0), h.subdomain))
+    out = []
+    for h in live:
+        url = _live_url(h)
+        target = h.ips[0] if h.ips else h.subdomain
+        pflag = f"-p {','.join(str(p) for p in sorted(h.ports))} " if h.ports else ""
+        cmds = [
+            f"nmap -sV -Pn {pflag}{target}",
+            f"ffuf -u {url}/FUZZ -w /usr/share/wordlists/dirb/common.txt -mc all -fc 404",
+            f"nuclei -u {url}",
+        ]
+        out.append((h, cmds))
+    return out
+
+
+def write_handoff(hosts, path) -> int:
+    """Write a ready-to-run `<base>.handoff.sh` of per-live-host follow-up
+    commands (see handoff_commands), ordered by risk. Returns the number of
+    hosts covered."""
+    packs = handoff_commands(hosts)
+    lines = [
+        "#!/usr/bin/env bash",
+        "# LRecon handoff pack — follow-up commands for the next (manual) phase.",
+        "# Every command below is ACTIVE and touches the target. Review each one and",
+        "# run only within your authorized scope / rules of engagement. Hosts are",
+        "# ordered by LRecon's composite risk score (highest first).",
+        "set -u",
+        "",
+    ]
+    for h, cmds in packs:
+        lines.append(f"# ---- {h.subdomain}  (risk {getattr(h, 'risk_score', 0)}) ----")
+        lines += cmds
+        lines.append("")
+    Path(path).write_text("\n".join(lines) + "\n")
+    return len(packs)
+
+
 def _whois_privacy_cell(w: dict) -> str:
     pp = w.get("privacy_protected")
     if pp is True:
@@ -1009,6 +1061,17 @@ def write_markdown(hosts, domains, res, path) -> None:
                          "probe found no matching software for the reported CPE(s); the banner may "
                          "be stale or the service since patched/replaced. Triage confirmed hosts first.")
 
+    packs = handoff_commands(hosts)
+    if packs:
+        lines += ["", f"## Handoff command pack ({len(packs)})", "",
+                  "Ready-to-run follow-up commands for the next (manual) phase, ordered by "
+                  "risk score. Every command is **active and touches the target** — review "
+                  "and run only within your ROE. Also written to `<base>.handoff.sh`.", ""]
+        for h, cmds in packs:
+            lines += [f"**{h.subdomain}** (risk {getattr(h, 'risk_score', 0)})", "", "```sh"]
+            lines += cmds
+            lines += ["```", ""]
+
     Path(path).write_text("\n".join(lines) + "\n")
 
 
@@ -1076,7 +1139,10 @@ def _html_export_button(table_id: str, filename: str) -> str:
             f'onclick="exportTableToCSV(\'{table_id}\',\'{filename}\')">Export CSV</button>')
 
 
-def write_html(hosts, domains, res, path) -> None:
+SCREENSHOT_MAX_BYTES = 512 * 1024   # per-shot cap for the self-contained HTML
+
+
+def write_html(hosts, domains, res, path, shots_dir=None) -> None:
     import html as _h
 
     def esc(x) -> str:
@@ -1854,6 +1920,49 @@ def write_html(hosts, domains, res, path) -> None:
                 f'<th>Exploitability</th><th>CVEs</th></tr>{rows}</table>{note}')
         sections.append(_html_section("cve", "CVE hits (validate before reporting)", len(vulns), body))
 
+    # ---- Screenshot evidence (embedded, self-contained) ----
+    if shots_dir:
+        import base64
+        shots = []
+        for h in hosts:
+            if h.wildcard or not h.http_status:
+                continue
+            safe = _live_url(h).replace("https://", "").replace("http://", "").replace("/", "_")[:80]
+            png = Path(shots_dir) / f"{safe}.png"
+            try:
+                if not png.is_file():
+                    continue
+                data = png.read_bytes()
+            except OSError:
+                continue
+            if not data or len(data) > SCREENSHOT_MAX_BYTES:
+                # Over the cap: link the sidecar file rather than bloating the HTML.
+                continue
+            b64 = base64.b64encode(data).decode("ascii")
+            shots.append(
+                f'<figure class="shot"><img loading="lazy" alt="{esc(h.subdomain)}" '
+                f'src="data:image/png;base64,{b64}">'
+                f'<figcaption>{esc(h.subdomain)}</figcaption></figure>')
+        if shots:
+            body = (f'<div class="shots">{"".join(shots)}</div>'
+                    f'<p class="note">Live-page captures embedded as evidence (over '
+                    f'{SCREENSHOT_MAX_BYTES // 1024} KB each are left in the sidecar '
+                    f'<code>_shots/</code> directory instead).</p>')
+            sections.append(_html_section("shots", "Screenshots", len(shots), body))
+
+    # ---- Handoff command pack ----
+    packs = handoff_commands(hosts)
+    if packs:
+        blocks = "".join(
+            f'<h4>{esc(h.subdomain)} <span class="count">risk {getattr(h, "risk_score", 0)}</span></h4>'
+            f'<pre class="handoff">{esc(chr(10).join(cmds))}</pre>'
+            for h, cmds in packs)
+        body = (f'{blocks}'
+                f'<p class="note">Ready-to-run follow-up commands, ordered by risk. Every '
+                f'command is active and touches the target — review and run only within your '
+                f'ROE. Also written to <code>&lt;base&gt;.handoff.sh</code>.</p>')
+        sections.append(_html_section("handoff", "Handoff command pack", len(packs), body))
+
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     doc = f"""<!doctype html><html><head><meta charset="utf-8">
 <title>lrecon — {esc(', '.join(domains))}</title>
@@ -1919,6 +2028,13 @@ h4 {{ margin: 1.1rem 0 .4rem; font-size: 14px; }}
 .badge {{ display: inline-block; background: #c0392b; color: #fff; padding: 0 5px;
          border-radius: 3px; font-size: 10px; font-weight: 700; margin-left: .3rem;
          text-transform: uppercase; letter-spacing: .02em; }}
+.shots {{ display: flex; flex-wrap: wrap; gap: .8rem; }}
+.shot {{ margin: 0; border: 1px solid #ddd; border-radius: 6px; overflow: hidden;
+        width: 240px; background: #fafafa; }}
+.shot img {{ display: block; width: 100%; height: auto; }}
+.shot figcaption {{ font-size: 12px; padding: .35rem .5rem; word-break: break-all; }}
+pre.handoff {{ background: #f0f0f0; padding: .6rem .8rem; border-radius: 4px; overflow-x: auto;
+              font-size: 12px; line-height: 1.5; margin: .2rem 0 .8rem; }}
 @media (prefers-color-scheme: dark) {{
   :root {{ color-scheme: dark; }}
   body {{ background: #16181c; color: #e6e6e6; }}
@@ -1947,6 +2063,8 @@ h4 {{ margin: 1.1rem 0 .4rem; font-size: 14px; }}
   .bad {{ color: #ff8a80; }}
   .warn {{ color: #ffb74d; }}
   .good {{ color: #81c784; }}
+  .shot {{ border-color: #3a3d44; background: #1c1f24; }}
+  pre.handoff {{ background: #1c1f24; }}
 }}
 @media print {{
   .toolbar {{ display: none; }}

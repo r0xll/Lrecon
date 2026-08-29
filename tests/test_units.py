@@ -6756,6 +6756,67 @@ def test_entry_points_for_host_matches_own_targets_only():
 
 
 # --------------------------------------------------------------------------- #
+# Handoff command pack + screenshot embedding (#15)
+# --------------------------------------------------------------------------- #
+def test_write_handoff_emits_commands_ordered_by_risk():
+    hot = Host(subdomain="hot.example.com", http_status=200, scheme="https",
+               ips=["10.0.0.1"], ports=[443, 22])
+    hot.risk_score = 65
+    cold = Host(subdomain="cold.example.com", http_status=200, scheme="https", ips=["10.0.0.2"])
+    cold.risk_score = 5
+    dead = Host(subdomain="dead.example.com")            # not live → excluded
+    wild = Host(subdomain="*.example.com", http_status=200, wildcard=True)  # excluded
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.handoff.sh"
+        n = report.write_handoff([cold, hot, dead, wild], str(path))
+        text = path.read_text()
+    assert n == 2
+    # Highest risk first.
+    assert text.index("hot.example.com") < text.index("cold.example.com")
+    # Each live host gets nmap/ffuf/nuclei; nmap scopes to the found ports and IP.
+    assert "nmap -sV -Pn -p 22,443 10.0.0.1" in text
+    assert "ffuf -u https://hot.example.com/FUZZ" in text
+    assert "nuclei -u https://hot.example.com" in text
+    # Excluded hosts don't appear.
+    assert "dead.example.com" not in text and "*.example.com" not in text
+
+
+def test_write_html_embeds_screenshot_when_present_and_omits_when_absent():
+    h = Host(subdomain="a.example.com", http_status=200, scheme="https")
+    res = {"entry_points": []}
+    with tempfile.TemporaryDirectory() as d:
+        shots = Path(d) / "shots"
+        shots.mkdir()
+        # screenshot_hosts names the file from the live URL, same transform.
+        (shots / "a.example.com.png").write_bytes(b"\x89PNG\r\n\x1a\nfake-image-bytes")
+        out = Path(d) / "r.html"
+
+        report.write_html([h], ["example.com"], res, str(out), shots_dir=str(shots))
+        with_shot = out.read_text()
+        report.write_html([h], ["example.com"], res, str(out), shots_dir=None)
+        without_shot = out.read_text()
+    assert "data:image/png;base64," in with_shot
+    assert 'id="shots"' in with_shot
+    assert "data:image/png;base64," not in without_shot
+    assert 'id="shots"' not in without_shot
+
+
+def test_write_html_skips_oversize_screenshot():
+    h = Host(subdomain="big.example.com", http_status=200, scheme="https")
+    res = {"entry_points": []}
+    with tempfile.TemporaryDirectory() as d:
+        shots = Path(d) / "shots"
+        shots.mkdir()
+        (shots / "big.example.com.png").write_bytes(b"x" * (report.SCREENSHOT_MAX_BYTES + 1))
+        out = Path(d) / "r.html"
+        report.write_html([h], ["example.com"], res, str(out), shots_dir=str(shots))
+        html = out.read_text()
+    # Over the cap → not embedded, and with no other shots the section is omitted.
+    assert "data:image/png;base64," not in html
+    assert 'id="shots"' not in html
+
+
+# --------------------------------------------------------------------------- #
 # Repo hygiene
 # --------------------------------------------------------------------------- #
 def test_no_recon_output_is_tracked_in_the_repo():
