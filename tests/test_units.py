@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import csv
 import ipaddress
+import json
 import re
 import sys
 import tempfile
@@ -7059,6 +7060,61 @@ def test_name_in_scope_rejects_lookalike_domain():
     assert name_in_scope("example.com", "example.com") is True
     assert name_in_scope("testexample.com", "example.com") is False
     assert name_in_scope("notexample.com", "example.com") is False
+
+
+# --------------------------------------------------------------------------- #
+# Features (audit follow-up, PR D)
+# --------------------------------------------------------------------------- #
+def test_write_sarif_emits_result_per_entry_point(tmp_path):
+    res = {"entry_points": [
+        {"type": "subdomain-takeover", "target": "x.example.com", "severity": "critical",
+         "summary": "Dangling CNAME", "attck": "T1584.001"},
+        {"type": "exposed-endpoint", "target": "x.example.com/admin", "severity": "medium",
+         "summary": "Live admin route", "attck": "T1190"},
+        {"type": "subdomain-takeover", "target": "y.example.com", "severity": "high",
+         "summary": "Another dangling", "attck": "T1584.001"},
+    ]}
+    path = tmp_path / "r.sarif"
+    n = report.write_sarif([], res, str(path))
+    doc = json.loads(path.read_text())
+    assert n == 3 and doc["version"] == "2.1.0"
+    run0 = doc["runs"][0]
+    assert run0["tool"]["driver"]["name"] == "lrecon"
+    # Two distinct rule types (takeover appears twice but is deduped).
+    rule_ids = {r["id"] for r in run0["tool"]["driver"]["rules"]}
+    assert rule_ids == {"subdomain-takeover", "exposed-endpoint"}
+    levels = [r["level"] for r in run0["results"]]
+    assert levels == ["error", "warning", "error"]        # critical/medium/high
+    assert run0["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] \
+        == "x.example.com"
+
+
+def test_write_sarif_empty_when_no_entry_points(tmp_path):
+    path = tmp_path / "r.sarif"
+    assert report.write_sarif([], {"entry_points": []}, str(path)) == 0
+    doc = json.loads(path.read_text())
+    assert doc["runs"][0]["results"] == []
+
+
+def test_dry_run_prints_tiers_and_makes_no_network_call(monkeypatch):
+    import lrecon.cli as cli
+    lines = []
+    monkeypatch.setattr(cli, "log", lambda m: lines.append(m))
+    args = argparse.Namespace(
+        passive_only=False, vt=True, dork=False, nvd=False, buckets=False,
+        no_cf_origin=True, asn_expand=False, brute=False, active_ports=True,
+        wayback_paths=False, api_scan=False, verify_emails=True, nuclei=False)
+    cli._print_dry_run(args)
+    blob = "\n".join(lines)
+    assert "DRY RUN" in blob
+    assert "AGGRESSIVE" in blob                            # active_ports + verify_emails
+    assert "SMTP RCPT-TO email verification" in blob
+    assert "TCP port scan" in blob
+    # passive-only omits the active HTTP-probe phase.
+    lines.clear()
+    args.passive_only = True
+    cli._print_dry_run(args)
+    assert "HTTP probe" not in "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
