@@ -249,7 +249,7 @@ async def run(domains, args, keys) -> list:
     ns = args.resolvers.split(",") if args.resolvers else DEFAULT_RESOLVERS
     use_prog = _HAVE_RICH and not args.no_progress
     limits = httpx.Limits(max_connections=args.concurrency)
-    headers = {"User-Agent": "lrecon/2.2 (authorized-assessment)"}
+    headers = {"User-Agent": USER_AGENT}
     shodan_limiter = RateLimiter(per_second=1.0)
 
     # `client` verifies certs — used for calls to trusted third-party APIs (Shodan,
@@ -517,7 +517,11 @@ async def run(domains, args, keys) -> list:
             async def _do_active(h, httpx_data):
                 if args.active_ports:
                     if naabu_ok:
-                        np = await backends.naabu_scan(h.ips[0], args.ports)
+                        # Scan every resolved IP, not just the first — a
+                        # round-robin/multi-homed host otherwise gets 1/N port
+                        # coverage reported as if complete. naabu's -host takes a
+                        # comma list; the union of open ports lands on h.ports.
+                        np = await backends.naabu_scan(",".join(h.ips), args.ports)
                         if np:
                             h.ports = sorted(set(h.ports) | set(np))
                     else:
@@ -527,6 +531,11 @@ async def run(domains, args, keys) -> list:
                     # that just found them; --no-banners suppresses.
                     if h.ports and not getattr(args, "no_banners", False):
                         await grab_banners(h, h.ports, banner_sem)
+                    # Probe any open non-standard web port (8080/8443/...) the
+                    # scan found — http_probe only tries 80/443, so these live
+                    # services (often admin panels) would otherwise be a bare
+                    # port number in the report. Same ROE tier as the scan.
+                    await probe_web_ports(probe_client, h)
                 if httpx_data is not None:
                     d = httpx_data.get(h.subdomain)
                     if d:
@@ -1039,7 +1048,8 @@ async def run(domains, args, keys) -> list:
                 d_people = [p for p in people if p.email.endswith(f"@{d}")]
                 if not d_people:
                     continue
-                statuses = await verify_emails(d, [p.email for p in d_people], ns)
+                statuses = await verify_emails(d, [p.email for p in d_people], ns,
+                                               mail_from=getattr(args, "mail_from", None))
                 for p in d_people:
                     p.smtp_status = statuses.get(p.email)
             n_valid = sum(1 for p in people if p.smtp_status == "valid")

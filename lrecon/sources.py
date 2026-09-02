@@ -508,14 +508,14 @@ async def resolve_full(subdomain: str, nameservers) -> tuple:
         return [], None, False
     res = get_resolver(nameservers)
 
-    async def q(rtype):
+    async def q(name, rtype):
         try:
-            return rtype, await res.resolve(subdomain, rtype), None
+            return rtype, await res.resolve(name, rtype), None
         except Exception as e:
             return rtype, None, e
 
     ips, cname = [], None
-    results = await asyncio.gather(q("A"), q("AAAA"), q("CNAME"))
+    results = await asyncio.gather(q(subdomain, "A"), q(subdomain, "AAAA"), q(subdomain, "CNAME"))
     for rtype, ans, _err in results:
         if ans is None:
             continue
@@ -523,6 +523,26 @@ async def resolve_full(subdomain: str, nameservers) -> tuple:
             cname = str(ans[0].target).rstrip(".").lower()
         else:
             ips.extend(str(r) for r in ans)
+
+    # Follow the CNAME chain to its terminal target when the name has a CNAME but
+    # no address of its own. A CDN double-CNAME (app -> app.cdn.net -> dangling)
+    # otherwise leaves `cname` at the live middle hop, so takeover detection
+    # checks the wrong name and misses the unclaimed end of the chain. Bounded to
+    # 5 hops and loop-guarded; the terminal hop is what we classify.
+    if cname and not ips:
+        seen = {subdomain.rstrip(".").lower(), cname}
+        terminal = cname
+        for _ in range(5):
+            _rt, ans, _err = await q(terminal, "CNAME")
+            if not ans:
+                break
+            nxt = str(ans[0].target).rstrip(".").lower()
+            if nxt in seen:
+                break
+            seen.add(nxt)
+            terminal = nxt
+        cname = terminal
+
     # Confirmed-dead only if nothing resolved AND a query actually said
     # NXDOMAIN. NXDOMAIN is a property of the name, so any of the three queries
     # raising it settles the name's non-existence.
@@ -603,14 +623,23 @@ async def cname_target_status(cname: str, nameservers) -> tuple:
     return ("nxdomain", closest_zone) if nxdomain else ("unknown", None)
 
 
-async def detect_wildcard(domain: str, nameservers) -> set:
+async def detect_wildcard(domain: str, nameservers, probes: int = 4) -> set:
     if not _HAVE_DNS:
         return set()
-    rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
-    ips, _cname, _nx = await resolve_full(f"{rand}.{domain}", nameservers)
-    if ips:
-        log(f"[!] wildcard DNS on {domain} -> {', '.join(ips)} (filtering phantoms)")
-    return set(ips)
+    # Fire several random labels, not one: a load-balanced wildcard returns a
+    # different IP from its pool per query, so a single probe captures only one
+    # pool member and the rest leak phantoms past the issubset filter. Union the
+    # answers to learn the whole pool.
+    labels = ["".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+              for _ in range(max(1, probes))]
+    results = await asyncio.gather(
+        *(resolve_full(f"{label}.{domain}", nameservers) for label in labels))
+    wc = set()
+    for ips, _cname, _nx in results:
+        wc.update(ips)
+    if wc:
+        log(f"[!] wildcard DNS on {domain} -> {', '.join(sorted(wc))} (filtering phantoms)")
+    return wc
 
 
 # --------------------------------------------------------------------------- #

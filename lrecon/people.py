@@ -279,15 +279,28 @@ async def verify_emails(domain: str, emails: list, resolver_ns, mail_from: str |
     res = get_resolver(resolver_ns)
     try:
         mx_records = sorted(await res.resolve(domain, "MX"), key=lambda r: r.preference)
-        mx_host = str(mx_records[0].exchange).rstrip(".")
+        # Filter RFC 7505 null MX (empty exchange) and dedupe, preference order.
+        mx_hosts = list(dict.fromkeys(
+            h for r in mx_records if (h := str(r.exchange).rstrip("."))))
     except Exception as e:
         log(f"[!] email verify {domain}: no MX ({e})")
         return out
+    if not mx_hosts:
+        log(f"[!] email verify {domain}: null MX (accepts no mail)")
+        return out
 
-    try:
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(mx_host, 25), timeout=timeout)
-    except Exception as e:
-        log(f"[!] email verify {domain}: can't reach MX {mx_host} ({e})")
+    # Try each MX in preference order, not just the most-preferred: the primary
+    # may be down or greylisting connections while a secondary answers.
+    reader = writer = None
+    for mx_host in mx_hosts:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(mx_host, 25), timeout=timeout)
+            break
+        except Exception as e:
+            last_err = e
+    if writer is None:
+        log(f"[!] email verify {domain}: can't reach any MX ({', '.join(mx_hosts)}) ({last_err})")
         return out
 
     async def cmd(line: str) -> int:

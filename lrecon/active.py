@@ -24,6 +24,46 @@ def _set_cookie_list(r) -> list:
 # --------------------------------------------------------------------------- #
 # Phase 4 — active
 # --------------------------------------------------------------------------- #
+def _extract_title(body: str) -> str | None:
+    """The <title> text of an HTML body, trimmed to 120 chars, or None."""
+    lo = (body or "").lower()
+    if "<title" not in lo:
+        return None
+    s = lo.find(">", lo.find("<title")) + 1
+    e = lo.find("</title", s)
+    if s > 0 and e > s:
+        return body[s:e].strip()[:120] or None
+    return None
+
+
+# Non-standard web ports the port scan may find that the main HTTP probe (80/443
+# only) never touches. https for the TLS-ish ones, http for the rest.
+_TLS_WEB_PORTS = {443, 8443, 9443}
+
+
+async def probe_web_ports(client, host: Host) -> None:
+    """HTTP-probe open non-standard web ports (8080/8443/8000/... from the port
+    scan) that http_probe never reaches — a live service on one is often a
+    forgotten admin panel, staging app, or management console. Each hit is
+    recorded on host.endpoints so it rides the existing report/JSON path."""
+    if not host.ips:
+        return
+    extra = sorted(p for p in host.ports if p in WEB_PORTS and p not in (80, 443))
+    for port in extra:
+        scheme = "https" if port in _TLS_WEB_PORTS else "http"
+        try:
+            r = await client.get(f"{scheme}://{host.subdomain}:{port}/",
+                                 timeout=8, follow_redirects=True)
+        except Exception:
+            continue
+        host.endpoints.append({
+            "path": f":{port}/",
+            "status": r.status_code,
+            "source": f"web-port ({scheme})",
+            "title": _extract_title(r.text[:30000]),
+        })
+
+
 async def http_probe(client, host: Host) -> None:
     for scheme in ("https", "http"):
         try:
@@ -50,11 +90,9 @@ async def http_probe(client, host: Host) -> None:
             host.waf = fingerprint_waf(r.headers)
             host.tracking_ids = extract_tracking_ids(body)
             lo = body.lower()
-            if "<title" in lo:
-                s = lo.find(">", lo.find("<title")) + 1
-                e = lo.find("</title", s)
-                if s > 0 and e > s:
-                    host.http_title = body[s:e].strip()[:120]
+            title = _extract_title(body)
+            if title:
+                host.http_title = title
             _check_takeover(host, lo, r.status_code)
             return
         except Exception:
@@ -413,8 +451,10 @@ async def tcp_scan(host: Host, ports, sem) -> None:
                 return None
     if not host.ips:
         return
-    ip = host.ips[0]
-    results = await asyncio.gather(*(probe(ip, p) for p in ports))
+    # Scan every resolved IP, not just the first — a round-robin/multi-homed host
+    # otherwise gets 1/N port coverage reported as if complete. The union of open
+    # ports across all IPs lands on host.ports.
+    results = await asyncio.gather(*(probe(ip, p) for ip in host.ips for p in ports))
     open_ports = [p for p in results if p]
     if open_ports:
         host.ports = sorted(set(host.ports) | set(open_ports))

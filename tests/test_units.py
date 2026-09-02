@@ -4285,6 +4285,134 @@ async def test_resolve_full_flags_nxdomain_but_not_transient_failure(monkeypatch
     assert (await sources.resolve_full("mail.test", None))[2] is False   # exists, MX-only
 
 
+class _CN:
+    def __init__(self, target):
+        self.target = target
+
+
+async def test_resolve_full_follows_cname_chain_to_terminal(monkeypatch):
+    # app -> cdn -> dangling(no A). The single-hop version left cname at the live
+    # middle hop; the chain walk must reach the dangling terminal so takeover
+    # detection classifies the right name.
+    import dns.resolver
+    chain = {"app.x.com": "app.cdn.net", "app.cdn.net": "gone.herokuapp.com"}
+
+    class _R:
+        async def resolve(self, name, rtype):
+            if rtype == "CNAME" and name in chain:
+                return [_CN(chain[name] + ".")]
+            raise dns.resolver.NoAnswer            # no A/AAAA anywhere, chain ends
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    monkeypatch.setattr(sources, "_HAVE_DNS", True)
+    ips, cname, nx = await sources.resolve_full("app.x.com", None)
+    assert ips == [] and cname == "gone.herokuapp.com"
+
+
+async def test_detect_wildcard_unions_multiple_probes(monkeypatch):
+    # A load-balanced wildcard hands out a different pool IP per query; the
+    # multi-probe union must capture more than one.
+    pool = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+    calls = {"n": 0}
+
+    class _R:
+        async def resolve(self, name, rtype):
+            if rtype == "A":
+                ip = pool[calls["n"] % len(pool)]
+                calls["n"] += 1
+                return [ip]
+            raise Exception("no answer")
+    monkeypatch.setattr(sources, "get_resolver", lambda ns: _R())
+    monkeypatch.setattr(sources, "_HAVE_DNS", True)
+    out = await sources.detect_wildcard("x.com", None, probes=3)
+    assert len(out) >= 2 and out.issubset(set(pool))
+
+
+async def test_tcp_scan_covers_all_ips(monkeypatch):
+    # Port 80 is open only on the SECOND IP; scanning ips[0] alone would miss it.
+    async def fake_open(ip, port):
+        if ip == "2.2.2.2" and port == 80:
+            class _W:
+                def close(self): pass
+                async def wait_closed(self): pass
+            return object(), _W()
+        raise ConnectionRefusedError
+    monkeypatch.setattr(active.asyncio, "open_connection", fake_open)
+    h = Host(subdomain="x.com", ips=["1.1.1.1", "2.2.2.2"])
+    await active.tcp_scan(h, [80], asyncio.Semaphore(4))
+    assert 80 in h.ports
+
+
+async def test_probe_web_ports_records_nonstandard_port():
+    class _Resp:
+        status_code = 200
+        text = "<html><title>Admin Panel</title></html>"
+    class _C:
+        async def get(self, url, timeout=None, follow_redirects=None):
+            assert url == "http://x.com:8080/"
+            return _Resp()
+    h = Host(subdomain="x.com", ips=["1.1.1.1"], ports=[80, 8080])
+    await active.probe_web_ports(_C(), h)
+    hit = [e for e in h.endpoints if e["path"] == ":8080/"]
+    assert hit and hit[0]["status"] == 200 and hit[0]["title"] == "Admin Panel"
+
+
+async def test_verify_emails_tries_each_mx_in_preference_order(monkeypatch):
+    import lrecon.people as people
+    attempted = []
+
+    class _MX:
+        def __init__(self, pref, ex):
+            self.preference = pref
+            self.exchange = ex
+    class _R:
+        async def resolve(self, name, rtype):
+            return [_MX(20, "mx2.x.com."), _MX(10, "mx1.x.com.")]
+    monkeypatch.setattr(people, "get_resolver", lambda ns: _R())
+    monkeypatch.setattr(people, "_HAVE_DNS", True)
+
+    async def fake_open(host, port, **kw):
+        attempted.append(host)
+        raise ConnectionRefusedError                # both MX unreachable
+    monkeypatch.setattr(people.asyncio, "open_connection", fake_open)
+    out = await people.verify_emails("x.com", ["a@x.com"], None)
+    # Preference order (10 before 20), and BOTH tried, not just the first.
+    assert attempted == ["mx1.x.com", "mx2.x.com"]
+    assert out == {"a@x.com": "unknown"}
+
+
+def test_save_snapshot_is_atomic_and_preserves_prior_on_failure(tmp_path, monkeypatch):
+    from lrecon import state
+    monkeypatch.setattr(state, "STATE_DIR", tmp_path)
+
+    class _H:
+        def __init__(self, s):
+            self.subdomain = s
+            self.ips = ["1.1.1.1"]
+            self.ports = [443]
+    state.save_snapshot(["x.com"], [_H("a.x.com")])
+    good = state.load_prev_snapshot(["x.com"])
+    assert "a.x.com" in good["hosts"]
+
+    # A crash during the replace must not corrupt the existing snapshot.
+    def boom(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(state.os, "replace", boom)
+    try:
+        state.save_snapshot(["x.com"], [_H("b.x.com")])
+    except OSError:
+        pass
+    # Prior snapshot is intact and still parses; no truncated file leaked in.
+    still = state.load_prev_snapshot(["x.com"])
+    assert "a.x.com" in still["hosts"] and "b.x.com" not in still["hosts"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_user_agent_derived_from_package_version():
+    from lrecon.common import USER_AGENT
+    assert USER_AGENT.startswith("lrecon/") and "authorized-assessment" in USER_AGENT
+    assert "2.2" not in USER_AGENT                    # no longer the stale hardcode
+
+
 def test_write_csv_drops_only_confirmed_dead_and_wildcards():
     """The client approves this list before testing, so names that don't exist
     (NXDOMAIN) and DNS-wildcard noise are excluded — but a host that merely has
