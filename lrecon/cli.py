@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS
+from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS, USER_AGENT
 from .core import run
 from .sources import load_wordlist
 from .dorking import configured_dork_providers, select_dork_provider
@@ -242,6 +242,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                     help="SMTP RCPT-TO probe discovered company emails against the domain's MX "
                          "(active — touches target mail infra; detects and flags catch-all domains "
                          "rather than reporting false positives)")
+    ap.add_argument("--mail-from",
+                    help="MAIL FROM sender for --verify-emails (default verify@<target-domain>). "
+                         "Set an operator-controlled address so the probe doesn't forge the "
+                         "client's own domain (which fails their SPF and shows in their DMARC reports)")
     ap.add_argument("--ask-keys", action="store_true", help="prompt for keys via getpass")
     ap.add_argument("--config", help="config json path (default ~/.config/lrecon/config.json)")
     # ---- LLM (dossier/news synthesis; see the dossier/full-report subcommands) ----
@@ -488,7 +492,7 @@ async def _build_dossier_async(res, args, keys, out_base) -> list:
     from .common import RateLimiter
     cfg = _llm.config_from_keys(keys)
     company = args.company_name or (args.domains[0].split(".")[0] if args.domains else "target")
-    headers = {"User-Agent": "lrecon/3.2 (authorized-assessment)"}
+    headers = {"User-Agent": USER_AGENT}
     async with httpx.AsyncClient(headers=headers, verify=True) as client:
         # Factual company intel (SEC EDGAR + operator-supplied sources).
         news = None
@@ -535,6 +539,9 @@ def _cmd_enum(argv) -> None:
     ap.add_argument("--company-name", dest="company_name", help=argparse.SUPPRESS)
     ap.add_argument("--verify-emails", action="store_true",
                     help="SMTP RCPT-TO probe (active; touches target MX)")
+    ap.add_argument("--mail-from",
+                    help="MAIL FROM sender for --verify-emails (default verify@<target-domain>); "
+                         "set an operator-controlled address so the probe doesn't forge the client's domain")
     ap.add_argument("--resolvers", help="comma-separated DNS servers")
     ap.add_argument("-o", "--out", default="lrecon", help="output basename")
     ap.add_argument("--config", help="config json path")
@@ -562,7 +569,7 @@ def _cmd_enum(argv) -> None:
     ns = args.resolvers.split(",") if args.resolvers else _DR
 
     async def _go():
-        headers = {"User-Agent": "lrecon/3.2 (authorized-assessment)"}
+        headers = {"User-Agent": USER_AGENT}
         gh_limiter = RateLimiter(0.2)
         people = []
         async with httpx.AsyncClient(headers=headers, verify=True) as client:
@@ -574,7 +581,8 @@ def _cmd_enum(argv) -> None:
                 d_people = [p for p in people if p.email.endswith(f"@{d}")]
                 if not d_people:
                     continue
-                statuses = await _people.verify_emails(d, [p.email for p in d_people], ns)
+                statuses = await _people.verify_emails(d, [p.email for p in d_people], ns,
+                                                        mail_from=getattr(args, "mail_from", None))
                 for p in d_people:
                     p.smtp_status = statuses.get(p.email)
         return people

@@ -114,7 +114,7 @@ def log(msg: str) -> None:
 # names re-exported to sibling modules via `from .common import *`
 __all__ = [
     "log", "Host", "Person", "RateLimiter", "load_keys",
-    "CONFIG_PATH", "DEFAULT_RESOLVERS", "TOP_PORTS", "WEB_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
+    "CONFIG_PATH", "USER_AGENT", "DEFAULT_RESOLVERS", "TOP_PORTS", "WEB_PORTS", "TAKEOVER_SIGS", "CF_FALLBACK",
     "SELF_SERVE", "ACCOUNT_BOUND", "NOT_CLAIMABLE", "TAKEOVER_ERROR_STATUSES",
     "non_web_ports", "human_bytes", "in_cf",
     "_HAVE_DNS", "_HAVE_RICH", "_console",
@@ -130,6 +130,23 @@ __all__ = [
 # Constants
 # --------------------------------------------------------------------------- #
 CONFIG_PATH = Path.home() / ".config" / "lrecon" / "config.json"
+
+
+def _pkg_version() -> str:
+    """The installed package version, so the User-Agent never drifts from the
+    real release the way a hardcoded string does."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            return version("lrecon")
+        except PackageNotFoundError:
+            return "0"
+    except Exception:
+        return "0"
+
+
+USER_AGENT = f"lrecon/{_pkg_version()} (authorized-assessment)"
+
 DEFAULT_RESOLVERS = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "8.8.4.4"]
 
 TOP_PORTS = [21, 22, 23, 25, 53, 80, 110, 111, 135, 139, 143, 389, 443, 445,

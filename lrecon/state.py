@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from .common import *
@@ -20,7 +22,7 @@ def _state_key(domains, ip_targets=None) -> str:
         # of a truncated IP list. Domain-only runs keep their original key
         # byte-for-byte, so existing snapshots stay continuous.
         import hashlib
-        digest = hashlib.sha1("_".join(sorted(ip_targets)).encode()).hexdigest()[:12]
+        digest = hashlib.sha1("_".join(sorted(ip_targets)).encode()).hexdigest()[:16]
         key = f"{key}_ip-{digest}" if key else f"ip-{digest}"
     return key.replace("/", "_")[:120]
 
@@ -39,7 +41,22 @@ def save_snapshot(domains, hosts, ip_targets=None) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     snap = {"ts": datetime.now(timezone.utc).isoformat(),
             "hosts": {h.subdomain: {"ips": h.ips, "ports": h.ports} for h in hosts}}
-    (STATE_DIR / f"{_state_key(domains, ip_targets)}.snapshot.json").write_text(json.dumps(snap))
+    dest = STATE_DIR / f"{_state_key(domains, ip_targets)}.snapshot.json"
+    # Write-and-rename so a Ctrl-C or crash mid-write can't leave a truncated,
+    # unparseable snapshot — that would silently corrupt the --diff baseline and
+    # report every host as "new" on the next run. os.replace is atomic on the
+    # same filesystem.
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_DIR), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(snap))
+        os.replace(tmp, dest)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def diff_snapshot(prev: dict, hosts) -> dict:
