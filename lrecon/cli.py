@@ -7,12 +7,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS, USER_AGENT
-from .core import run
+from .common import log, load_keys, DEFAULT_RESOLVERS, TOP_PORTS, _HAVE_DNS, USER_AGENT, CONFIG_PATH
+from .core import run, verify_keys
 from .sources import load_wordlist
 from .dorking import configured_dork_providers, select_dork_provider
 from .report import (write_markdown, write_html, write_live_hosts, write_csv, write_users_csv,
-                     write_origin_ips, screenshot_hosts, write_handoff)
+                     write_origin_ips, screenshot_hosts, write_handoff, write_sarif)
 from .backends import available_backends
 from . import backends
 from . import cache
@@ -99,6 +99,102 @@ def apply_all_flag(args) -> None:
     args.asn_expand = True
 
 
+async def _run_doctor(args) -> None:
+    """Pre-engagement readiness: config permissions, key validity, resolver
+    reachability, optional backends. Read-only against third-party account/info
+    endpoints (verify_keys), plus one benign resolver query — never touches a
+    target."""
+    import httpx
+    log("[i] lrecon doctor — engagement readiness check")
+
+    # 1. Config file permissions (holds cleartext API keys).
+    cfg = Path(args.config) if args.config else CONFIG_PATH
+    if cfg.exists():
+        try:
+            mode = cfg.stat().st_mode
+            if (mode & 0o077) and __import__("os").name == "posix":
+                log(f"    config      : WARN  {cfg} is group/other-readable — chmod 600 it")
+            else:
+                log(f"    config      : ok    {cfg}")
+        except OSError as e:
+            log(f"    config      : ?     {cfg} ({e})")
+    else:
+        log(f"    config      : none  {cfg} (env vars / CLI only)")
+
+    # 2. API keys — verify_keys logs Ready/Invalid per configured service.
+    keys = load_keys(args)
+    configured = [k for k, v in keys.items() if v and k != "llm"]
+    if configured:
+        log(f"    keys        : verifying {len(configured)} configured — {', '.join(sorted(configured))}")
+        async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}) as client:
+            await verify_keys(client, keys, dorking=bool(getattr(args, "dork", False)))
+    else:
+        log("    keys        : none configured (keyless sources only)")
+
+    # 3. Resolver reachability — one benign query, not at any target.
+    ns = args.resolvers.split(",") if args.resolvers else DEFAULT_RESOLVERS
+    if not _HAVE_DNS:
+        log("    resolver    : WARN  dnspython not installed — active phases unavailable")
+    else:
+        from .sources import resolve_full
+        ips, _c, _nx = await resolve_full("example.com", ns)
+        log(f"    resolver    : {'ok' if ips else 'WARN'}   {', '.join(ns)}"
+            f"{'' if ips else '  (no answer — check network/resolvers)'}")
+
+    # 4. Optional backends.
+    rows = await backends.selfcheck(active=False)
+    present = [r["tool"] for r in rows if r["path"]]
+    broken = [r["tool"] for r in rows if r["path"] and not r["ran"]]
+    log(f"    backends    : {', '.join(present) if present else 'none on PATH (pure-Python)'}"
+        + (f"  — BROKEN: {', '.join(broken)}" if broken else ""))
+    log("[i] doctor complete")
+
+
+def _print_dry_run(args) -> None:
+    """Print the phase plan and each phase's ROE target-touch tier for the given
+    flags, without sending anything. `passive` = no contact with target infra
+    (third-party sources only); `active` = ordinary queries/GETs at the target;
+    `AGGRESSIVE` = port scans, brute force, SMTP probes, nuclei — the tiers the
+    README's ROE section says need conscious authorization."""
+    plan = [("Passive enumeration (CT logs, OTX, Wayback, DNS dumpster, ...)",
+             "passive — third-party sources, no target contact"),
+            ("Domain WHOIS / RDAP", "passive — third-party registries")]
+    if not args.passive_only:
+        plan += [("DNS resolution + wildcard filter", "active — queries the target's authoritative NS"),
+                 ("HTTP probe (80/443) + tech/WAF/headers", "active — HTTP GET to each live host"),
+                 ("Email posture (SPF/DKIM/DMARC/MTA-STS/DANE)", "active — DNS queries for the domain"),
+                 ("DNS records + mail infrastructure", "active — DNS queries for the domain")]
+    if args.vt:
+        plan.append(("VirusTotal domain intel", "passive — third-party API"))
+    if args.dork:
+        plan.append(("Search-engine dorking", "passive — third-party search API"))
+    if args.nvd:
+        plan.append(("NVD CVE enrichment", "passive — third-party API"))
+    if args.buckets:
+        plan.append(("Cloud storage bucket enumeration", "active — probes provider storage endpoints"))
+    if not args.no_cf_origin and not args.passive_only:
+        plan.append(("Cloudflare origin discovery", "active — probes candidate origin IPs"))
+    if args.asn_expand:
+        plan.append(("ASN expansion + reverse-DNS sweep", "active — PTR queries across the ASN's prefixes"))
+    if args.brute:
+        plan.append(("DNS brute-force + permutation", "AGGRESSIVE — many queries at the target's NS"))
+    if args.active_ports:
+        plan.append(("TCP port scan + service banners", "AGGRESSIVE — connects to target ports"))
+    if getattr(args, "wayback_paths", False):
+        plan.append(("Wayback path replay", "AGGRESSIVE — re-requests archived paths live at the target"))
+    if getattr(args, "api_scan", False):
+        plan.append(("API-doc / JS-bundle fetch", "AGGRESSIVE — fetches live from the target"))
+    if args.verify_emails:
+        plan.append(("SMTP RCPT-TO email verification", "AGGRESSIVE — SMTP dialog with the target's MX"))
+    if getattr(args, "nuclei", False):
+        plan.append(("nuclei templated scan", "AGGRESSIVE — exploit/auth-bypass probes at live hosts"))
+    log("[i] DRY RUN — planned phases and target-touch tier (no packets will be sent):")
+    for name, tier in plan:
+        log(f"    - {name}")
+        log(f"        {tier}")
+    log("[i] dry run complete — exiting before any network activity")
+
+
 def main() -> None:
     """Dispatch subcommands (dossier / enum / full-report), else run the
     default flat recon flow. The default path preserves the original
@@ -125,10 +221,17 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--check-backends", action="store_true",
                     help="validate optional backends (ProjectDiscovery tools + psql) + "
                          "parser mapping, then exit")
+    ap.add_argument("--doctor", action="store_true",
+                    help="pre-engagement readiness check: config-file permissions, API-key "
+                         "validity, resolver reachability, and optional backends — then exit")
     ap.add_argument("--check-active", action="store_true",
                     help="with --check-backends: let naabu/nuclei test-scan scanme.nmap.org")
     ap.add_argument("--passive-only", action="store_true",
                     help="OSINT sources + host lookup only; no resolution/HTTP/portscan")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the planned phases and each phase's target-touch tier "
+                         "(passive/active/aggressive) for the given flags, then exit before "
+                         "sending a single packet — a scoping/ROE aid")
     ap.add_argument("--all", action="store_true",
                     help="turn on every OSINT/informational check that's otherwise opt-in due "
                          "to quota/speed/binary availability, not ROE: --buckets, --dork, --vt, "
@@ -287,6 +390,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
         log(f"    reachable={'yes' if row['reachable'] else ' no'}  note: {row['note']}")
         return
 
+    if args.doctor:
+        asyncio.run(_run_doctor(args))
+        return
+
     if args.check_backends:
         rows = asyncio.run(backends.selfcheck(active=args.check_active))
         w = max(len(r["tool"]) for r in rows)
@@ -348,6 +455,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
         log(f"[i] --brute: {len(args.brute_words)} wordlist label(s) loaded"
             + (f" from {args.wordlist}" if args.wordlist else " (bundled default)"))
     args.ports = [int(p) for p in args.ports.split(",")] if args.ports else TOP_PORTS
+
+    if args.dry_run:
+        _print_dry_run(args)
+        return
 
     if not _HAVE_DNS and not args.passive_only:
         log("[!] dnspython missing — install it or use --passive-only")
@@ -412,6 +523,7 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     users_path = f"{out_base}.users.csv"
     origin_path = f"{out_base}.origin_ips.txt"
     handoff_path = f"{out_base}.handoff.sh"
+    sarif_path = f"{out_base}.sarif"
 
     # Every result key the JSON export carries. Anything added to run()'s return
     # value has to be listed here too, or it renders in the Markdown/HTML report
@@ -425,6 +537,7 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
     write_markdown(hosts, args.domains, res, md_path)
+    write_sarif(hosts, res, sarif_path)          # entry points as SARIF for GRC/defect tooling
     n_live = write_live_hosts(hosts, live_path)
     n_targets = write_csv(hosts, csv_path)
     # Say what was left off the scope sheet, so a shorter list never reads as
@@ -438,7 +551,7 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
             f"{n_dead} non-existent (NXDOMAIN) and {n_wild} wildcard host(s) — they "
             f"remain in the full report/JSON, just not on the approval list")
 
-    outputs = [json_path, md_path, html_path, live_path, csv_path]
+    outputs = [json_path, md_path, html_path, sarif_path, live_path, csv_path]
     people = res.get("people") or []
     if people:
         write_users_csv(people, users_path)

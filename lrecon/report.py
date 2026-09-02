@@ -336,6 +336,48 @@ def write_users_csv(people, path) -> int:
     return len(people)
 
 
+_SARIF_LEVEL = {"critical": "error", "high": "error",
+                "medium": "warning", "low": "note", "info": "note"}
+
+
+def write_sarif(hosts, res, path) -> int:
+    """Write the synthesized entry points as a SARIF 2.1.0 file so the findings
+    drop straight into GRC / defect-tracking tooling. Each entry point becomes a
+    result (ruleId = finding type, level from severity, target as the location);
+    the distinct types become the run's rules. Returns the result count."""
+    eps = res.get("entry_points") or []
+    rules, seen = [], set()
+    results = []
+    for ep in eps:
+        rid = ep.get("type") or "finding"
+        if rid not in seen:
+            seen.add(rid)
+            rules.append({"id": rid, "name": rid,
+                          "shortDescription": {"text": rid.replace("-", " ")}})
+        results.append({
+            "ruleId": rid,
+            "level": _SARIF_LEVEL.get((ep.get("severity") or "info").lower(), "note"),
+            "message": {"text": ep.get("summary") or rid},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": str(ep.get("target") or "")}}}],
+            "properties": {k: ep[k] for k in ("severity", "attck", "confidence")
+                           if ep.get(k) is not None},
+        })
+    doc = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "lrecon", "informationUri":
+                                "https://github.com/r0xll/Lrecon",
+                                "version": USER_AGENT.split("/", 1)[-1].split(" ")[0],
+                                "rules": rules}},
+            "results": results,
+        }],
+    }
+    Path(path).write_text(json.dumps(doc, indent=2))
+    return len(results)
+
+
 def write_live_hosts(hosts, path) -> int:
     urls = []
     for h in hosts:
