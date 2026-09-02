@@ -318,8 +318,13 @@ async def run(domains, args, keys) -> list:
         if args.vt:
             if keys.get("vt"):
                 vt_limiter = RateLimiter(per_second=4 / 60)
-                for d in domains:
-                    info = await vt_domain_intel(client, d, keys["vt"], vt_limiter)
+                # Independent per domain; the shared vt_limiter still enforces
+                # VT's rate ceiling at each request, so gathering only overlaps
+                # the waiting, never exceeds the limit.
+                async def _vt(d):
+                    return d, await vt_domain_intel(client, d, keys["vt"], vt_limiter)
+                for d, info in await _gather_with_progress(
+                        (_vt(d) for d in domains), "VirusTotal", use_prog):
                     if info:
                         vt_intel[d] = info
                 if vt_intel:
@@ -347,9 +352,12 @@ async def run(domains, args, keys) -> list:
         # should see all N in the WHOIS section, not have the whole
         # section vanish because one domain's lookup came back empty.
         whois = {}
-        for d in domains:
-            vt_whois_text = vt_intel.get(d, {}).get("whois")
-            w = await whois_lookup(client, d, vt_whois_text)
+        # vt_intel is fully populated above, so each domain's WHOIS (which may
+        # fall back to VT's cached text) is independent — gather them.
+        async def _whois(d):
+            return d, await whois_lookup(client, d, vt_intel.get(d, {}).get("whois"))
+        for d, w in await _gather_with_progress(
+                (_whois(d) for d in domains), "WHOIS", use_prog):
             whois[d] = w
             if w.get("expires") and domain_expiring_soon(w["expires"]):
                 log(f"[!] {d}: domain registration expires {w['expires']} — flag to client")
@@ -375,8 +383,14 @@ async def run(domains, args, keys) -> list:
                         h.cname = rec["cname"]
                         _mark_wildcard(h)
             else:
+                # Bound the DNS fan-out: resolve_full fires 3 queries per host,
+                # and a multi-thousand-host scope would otherwise open that many
+                # sockets at once and exhaust file descriptors. Mirrors enrich_sem.
+                resolve_sem = asyncio.Semaphore(args.concurrency)
+
                 async def do_resolve(h):
-                    h.ips, h.cname, h.nxdomain = await resolve_full(h.subdomain, ns)
+                    async with resolve_sem:
+                        h.ips, h.cname, h.nxdomain = await resolve_full(h.subdomain, ns)
                     _mark_wildcard(h)
                     return h
                 await _gather_with_progress((do_resolve(h) for h in hosts.values()),
@@ -850,11 +864,14 @@ async def run(domains, args, keys) -> list:
         # ---- Intel phase: email posture, github, buckets, breach ----
         email = {}
         if not args.passive_only:
-            for d in domains:
-                email[d] = await email_security(d, ns, client)
-                g = email[d].get("grade")
+            async def _email(d):
+                return d, await email_security(d, ns, client)
+            for d, e in await _gather_with_progress(
+                    (_email(d) for d in domains), "email posture", use_prog):
+                email[d] = e
+                g = e.get("grade")
                 if g:
-                    log(f"[+] email {d}: {g} ({len(email[d].get('issues', []))} issue(s))")
+                    log(f"[+] email {d}: {g} ({len(e.get('issues', []))} issue(s))")
 
         # ---- DNS records + mail infrastructure ----
         # Raw apex DNS snapshot (A/AAAA/MX/NS/SOA) for the report's DNS
@@ -865,11 +882,17 @@ async def run(domains, args, keys) -> list:
         dns_records = {}
         mail_infra = {}
         if not args.passive_only:
-            for d in domains:
-                dns_records[d] = await dns_lookup(d, ns)
-                mx = dns_records[d].get("mx") or []
-                if mx:
-                    entries = await mail_infra_lookup(client, mx, ipinfo_token, ns)
+            # Each domain's DNS snapshot + its MX-infra lookup are independent;
+            # do both inside one per-domain coroutine and gather across domains.
+            async def _dns(d):
+                rec = await dns_lookup(d, ns)
+                mx = rec.get("mx") or []
+                entries = await mail_infra_lookup(client, mx, ipinfo_token, ns) if mx else None
+                return d, rec, entries
+            for d, rec, entries in await _gather_with_progress(
+                    (_dns(d) for d in domains), "DNS records", use_prog):
+                dns_records[d] = rec
+                if entries is not None:
                     mail_infra[d] = entries
                     providers = sorted({e["provider"] for e in entries if e["provider"]})
                     unmanaged = [e["host"] for e in entries if not e["provider"]]
