@@ -9,6 +9,43 @@ from .headers import header_gaps
 # --------------------------------------------------------------------------- #
 # Reporting
 # --------------------------------------------------------------------------- #
+
+# Cells that begin with =, +, -, @ (or a tab/CR that a spreadsheet strips back
+# to one of those) are evaluated as formulas by Excel/Sheets on open. Our CSV
+# columns carry third-party data an attacker can influence — a CT-log subdomain,
+# an IPinfo org string, a Hunter/RocketReach name — so `=HYPERLINK(...)` or
+# `=cmd|'/c ...'` in one of those would run on the analyst's machine. Prefix any
+# such value with a single quote (the OWASP CSV-injection rule); csv.writer then
+# quotes it so the sheet shows the literal text, formula defused.
+_CSV_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value) -> str:
+    s = "" if value is None else str(value)
+    if s and s[0] in _CSV_FORMULA_LEADERS:
+        return "'" + s
+    return s
+
+
+_SAFE_URL_SCHEMES = ("http:", "https:", "mailto:")
+
+
+def _safe_href(url) -> str:
+    """An href value safe to drop into the report. `_h.escape` stops attribute
+    breakout but not a `javascript:` (or `data:`) scheme — and these URLs come
+    from target-controlled data (a security.txt contact, a dork/bucket link), so
+    a hostile target could otherwise land script in the analyst's browser. Allow
+    only http/https/mailto (relative `#…`/`/…` too); anything else becomes `#`.
+    The caller still HTML-escapes the result."""
+    s = ("" if url is None else str(url)).strip().strip("\x00\t\r\n")
+    low = s.lower()
+    if low.startswith(_SAFE_URL_SCHEMES) or s.startswith(("#", "/")):
+        return s
+    if ":" not in s.split("/", 1)[0]:      # scheme-relative path, no scheme -> safe
+        return s
+    return "#"
+
+
 def _md_code(value) -> str:
     """A DNS record as inline Markdown code, safe inside a table cell: records
     can contain `|` (rare) and are long enough to need the pipe escaped so the
@@ -267,13 +304,13 @@ def write_csv(hosts, path) -> int:
                 continue
             status = _target_status(h)
             if not h.ips:
-                w.writerow([h.subdomain, "", "", status])
+                w.writerow([_csv_safe(h.subdomain), "", "", status])
                 n += 1
                 continue
             single = len(h.ips) == 1
             for ip in h.ips:
                 org = h.ip_org.get(ip) or (h.org if single else "") or ""
-                w.writerow([h.subdomain, ip, org, status])
+                w.writerow([_csv_safe(h.subdomain), ip, _csv_safe(org), status])
                 n += 1
     return n
 
@@ -290,11 +327,12 @@ def write_users_csv(people, path) -> int:
         w.writerow(["email", "name", "position", "confidence", "generated",
                    "smtp_status", "source"])
         for p in people:
-            w.writerow([p.email, p.name or "", p.position or "",
+            w.writerow([_csv_safe(p.email), _csv_safe(p.name or ""),
+                       _csv_safe(p.position or ""),
                        p.confidence if p.confidence is not None else "",
                        "yes" if p.generated else "",
                        p.smtp_status or "",
-                       ", ".join(sorted(p.source))])
+                       _csv_safe(", ".join(sorted(p.source)))])
     return len(people)
 
 
@@ -1562,9 +1600,13 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
                         if s.get("expired") else esc(exp))
             def _links(key):
                 vals = s.get(key) or []
-                return ", ".join(f'<a href="{_h.escape(v)}" target="_blank" '
-                                 f'rel="noopener">{esc(v)}</a>'
-                                 if v.startswith("http") else esc(v) for v in vals) or "—"
+                def _one(v):
+                    href = _safe_href(v)
+                    if href != "#":
+                        return (f'<a href="{_h.escape(href)}" target="_blank" '
+                                f'rel="noopener">{esc(v)}</a>')
+                    return esc(v)      # unsafe scheme -> plain text, never a link
+                return ", ".join(_one(v) for v in vals) or "—"
             return (f'<tr><td>{esc(s["host"])}</td><td>{_links("contact")}</td>'
                     f'<td>{exp_cell}</td><td>{_links("policy")}</td></tr>')
 
@@ -1616,7 +1658,7 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
     if gh:
         rows = "".join(
             f'<tr><td>{esc(it.get("repo"))}</td><td>{esc(it.get("path"))}</td>'
-            f'<td><a href="{_h.escape(it.get("url") or "#")}">{esc(it.get("url"))}</a></td></tr>'
+            f'<td><a href="{_h.escape(_safe_href(it.get("url")))}">{esc(it.get("url"))}</a></td></tr>'
             for it in gh[:100])
         body = (f'{_html_export_button("t-github", "github_hits.csv")}'
                 f'<table id="t-github"><tr><th>Repo</th><th>Path</th><th>URL</th></tr>{rows}</table>'
@@ -1628,7 +1670,7 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
         rows = "".join(
             f'<tr><td>{esc(d["category"])}</td><td>{sev_badge(d["severity"])}</td>'
             f'<td>{esc(d["title"])}</td>'
-            f'<td><a href="{_h.escape(d["link"])}">{esc(d["link"])}</a></td>'
+            f'<td><a href="{_h.escape(_safe_href(d["link"]))}">{esc(d["link"])}</a></td>'
             f'<td>{esc(d["snippet"])}</td></tr>'
             for d in dorks)
         body = (f'{_html_export_button("t-dorks", "dork_hits.csv")}'
@@ -1647,7 +1689,7 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
             objs = f'{n_obj}{"+" if b.get("truncated") else ""}' if n_obj is not None else "—"
             pub = ('<strong class="bad">YES</strong>' if b["public"] else "no")
             sens = f'<strong class="bad">{n_int}</strong>' if n_int else "—"
-            return (f'<tr><td><a href="{esc(b["url"])}" target="_blank" rel="noopener">'
+            return (f'<tr><td><a href="{esc(_safe_href(b["url"]))}" target="_blank" rel="noopener">'
                     f'{esc(b["name"])}</a></td>'
                     f'<td>{esc(b["provider"])}</td><td>{esc(b["status"])}</td>'
                     f'<td>{pub}</td><td>{objs}</td><td>{sens}</td>'
@@ -1665,7 +1707,7 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
         for b in [x for x in buckets if x.get("public") and x.get("objects")]:
             def _obj_row(o):
                 flag = ' <span class="badge">sensitive</span>' if o.get("interesting") else ""
-                return (f'<tr><td><a href="{esc(o["url"])}" target="_blank" rel="noopener">'
+                return (f'<tr><td><a href="{esc(_safe_href(o["url"]))}" target="_blank" rel="noopener">'
                         f'<code>{esc(o["key"])}</code></a>{flag}</td>'
                         f'<td>{esc(human_bytes(o.get("size")))}</td></tr>')
             ordered = ((b.get("interesting") or [])
@@ -1677,7 +1719,7 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
                     if len(ordered) > 150 or b.get("truncated") else "")
             body += (f'<h4>{esc(b["name"])} <span class="count">'
                      f'{b.get("object_count", 0)}</span></h4>'
-                     f'<p class="note">Listing: <a href="{esc(b["url"])}" target="_blank" '
+                     f'<p class="note">Listing: <a href="{esc(_safe_href(b["url"]))}" target="_blank" '
                      f'rel="noopener">{esc(b["url"])}</a></p>'
                      f'<div style="overflow-x:auto"><table><tr><th>Object</th><th>Size</th></tr>'
                      f'{obj_rows}</table></div>{more}')
@@ -2104,7 +2146,11 @@ function exportTableToCSV(tableId, filename) {{
   var csv = rows.map(function(row) {{
     var cells = Array.prototype.slice.call(row.querySelectorAll('th,td'));
     return cells.map(function(cell) {{
-      return '"' + cell.textContent.trim().replace(/"/g, '""') + '"';
+      var t = cell.textContent.trim();
+      // Defuse spreadsheet formula injection on the client-side export too,
+      // same rule as the server-written CSVs (_csv_safe).
+      if (t && '=+-@\\t\\r'.indexOf(t[0]) !== -1) t = "'" + t;
+      return '"' + t.replace(/"/g, '""') + '"';
     }}).join(',');
   }}).join('\\r\\n');
   var blob = new Blob([csv], {{type: 'text/csv;charset=utf-8;'}});
