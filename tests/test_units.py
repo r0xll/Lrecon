@@ -4983,8 +4983,24 @@ def test_write_html_security_txt_links_contact_and_policy():
     assert "security.txt (RFC 9116)" in content
     assert 'href="https://internal-portal.x.com/vdp"' in content
     assert "expired" in content
-    # A non-URL contact must not become a broken anchor.
-    assert 'href="mailto:security@x.com"' not in content
+    # http/https/mailto are all valid, useful links.
+    assert 'href="mailto:security@x.com"' in content
+
+
+def test_write_html_security_txt_rejects_javascript_contact():
+    # A hostile target controls its own security.txt; a javascript: contact must
+    # never become an executable link in the analyst's report.
+    res = {"security_txt": [
+        {"host": "evil.com", "url": "https://evil.com/.well-known/security.txt",
+         "contact": ["javascript:alert(document.cookie)"], "expires": [],
+         "policy": [], "expired": False},
+    ]}
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "r.html"
+        report.write_html([Host("evil.com")], ["evil.com"], res, str(path))
+        content = path.read_text()
+    # The value may appear as escaped plain text, but never inside an href.
+    assert 'href="javascript' not in content.lower()
 
 
 def test_write_html_whois_section_shows_domain_even_when_rdap_lookup_failed():
@@ -6315,7 +6331,9 @@ async def test_llm_google_folds_system_into_first_user_turn():
     out = await llm.complete(c, cfg, [{"role": "system", "content": "SYS"},
                                       {"role": "user", "content": "hi"}])
     assert out == "g"
-    assert "generateContent" in c.last["url"] and c.last["url"].endswith("key=gk")
+    # Key rides the x-goog-api-key header, never the request URL (log-safety).
+    assert "generateContent" in c.last["url"] and "key=gk" not in c.last["url"]
+    assert c.last["headers"]["x-goog-api-key"] == "gk"
     assert c.last["json"]["contents"][0]["parts"][0]["text"].startswith("SYS")
 
 
@@ -6860,6 +6878,59 @@ def test_write_html_skips_oversize_screenshot():
     # Over the cap → not embedded, and with no other shots the section is omitted.
     assert "data:image/png;base64," not in html
     assert 'id="shots"' not in html
+
+
+# --------------------------------------------------------------------------- #
+# Security hardening (audit follow-up, PR A)
+# --------------------------------------------------------------------------- #
+def test_csv_safe_defuses_formula_leaders():
+    from lrecon.report import _csv_safe
+    for bad in ("=HYPERLINK(\"http://x\")", "+1+2", "-2+3", "@SUM(A1)", "\tcmd", "\rx"):
+        assert _csv_safe(bad).startswith("'"), bad
+    # Ordinary values are untouched.
+    assert _csv_safe("Acme Inc") == "Acme Inc"
+    assert _csv_safe("192.0.2.1") == "192.0.2.1"
+    assert _csv_safe(None) == ""
+
+
+def test_write_csv_sanitizes_malicious_org(tmp_path):
+    h = Host(subdomain="www.example.com", ips=["192.0.2.1"], http_status=200)
+    h.ip_org = {"192.0.2.1": "=cmd|'/c calc'!A1"}
+    path = tmp_path / "t.targets.csv"
+    report.write_csv([h], str(path))
+    rows = list(csv.reader(path.read_text().splitlines()))
+    org_cell = rows[1][2]
+    assert org_cell.startswith("'=cmd")           # formula defused, value preserved
+
+
+def test_safe_href_allows_web_schemes_and_blocks_javascript():
+    from lrecon.report import _safe_href
+    assert _safe_href("https://example.com/x") == "https://example.com/x"
+    assert _safe_href("http://example.com") == "http://example.com"
+    assert _safe_href("mailto:security@example.com") == "mailto:security@example.com"
+    assert _safe_href("/relative/path") == "/relative/path"
+    # Hostile schemes collapse to '#'.
+    assert _safe_href("javascript:alert(1)") == "#"
+    assert _safe_href("JavaScript:alert(1)") == "#"
+    assert _safe_href("data:text/html,<script>") == "#"
+    assert _safe_href("  javascript:alert(1)") == "#"
+
+
+def test_scrub_redacts_configured_keys():
+    from lrecon.core import _scrub
+    keys = {"shodan": "SECRETKEY123", "ipinfo": None, "x": "ab"}  # short/None ignored
+    msg = "ConnectError to https://api.shodan.io/api-info?key=SECRETKEY123 failed"
+    out = _scrub(msg, keys)
+    assert "SECRETKEY123" not in out and "***" in out
+
+
+def test_name_in_scope_rejects_lookalike_domain():
+    # The bug the three former endswith gates could hit.
+    from lrecon.sources import name_in_scope
+    assert name_in_scope("app.example.com", "example.com") is True
+    assert name_in_scope("example.com", "example.com") is True
+    assert name_in_scope("testexample.com", "example.com") is False
+    assert name_in_scope("notexample.com", "example.com") is False
 
 
 # --------------------------------------------------------------------------- #

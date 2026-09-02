@@ -160,8 +160,12 @@ async def _google_complete(client, cfg: LLMConfig, params: dict,
     # (v1beta systemInstruction support varies by model, so keep it simple).
     model = params["model"]
     url = f"{cfg.base_url.rstrip('/')}/models/{model}:generateContent"
+    # Pass the key in the x-goog-api-key header rather than the query string, so
+    # it never rides the request URL (which a transport error would stringify
+    # into a log).
+    headers = {"Content-Type": "application/json"}
     if cfg.api_key:
-        url += f"?key={cfg.api_key}"
+        headers["x-goog-api-key"] = cfg.api_key
     sys_txt = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
     contents = []
     for m in messages:
@@ -175,8 +179,7 @@ async def _google_complete(client, cfg: LLMConfig, params: dict,
     body = {"contents": contents,
             "generationConfig": {"temperature": params["temperature"],
                                  "maxOutputTokens": params["max_tokens"]}}
-    r = await client.post(url, headers={"Content-Type": "application/json"},
-                          json=body, timeout=timeout)
+    r = await client.post(url, headers=headers, json=body, timeout=timeout)
     r.raise_for_status()
     data = r.json()
     cands = data.get("candidates") or []

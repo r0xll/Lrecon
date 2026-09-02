@@ -296,6 +296,15 @@ def load_keys(args) -> dict:
             "openai": None, "anthropic": None, "google_ai": None, "llm": None}
     cfg = Path(args.config) if args.config else CONFIG_PATH
     if cfg.exists():
+        # The config holds a dozen API keys in cleartext. Warn if it is
+        # group/other-readable so the operator can `chmod 600` it — a shared or
+        # backed-up box shouldn't expose engagement credentials to every account.
+        try:
+            if (cfg.stat().st_mode & 0o077) and os.name == "posix":
+                log(f"[!] {cfg} is group/other-readable — it holds API keys; "
+                    f"run: chmod 600 {cfg}")
+        except OSError:
+            pass
         try:
             data = json.loads(cfg.read_text())
             keys["shodan"] = data.get("shodan_api_key")

@@ -39,6 +39,19 @@ async def _gather_with_progress(coros, desc, use_progress):
     return await asyncio.gather(*coros)
 
 
+def _scrub(text: str, keys: dict) -> str:
+    """Redact every configured API key from a string before it is logged. Some
+    services take the key in the query string (Shodan `?key=`, Hunter/RocketReach
+    `?api_key=`), and an httpx transport error stringifies the request URL — so a
+    transient network failure could otherwise print a live key into the run log
+    and any terminal capture. Also covers a key echoed in a provider error body."""
+    out = text
+    for v in (keys or {}).values():
+        if v and isinstance(v, str) and len(v) >= 6:
+            out = out.replace(v, "***")
+    return out
+
+
 async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
     """
     On-boot API key verification — one cheap, non-quota-consuming call per
@@ -63,7 +76,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
             else:
                 log(f"[!] Shodan API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
         except Exception as e:
-            log(f"[!] Shodan API: check failed ({e}) — proceeding anyway")
+            log(f"[!] Shodan API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("ipinfo"):
         try:
@@ -78,7 +91,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
             else:
                 log(f"[!] IPinfo API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
         except Exception as e:
-            log(f"[!] IPinfo API: check failed ({e}) — proceeding anyway")
+            log(f"[!] IPinfo API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("github"):
         try:
@@ -93,7 +106,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
             else:
                 log(f"[!] GitHub API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
         except Exception as e:
-            log(f"[!] GitHub API: check failed ({e}) — proceeding anyway")
+            log(f"[!] GitHub API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("hunter"):
         try:
@@ -109,7 +122,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
             else:
                 log(f"[!] Hunter.io API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
         except Exception as e:
-            log(f"[!] Hunter.io API: check failed ({e}) — proceeding anyway")
+            log(f"[!] Hunter.io API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("rocketreach"):
         try:
@@ -123,7 +136,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
             else:
                 log(f"[!] RocketReach API: unexpected response (HTTP {r.status_code}) — proceeding anyway")
         except Exception as e:
-            log(f"[!] RocketReach API: check failed ({e}) — proceeding anyway")
+            log(f"[!] RocketReach API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     # Brave has no free account endpoint — the only way to validate a key is to
     # spend a search from the monthly quota. So this runs *only* when dorking is
@@ -147,7 +160,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
                 log(f"[!] Brave Search API: unexpected response (HTTP {r.status_code}) "
                     f"— proceeding anyway")
         except Exception as e:
-            log(f"[!] Brave Search API: check failed ({e}) — proceeding anyway")
+            log(f"[!] Brave Search API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("vt"):
         try:
@@ -164,7 +177,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
                 log(f"[!] VirusTotal API: unexpected response (HTTP {r.status_code}) "
                     f"— proceeding anyway")
         except Exception as e:
-            log(f"[!] VirusTotal API: check failed ({e}) — proceeding anyway")
+            log(f"[!] VirusTotal API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("otx"):
         try:
@@ -179,7 +192,7 @@ async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
                 log(f"[!] OTX API: unexpected response (HTTP {r.status_code}) "
                     f"— proceeding anyway")
         except Exception as e:
-            log(f"[!] OTX API: check failed ({e}) — proceeding anyway")
+            log(f"[!] OTX API: check failed ({_scrub(str(e), keys)}) — proceeding anyway")
 
     if keys.get("hibp"):
         # hibp_breaches() only calls HIBP's keyless domain-breaches endpoint —
@@ -346,7 +359,7 @@ async def run(domains, args, keys) -> list:
             wildcard_ips = {d: await detect_wildcard(d, ns) for d in domains}
 
             def _mark_wildcard(h):
-                root = next((d for d in domains if h.subdomain.endswith(d)), None)
+                root = next((d for d in domains if name_in_scope(h.subdomain, d)), None)
                 wc = wildcard_ips.get(root, set()) if root else set()
                 if wc and h.ips and set(h.ips).issubset(wc):
                     h.wildcard = True
@@ -781,7 +794,7 @@ async def run(domains, args, keys) -> list:
 
         # ---- rDNS wire-back: add in-scope PTR names as hosts ----
         for h in list(hosts.values()):
-            if h.rdns and any(h.rdns.endswith(d) for d in domains) and h.rdns not in hosts:
+            if h.rdns and any(name_in_scope(h.rdns, d) for d in domains) and h.rdns not in hosts:
                 nh = Host(subdomain=h.rdns, source={"rdns"})
                 if not args.passive_only:
                     nh.ips, nh.cname, nh.nxdomain = await resolve_full(h.rdns, ns)
@@ -817,7 +830,7 @@ async def run(domains, args, keys) -> list:
                     swept = await reverse_dns_sweep(prefixes, ns, cap=args.asn_cap)
                     added = 0
                     for ip, host in swept.items():
-                        if any(host.endswith(d) for d in domains) and host not in hosts:
+                        if any(name_in_scope(host, d) for d in domains) and host not in hosts:
                             hosts[host] = Host(subdomain=host, ips=[ip], source={"asn-rdns"})
                             added += 1
                     # An ASN that yielded nothing is the normal case and says
