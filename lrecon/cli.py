@@ -195,6 +195,27 @@ def _print_dry_run(args) -> None:
     log("[i] dry run complete — exiting before any network activity")
 
 
+def _ensure_out_dir(ap, out: str) -> str:
+    """Normalize `--out` into an output base path and create its directory.
+
+    `--out` may be a bare name (`lrecon`) or a path (`../out/recon`, `~/scans/acme`)
+    — the writers just append `_<timestamp>.<ext>` to it, but `Path.write_text`
+    won't create missing parents, so a directory-qualified name used to run the
+    whole scan and then crash at the first write. Expand `~`, treat a
+    trailing-separator value as a directory (append the default basename), create
+    the parent up front, and fail fast with a clear error if it can't be made."""
+    import os
+    ends_with_sep = out.endswith(os.sep) or (os.altsep and out.endswith(os.altsep))
+    p = Path(out).expanduser()
+    if ends_with_sep:
+        p = p / "lrecon"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        ap.error(f"--out: cannot create output directory {p.parent} ({e})")
+    return str(p)
+
+
 def main() -> None:
     """Dispatch subcommands (dossier / enum / full-report), else run the
     default flat recon flow. The default path preserves the original
@@ -371,8 +392,9 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                          "1 req/s Shodan host API; 0 = always use Shodan")
     ap.add_argument("--no-progress", action="store_true")
     ap.add_argument("-o", "--out", default="lrecon",
-                    help="output basename — a UTC timestamp is appended so "
-                         "reruns don't overwrite prior output (<basename>_YYYYMMDD_HHMMSS.*)")
+                    help="output path — a bare name or dir/name (e.g. ../out/recon, "
+                         "~/scans/acme); parent directories are created. A UTC timestamp is "
+                         "appended so reruns don't overwrite prior output (<path>_YYYYMMDD_HHMMSS.*)")
     args = ap.parse_args(argv)
     apply_all_flag(args)
     # --company is an alias for --company-name; --domain appends to positional.
@@ -429,6 +451,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
 
     if not args.domains and not args.ip_targets:
         ap.error("provide at least one domain or IP/CIDR (or use --check-backends)")
+
+    # Resolve --out to a base path and create its directory now, so a bad output
+    # location fails in milliseconds rather than after the whole scan has run.
+    args.out = _ensure_out_dir(ap, args.out)
 
     if args.active_ports and args.passive_only:
         ap.error("--active-ports conflicts with --passive-only")
@@ -656,7 +682,9 @@ def _cmd_enum(argv) -> None:
                     help="MAIL FROM sender for --verify-emails (default verify@<target-domain>); "
                          "set an operator-controlled address so the probe doesn't forge the client's domain")
     ap.add_argument("--resolvers", help="comma-separated DNS servers")
-    ap.add_argument("-o", "--out", default="lrecon", help="output basename")
+    ap.add_argument("-o", "--out", default="lrecon",
+                    help="output path — a bare name or dir/name (e.g. ../out/recon); "
+                         "parent directories are created")
     ap.add_argument("--config", help="config json path")
     ap.add_argument("--hunter-key")
     ap.add_argument("--rocketreach-key")
@@ -678,6 +706,7 @@ def _cmd_enum(argv) -> None:
     if not domains:
         ap.error("provide at least one domain")
     args.domains = domains
+    args.out = _ensure_out_dir(ap, args.out)          # create the output dir up front
     keys = load_keys(args)
     ns = args.resolvers.split(",") if args.resolvers else _DR
 
