@@ -7117,6 +7117,32 @@ def test_dry_run_prints_tiers_and_makes_no_network_call(monkeypatch):
     assert "HTTP probe" not in "\n".join(lines)
 
 
+def test_ensure_out_dir_creates_nested_path_and_normalizes():
+    from lrecon.cli import _ensure_out_dir
+    ap = argparse.ArgumentParser()
+    with tempfile.TemporaryDirectory() as d:
+        # A nested, non-existent output dir is created; the base keeps the name.
+        base = _ensure_out_dir(ap, str(Path(d) / "a" / "b" / "recon"))
+        assert base == str(Path(d) / "a" / "b" / "recon")
+        assert (Path(d) / "a" / "b").is_dir()
+        # A trailing separator means "directory" -> default basename appended.
+        base2 = _ensure_out_dir(ap, str(Path(d) / "c") + "/")
+        assert base2 == str(Path(d) / "c" / "lrecon")
+        assert (Path(d) / "c").is_dir()
+    # ~ is expanded (no literal tilde survives into the path).
+    assert not _ensure_out_dir(ap, "~/x-basename").startswith("~")
+
+
+def test_ensure_out_dir_errors_when_parent_uncreatable():
+    from lrecon.cli import _ensure_out_dir
+    ap = argparse.ArgumentParser()
+    with tempfile.TemporaryDirectory() as d:
+        blocker = Path(d) / "afile"
+        blocker.write_text("x")                       # a file where a dir would need to be
+        with pytest.raises(SystemExit):               # argparse .error() exits
+            _ensure_out_dir(ap, str(blocker / "sub" / "recon"))
+
+
 # --------------------------------------------------------------------------- #
 # Repo hygiene
 # --------------------------------------------------------------------------- #
