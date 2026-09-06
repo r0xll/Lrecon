@@ -594,6 +594,22 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"| `{tid}` | {', '.join(hs)} |")
         lines.append("")
 
+    social = res.get("social") or {}
+    if social:
+        rows = [(h, r) for h, results in social.items() for r in results
+                if r.get("status") in ("present", "absent")]
+        n_squat = sum(1 for _h, r in rows if r["status"] == "absent")
+        lines += [f"## Brand-handle presence ({len(rows)}, {n_squat} squattable)", "",
+                  "The org's handle checked across major platforms (third-party OSINT, no "
+                  "target contact). **squattable** = the handle is unregistered, so an attacker "
+                  "could claim it to impersonate the org for phishing — verify before reporting. "
+                  "Inconclusive checks (rate-limited / bot-blocked) are omitted.", "",
+                  "| Handle | Platform | Status | URL |", "|---|---|---|---|"]
+        for h, r in sorted(rows, key=lambda x: (x[1]["status"] != "absent", x[0], x[1]["site"])):
+            status = "**squattable**" if r["status"] == "absent" else "present"
+            lines.append(f"| {h} | {r['site']} | {status} | {r['url']} |")
+        lines.append("")
+
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
     if ep_hosts:
         n_ep = sum(len(h.endpoints) for h in ep_hosts)
@@ -1311,6 +1327,32 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
                 f'useful for confirming ownership and spotting shadow-IT. Correlated within the '
                 f'scanned scope only; no third-party lookup.</p>')
         sections.append(_html_section("tracking", "Shared tracking IDs", len(tracking), body))
+
+    # ---- Brand-handle presence (Sherlock-style, org-scoped) ----
+    social = res.get("social") or {}
+    if social:
+        srows = [(h, r) for h, results in social.items() for r in results
+                 if r.get("status") in ("present", "absent")]
+        n_squat = sum(1 for _h, r in srows if r["status"] == "absent")
+
+        def _social_row(h, r):
+            cell = ('<strong class="bad">squattable</strong>'
+                    if r["status"] == "absent" else "present")
+            return (f'<tr><td>{esc(h)}</td><td>{esc(r["site"])}</td><td>{cell}</td>'
+                    f'<td><a href="{esc(_safe_href(r["url"]))}" target="_blank" '
+                    f'rel="noopener">{esc(r["url"])}</a></td></tr>')
+        rows = "".join(
+            _social_row(h, r)
+            for h, r in sorted(srows, key=lambda x: (x[1]["status"] != "absent", x[0], x[1]["site"])))
+        body = (f'{_html_export_button("t-social", "brand_handles.csv")}'
+                f'<table id="t-social"><tr><th>Handle</th><th>Platform</th><th>Status</th>'
+                f'<th>URL</th></tr>{rows}</table>'
+                f'<p class="note">The org handle across major platforms (third-party OSINT, no '
+                f'target contact). <strong>squattable</strong> = unregistered, so an attacker '
+                f'could claim it to impersonate the org for phishing — verify before reporting. '
+                f'Inconclusive (rate-limited / bot-blocked) checks are omitted.</p>')
+        sections.append(_html_section("social", f"Brand-handle presence ({n_squat} squattable)",
+                                      len(srows), body))
 
     # ---- Discovered endpoints (Wayback + API docs -> live) ----
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]

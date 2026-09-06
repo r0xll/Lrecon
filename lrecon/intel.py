@@ -1823,7 +1823,7 @@ def risk_score(host, host_entry_points) -> tuple:
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                            dorks=None, auth_surfaces=None, whois=None,
-                           axfr=None) -> list:
+                           axfr=None, social=None) -> list:
     """
     Pull the findings that represent a likely initial-access vector out of the
     full result set into one ranked list, so they're stated explicitly instead
@@ -1831,6 +1831,21 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
     summary, attck (ATT&CK technique).
     """
     out = []
+
+    # Squattable brand handles — an unregistered handle on a major platform lets
+    # an attacker stand up a lookalike org account for phishing (T1585.001).
+    # Only `absent` (clearly unregistered) counts; `unknown` never does.
+    for handle, results in (social or {}).items():
+        for r in results or []:
+            if r.get("status") != "absent":
+                continue
+            out.append({"type": "brand-handle-squat",
+                        "target": f"{r.get('site')}/{handle}",
+                        "severity": "low",
+                        "summary": f"Unregistered '{handle}' handle on {r.get('site')} — an "
+                                   f"attacker could register it to impersonate the org for "
+                                   f"phishing (verify before reporting)",
+                        "attck": "T1585.001"})
 
     for h in hosts:
         if h.takeover:

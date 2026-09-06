@@ -362,6 +362,11 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--company-name",
                     help="company name override for people-enum sources that search by name "
                          "rather than domain (e.g. RocketReach); defaults to the domain's label")
+    ap.add_argument("--brand-handles", "--social", dest="brand_handles", action="store_true",
+                    help="check the org's handle across major platforms (third-party OSINT, no "
+                         "target contact): reports official accounts and flags squattable "
+                         "(unregistered) brand handles as an impersonation/phishing lead. Opt-in "
+                         "(not enabled by --all)")
     ap.add_argument("--verify-emails", action="store_true",
                     help="SMTP RCPT-TO probe discovered company emails against the domain's MX "
                          "(active — touches target mail infra; detects and flags catch-all domains "
@@ -558,7 +563,7 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                                     "asn", "favicon_pivots", "nuclei", "diff", "per_source",
                                     "entry_points", "whois", "dorks", "dns", "mail_infra", "vt",
                                     "auth_surface", "certs", "axfr", "security_txt",
-                                    "tracking_correlation")}
+                                    "tracking_correlation", "social")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))

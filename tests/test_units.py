@@ -7144,6 +7144,59 @@ def test_ensure_out_dir_errors_when_parent_uncreatable():
 
 
 # --------------------------------------------------------------------------- #
+# Brand-handle enumeration (Sherlock-style, org-scoped)
+# --------------------------------------------------------------------------- #
+def test_brand_handles_derives_slugs():
+    from lrecon.social import brand_handles
+    h = brand_handles(["acme-corp.com", "acme-corp.io"], company_name="Acme Corp")
+    # domain label as-is, slugified variant, and the company slug; deduped.
+    assert "acme-corp" in h and "acmecorp" in h
+    assert h == list(dict.fromkeys(h))                # no duplicates
+    assert all(x for x in h)                          # no empties
+
+
+async def test_check_handle_classifies_present_absent_unknown():
+    from lrecon.social import check_handle
+    sites = {
+        "Present": {"url": "https://p.test/{}", "category": "x"},
+        "Absent":  {"url": "https://a.test/{}", "category": "x"},
+        "Blocked": {"url": "https://b.test/{}", "category": "x"},
+        "Msg":     {"url": "https://m.test/{}", "method": "message",
+                    "absent_if": "no such user", "category": "x"},
+    }
+
+    class _Resp:
+        def __init__(self, code, text=""):
+            self.status_code = code
+            self.text = text
+    class _C:
+        async def get(self, url, timeout=None, follow_redirects=None, headers=None):
+            if url.startswith("https://p.test"):
+                return _Resp(200)
+            if url.startswith("https://a.test"):
+                return _Resp(404)
+            if url.startswith("https://b.test"):
+                return _Resp(403)                     # bot-blocked -> inconclusive
+            return _Resp(200, "sorry, no such user here")   # message method -> absent
+    res = {r["site"]: r["status"]
+           for r in await check_handle(_C(), "acme", asyncio.Semaphore(4), sites=sites)}
+    assert res == {"Present": "present", "Absent": "absent",
+                   "Blocked": "unknown", "Msg": "absent"}
+
+
+def test_summarize_entry_points_flags_squattable_handle_only():
+    social = {"acme": [
+        {"site": "GitHub", "url": "https://github.com/acme", "status": "absent"},
+        {"site": "X/Twitter", "url": "https://x.com/acme", "status": "present"},
+        {"site": "TikTok", "url": "https://www.tiktok.com/@acme", "status": "unknown"},
+    ]}
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], social=social)
+    squat = [e for e in eps if e["type"] == "brand-handle-squat"]
+    assert len(squat) == 1
+    assert squat[0]["target"] == "GitHub/acme" and squat[0]["attck"] == "T1585.001"
+
+
+# --------------------------------------------------------------------------- #
 # Repo hygiene
 # --------------------------------------------------------------------------- #
 def test_no_recon_output_is_tracked_in_the_repo():
