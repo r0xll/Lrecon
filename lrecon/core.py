@@ -11,6 +11,7 @@ from .intel import *
 from .active import *
 from .state import *
 from .people import *
+from .social import *
 from .dorking import *
 from .vt import *
 from . import backends
@@ -1043,6 +1044,18 @@ async def run(domains, args, keys) -> list:
                 + ("(keyed sources + website scrape both came back empty)" if keyed
                    else "(website scrape only — no hunter/rocketreach/github key configured)"))
 
+        # ---- Brand-handle enumeration (Sherlock-style, org-scoped) ----
+        # Third-party OSINT only — no target contact. Opt-in (--brand-handles):
+        # checks the org's handle across major platforms and flags unregistered
+        # (squattable) ones as impersonation/phishing leads (see social.py).
+        social = {}
+        if getattr(args, "brand_handles", False):
+            social = await enumerate_brand_handles(client, domains, args.company_name)
+            n_abs = sum(1 for rs in social.values() for r in rs if r["status"] == "absent")
+            n_pre = sum(1 for rs in social.values() for r in rs if r["status"] == "present")
+            log(f"[+] brand handles: {n_pre} present, {n_abs} squattable across "
+                f"{len(social)} handle(s)")
+
         if args.verify_emails and people and not args.passive_only:
             for d in domains:
                 d_people = [p for p in people if p.email.endswith(f"@{d}")]
@@ -1181,7 +1194,7 @@ async def run(domains, args, keys) -> list:
     # ---- Entry-point summary (red-team signal: what to chase first) ----
     entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings,
                                           nuclei, dorks, auth_surfaces, whois=whois,
-                                          axfr=axfr)
+                                          axfr=axfr, social=social)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
@@ -1212,6 +1225,6 @@ async def run(domains, args, keys) -> list:
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
             "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs,
             "axfr": axfr, "security_txt": security_txts,
-            "tracking_correlation": tracking_correlation}
+            "tracking_correlation": tracking_correlation, "social": social}
 
 
