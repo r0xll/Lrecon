@@ -1022,9 +1022,12 @@ async def run(domains, args, keys) -> list:
                 staff, roles = split_role_accounts(fresh)
                 roles_total += len(roles)
                 scraped_total += len(fresh)
-                for email in staff + roles:
-                    people.append(Person(email=email, source={"website"}))
-                    known.add(email)
+                # Loop var must NOT be `email`: that name holds the email-security
+                # posture dict returned as res["email"], and rebinding it to an
+                # address string here corrupted the report (str has no .items()).
+                for addr in staff + roles:
+                    people.append(Person(email=addr, source={"website"}))
+                    known.add(addr)
                 # An address already known from a keyed source is corroborated,
                 # not duplicated — record that the target published it itself.
                 for p in people:
