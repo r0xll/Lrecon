@@ -4249,6 +4249,19 @@ def test_every_resolve_full_caller_unpacks_three_values():
     assert offenders == [], "resolve_full callers not unpacking 3 values:\n" + "\n".join(offenders)
 
 
+def test_core_does_not_shadow_email_result_key():
+    """core.run() builds `email` as the {domain: posture} dict returned as
+    res["email"]. A website-scrape loop once did `for email in staff + roles`,
+    rebinding it to an address string, so res["email"] became a str and
+    write_markdown crashed on `.items()`. Guard the whole class: `email` must
+    never be a loop variable in core.py."""
+    core_src = (Path(__file__).resolve().parent.parent / "lrecon" / "core.py").read_text()
+    offenders = [f"core.py:{i}: {ln.strip()}"
+                 for i, ln in enumerate(core_src.splitlines(), 1)
+                 if ln.lstrip().startswith("for email ")]
+    assert offenders == [], "`email` result key shadowed by a loop var:\n" + "\n".join(offenders)
+
+
 async def test_detect_wildcard_unpacks_resolve_full(monkeypatch):
     """Directly exercises the caller that crashed the user's run: it must unpack
     resolve_full's real 3-tuple, not raise ValueError."""
