@@ -656,6 +656,50 @@ async def test_discover_endpoints_finds_api_docs_and_same_origin_js_secrets():
     assert any(s["kind"] == "aws-access-key" for s in host.js_secrets)  # same-origin JS
 
 
+async def test_probe_vcs_config_records_content_validated_hit():
+    from lrecon import active
+    host = Host("a.example.com", ips=["1.2.3.4"], http_status=200, scheme="https")
+    base = "https://a.example.com"
+    # A real exposed git dir: /.git/HEAD serves a ref line, /.git/config a [core]
+    # block. Everything else 404s.
+    routes = {
+        base + "/.git/HEAD": (200, "ref: refs/heads/main\n"),
+        base + "/.git/config": (200, "[core]\n\trepositoryformatversion = 0\n"),
+    }
+
+    class _C:
+        async def get(self, url, **kwargs):
+            status, text = routes.get(url, (404, ""))
+            return _FakeRespText(status, text)
+
+    await active.probe_vcs_config(_C(), host, asyncio.Semaphore(4))
+    hits = {e["path"]: e for e in host.endpoints}
+    assert hits["/.git/HEAD"]["source"] == "vcs-config"
+    assert hits["/.git/config"]["source"] == "vcs-config"
+    assert "/.env" not in hits  # not served → not recorded
+
+
+async def test_probe_vcs_config_rejects_soft_404_html():
+    from lrecon import active
+    host = Host("a.example.com", ips=["1.2.3.4"], http_status=200, scheme="https")
+
+    class _C:
+        # A server that answers every path with a styled 200 HTML error page.
+        async def get(self, url, **kwargs):
+            return _FakeRespText(200, "<html><body>Not Found</body></html>")
+
+    await active.probe_vcs_config(_C(), host, asyncio.Semaphore(4))
+    assert host.endpoints == []  # content validation rejects the soft-404 body
+
+
+def test_vcs_config_paths_flow_into_exposed_endpoint_entry_points():
+    from lrecon import intel, active
+    # Every VCS/config path LRecon probes must be recognized as sensitive so it
+    # auto-raises as an exposed-endpoint entry point (no dedicated entry block).
+    for path, _ in active._VCS_CONFIG_CHECKS:
+        assert intel._is_sensitive_path(path), f"{path} not flagged sensitive"
+
+
 def test_ssh_tech_extracts_openssh_version():
     from lrecon import active
     assert active._ssh_tech("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1") == "OpenSSH:8.9"

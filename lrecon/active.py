@@ -310,6 +310,92 @@ _APIDOC_PATHS = ("/openapi.json", "/swagger.json", "/swagger-ui.html", "/api-doc
 _SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
 _JS_MAX_BYTES = 512 * 1024        # a bundle bigger than this is scanned truncated
 
+# Exposed VCS / config artifacts worth a direct probe. Each entry pairs a path
+# with a content validator: a webserver that answers every path with a styled
+# 200 HTML error ("soft 404") would false-positive on status alone, so a hit
+# only counts when the body actually looks like the artifact it claims to be.
+# BBOT-style, but tightly scoped and keyless.
+_VCS_HEAD_RE = re.compile(r"^(?:ref:\s|[0-9a-f]{40}\b)", re.I)
+
+
+def _looks_git_head(b: str) -> bool:
+    return bool(_VCS_HEAD_RE.match(b.lstrip()))
+
+
+def _looks_git_config(b: str) -> bool:
+    return "[core]" in b.lower()
+
+
+def _looks_svn_entries(b: str) -> bool:
+    # Old working-copy format: first line is a format integer or "dir".
+    first = b.lstrip().split("\n", 1)[0].strip()
+    return first.isdigit() or first == "dir"
+
+
+def _looks_hg_requires(b: str) -> bool:
+    toks = {"revlogv1", "dotencode", "store", "fncache", "generaldelta"}
+    return any(t in b.lower() for t in toks)
+
+
+def _looks_env(b: str) -> bool:
+    # A dotenv file is KEY=value lines, not markup. Reject anything HTML-ish.
+    s = b.lstrip()
+    if s[:1] == "<" or "<html" in s[:400].lower():
+        return False
+    for line in s.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, sep, _ = line.partition("=")
+        if sep and k.strip().replace("_", "").isalnum():
+            return True
+        return False
+    return False
+
+
+def _looks_ds_store(b: str) -> bool:
+    return b[:8].find("Bud1") != -1 or b[:4] == "\x00\x00\x00\x01"
+
+
+_VCS_CONFIG_CHECKS = (
+    ("/.git/HEAD", _looks_git_head),
+    ("/.git/config", _looks_git_config),
+    ("/.svn/entries", _looks_svn_entries),
+    ("/.hg/requires", _looks_hg_requires),
+    ("/.env", _looks_env),
+    ("/.DS_Store", _looks_ds_store),
+)
+
+
+async def probe_vcs_config(client, host: Host, sem) -> None:
+    """Directly request a small fixed set of exposed-VCS/config paths and record
+    only content-validated hits (status 200 AND body matches the artifact shape)
+    as `host.endpoints` with source "vcs-config". Content validation avoids the
+    soft-404 false positives a status-only probe would raise. The recorded paths
+    (`/.git`, `/.svn`, `/.hg`, `/.env`, `/.DS_Store`) are all sensitive, so they
+    auto-flow into entry points via the existing exposed-endpoint block."""
+    if not (host.scheme and host.http_status):
+        return
+    base = f"{host.scheme}://{host.subdomain}"
+    seen = {ep.get("path") for ep in host.endpoints}
+
+    async def probe(path, validator):
+        async with sem:
+            try:
+                r = await client.get(base + path, timeout=8, follow_redirects=False)
+            except Exception:
+                return
+            if r.status_code != 200:
+                return
+            try:
+                ok = validator(r.text[:4096])
+            except Exception:
+                ok = False
+        if ok and path not in seen:
+            host.endpoints.append({"path": path, "status": 200, "source": "vcs-config"})
+
+    await asyncio.gather(*(probe(p, v) for p, v in _VCS_CONFIG_CHECKS))
+
 
 def _same_origin(url: str, host: str) -> bool:
     netloc = url.split("://", 1)[-1].split("/", 1)[0].split("@")[-1].split(":")[0].lower()
@@ -338,6 +424,7 @@ async def discover_endpoints(client, host: Host, sem, js_max: int = 8) -> None:
             if r.status_code == 200:
                 host.endpoints.append({"path": path, "status": 200, "source": "api-doc"})
     await asyncio.gather(*(probe_doc(p) for p in _APIDOC_PATHS))
+    await probe_vcs_config(client, host, sem)
 
     try:
         root = await client.get(base, timeout=10, follow_redirects=True)

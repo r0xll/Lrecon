@@ -1731,10 +1731,10 @@ def _cve_severity(cvss, has_poc: bool = False, kev: bool = False) -> str:
 # A plain login/signin page is a legitimate, common endpoint and is deliberately
 # NOT here — it's still recorded on the host, just not raised as an entry point.
 _SENSITIVE_PATH_HINTS = (
-    "/admin", "/wp-admin", "/.git", "/.env", "/.svn", "/.htpasswd", "/backup",
-    "/phpmyadmin", "/adminer", "/manager", "/console", "/actuator", "/jenkins",
-    "/server-status", "/debug", "/swagger", "/api-docs", "/graphql", "/.aws",
-    "/config", "/wp-config", "/.ds_store", "/dumps", "/phpinfo", "/openapi",
+    "/admin", "/wp-admin", "/.git", "/.env", "/.svn", "/.hg", "/.htpasswd",
+    "/backup", "/phpmyadmin", "/adminer", "/manager", "/console", "/actuator",
+    "/jenkins", "/server-status", "/debug", "/swagger", "/api-docs", "/graphql",
+    "/.aws", "/config", "/wp-config", "/.ds_store", "/dumps", "/phpinfo", "/openapi",
 )
 
 
