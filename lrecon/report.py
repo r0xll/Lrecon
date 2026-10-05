@@ -638,6 +638,20 @@ def write_markdown(hosts, domains, res, path) -> None:
                              f"| {s.get('url','')} |")
         lines.append("")
 
+    fw_hosts = [h for h in hosts if getattr(h, "framework_secrets", None)]
+    if fw_hosts:
+        n_fw = sum(len(h.framework_secrets) for h in fw_hosts)
+        lines += [f"## Framework secrets / crypto misconfigs ({n_fw})", "",
+                  "Known-framework misconfigurations on the live page — unsigned ASP.NET "
+                  "ViewState, `alg:none`/symmetric JWTs, exposed Telerik handlers, default "
+                  "framework secrets. **Leads, not confirmations** — verify per ROE.", "",
+                  "| Host | Kind | Severity | Detail |", "|---|---|---|---|"]
+        for h in fw_hosts:
+            for fs in h.framework_secrets:
+                lines.append(f"| {h.subdomain} | {fs.get('kind','')} | {fs.get('severity','')} "
+                             f"| {fs.get('detail','')} |")
+        lines.append("")
+
     ban_hosts = [h for h in hosts if getattr(h, "banners", None)]
     if ban_hosts:
         n_ban = sum(len(h.banners) for h in ban_hosts)
@@ -1385,6 +1399,23 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
                 f'not confirmations</strong>. A bundled key may be publishable or a placeholder. '
                 f'Values masked; verify per ROE.</p>')
         sections.append(_html_section("jssecrets", "Secret leads in JS bundles", n_sec, body))
+
+    # ---- Framework secrets / crypto misconfigs (badsecrets-style) ----
+    fw_hosts = [h for h in hosts if getattr(h, "framework_secrets", None)]
+    if fw_hosts:
+        n_fw = sum(len(h.framework_secrets) for h in fw_hosts)
+        rows = "".join(
+            f"<tr><td>{esc(h.subdomain)}</td><td>{esc(fs.get('kind'))}</td>"
+            f"<td>{esc(fs.get('severity'))}</td><td>{esc(fs.get('detail'))}</td></tr>"
+            for h in fw_hosts for fs in h.framework_secrets)
+        body = (f'{_html_export_button("t-fwsecrets", "framework_secrets.csv")}'
+                f'<table id="t-fwsecrets"><tr><th>Host</th><th>Kind</th><th>Severity</th>'
+                f'<th>Detail</th></tr>{rows}</table>'
+                f'<p class="note">Known-framework misconfigurations on the live page — unsigned '
+                f'ASP.NET ViewState, <code>alg:none</code>/symmetric JWTs, exposed Telerik '
+                f'handlers, default secrets. <strong>Leads, not confirmations</strong>; verify '
+                f'per ROE.</p>')
+        sections.append(_html_section("fwsecrets", "Framework secrets / crypto misconfigs", n_fw, body))
 
     # ---- Service banners ----
     ban_hosts = [h for h in hosts if getattr(h, "banners", None)]

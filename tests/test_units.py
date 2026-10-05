@@ -1,6 +1,7 @@
 """Unit tests for LRecon pure-logic and backend parsers (no network required)."""
 import argparse
 import asyncio
+import base64
 import csv
 import ipaddress
 import json
@@ -7251,6 +7252,54 @@ def test_excavate_scope_filter_matches_wire_back_logic():
     new = sorted(n for n in harvested
                  if n not in known and any(name_in_scope(n, d) for d in domains))
     assert new == ["api.corp.com", "cdn.corp.com"]   # lookalikes rejected
+
+
+# --------------------------------------------------------------------------- #
+# badsecrets — known-framework-secret / crypto misconfig detection
+# --------------------------------------------------------------------------- #
+def _jwt(header: dict, payload=None) -> str:
+    def seg(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{seg(header)}.{seg(payload or {'u': 'admin'})}."
+
+
+def test_badsecrets_viewstate_without_generator():
+    from lrecon import badsecrets
+    body = '<form><input type="hidden" name="__VIEWSTATE" value="/wEPaA==" /></form>'
+    kinds = [f["kind"] for f in badsecrets.check_response(body)]
+    assert "aspnet-viewstate-no-generator" in kinds
+    # With the generator token present it is not flagged.
+    ok = body + '<input name="__VIEWSTATEGENERATOR" value="CA0B0334">'
+    assert not any(f["kind"] == "aspnet-viewstate-no-generator"
+                   for f in badsecrets.check_response(ok))
+
+
+def test_badsecrets_jwt_alg_none_and_symmetric():
+    from lrecon import badsecrets
+    none_tok = _jwt({"alg": "none", "typ": "JWT"})
+    f = badsecrets.check_response("", cookies=[f"session={none_tok}"])
+    assert any(x["kind"] == "jwt-alg-none" and x["severity"] == "high" for x in f)
+    hs_tok = _jwt({"alg": "HS256"}) + "sig"
+    assert any(x["kind"] == "jwt-hs-symmetric" for x in badsecrets.check_response(hs_tok))
+
+
+def test_badsecrets_clean_response_and_dedupe():
+    from lrecon import badsecrets
+    assert badsecrets.check_response("<html><body>nothing here</body></html>") == []
+    # Two ViewState forms → one finding (deduped by kind).
+    dbl = '<input name="__VIEWSTATE"><input name="__VIEWSTATE">'
+    assert sum(1 for f in badsecrets.check_response(dbl)
+               if f["kind"] == "aspnet-viewstate-no-generator") == 1
+
+
+def test_summarize_entry_points_flags_framework_secret():
+    h = Host(subdomain="app.example.com")
+    h.framework_secrets = [{"kind": "aspnet-viewstate-no-generator",
+                            "severity": "high", "detail": "unsigned ViewState"}]
+    eps = intel.summarize_entry_points([h], {}, [], {}, [], [])
+    fw = [e for e in eps if e["type"] == "framework-secret"]
+    assert len(fw) == 1 and fw[0]["severity"] == "high"
+    assert fw[0]["target"] == "app.example.com (aspnet-viewstate-no-generator)"
 
 
 # --------------------------------------------------------------------------- #
