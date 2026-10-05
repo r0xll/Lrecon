@@ -7263,15 +7263,32 @@ def _jwt(header: dict, payload=None) -> str:
     return f"{seg(header)}.{seg(payload or {'u': 'admin'})}."
 
 
-def test_badsecrets_viewstate_without_generator():
+def test_badsecrets_viewstate_is_low_pointer_not_rce_claim():
     from lrecon import badsecrets
     body = '<form><input type="hidden" name="__VIEWSTATE" value="/wEPaA==" /></form>'
-    kinds = [f["kind"] for f in badsecrets.check_response(body)]
-    assert "aspnet-viewstate-no-generator" in kinds
-    # With the generator token present it is not flagged.
-    ok = body + '<input name="__VIEWSTATEGENERATOR" value="CA0B0334">'
-    assert not any(f["kind"] == "aspnet-viewstate-no-generator"
-                   for f in badsecrets.check_response(ok))
+    fs = [f for f in badsecrets.check_response(body) if f["kind"] == "aspnet-viewstate"]
+    # Present → a single low-severity "test offline" pointer. We do NOT claim the
+    # MAC is disabled from a passive response (the generator token is not a MAC
+    # indicator), so severity is low, not high.
+    assert len(fs) == 1 and fs[0]["severity"] == "low"
+
+
+def test_badsecrets_scans_headers_and_cookies_for_jwt():
+    from lrecon import badsecrets
+
+    class _Headers:   # httpx.Headers-like: exposes .items()
+        def __init__(self, d):
+            self._d = d
+        def items(self):
+            return self._d.items()
+
+    none_tok = _jwt({"alg": "none", "typ": "JWT"})
+    # alg:none JWT carried only in a response header must still be caught.
+    hdr = _Headers({"x-access-token": none_tok})
+    assert any(f["kind"] == "jwt-alg-none" for f in badsecrets.check_response("", headers=hdr))
+    # …and in a cookie.
+    assert any(f["kind"] == "jwt-alg-none"
+               for f in badsecrets.check_response("", cookies=[f"s={none_tok}"]))
 
 
 def test_badsecrets_jwt_alg_none_and_symmetric():
@@ -7283,23 +7300,25 @@ def test_badsecrets_jwt_alg_none_and_symmetric():
     assert any(x["kind"] == "jwt-hs-symmetric" for x in badsecrets.check_response(hs_tok))
 
 
-def test_badsecrets_clean_response_and_dedupe():
+def test_badsecrets_no_false_positive_on_ordinary_text():
     from lrecon import badsecrets
+    # Ordinary prose that merely contains the word "secret"/"secretary" must not
+    # produce a finding (the old unbounded default-secret substring did).
+    assert badsecrets.check_response("<p>Contact the secretary about our secret menu.</p>") == []
     assert badsecrets.check_response("<html><body>nothing here</body></html>") == []
     # Two ViewState forms → one finding (deduped by kind).
     dbl = '<input name="__VIEWSTATE"><input name="__VIEWSTATE">'
-    assert sum(1 for f in badsecrets.check_response(dbl)
-               if f["kind"] == "aspnet-viewstate-no-generator") == 1
+    assert sum(1 for f in badsecrets.check_response(dbl) if f["kind"] == "aspnet-viewstate") == 1
 
 
 def test_summarize_entry_points_flags_framework_secret():
     h = Host(subdomain="app.example.com")
-    h.framework_secrets = [{"kind": "aspnet-viewstate-no-generator",
-                            "severity": "high", "detail": "unsigned ViewState"}]
+    h.framework_secrets = [{"kind": "jwt-alg-none", "severity": "high",
+                            "detail": "alg:none JWT"}]
     eps = intel.summarize_entry_points([h], {}, [], {}, [], [])
     fw = [e for e in eps if e["type"] == "framework-secret"]
     assert len(fw) == 1 and fw[0]["severity"] == "high"
-    assert fw[0]["target"] == "app.example.com (aspnet-viewstate-no-generator)"
+    assert fw[0]["target"] == "app.example.com (jwt-alg-none)"
 
 
 # --------------------------------------------------------------------------- #
