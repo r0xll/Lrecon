@@ -464,6 +464,10 @@ class Host:
     # Analytics/marketing IDs on the page ({ga/gtm/fb: [ids]}) — an ownership
     # fingerprint; hosts sharing one are the same team's (see pixels.py).
     tracking_ids: dict = field(default_factory=dict)
+    # FQDN-shaped strings mined from this host's response body/headers
+    # (excavate.py). Scope-filtered in core.run into new hosts; kept as
+    # provenance for which page referenced which name.
+    harvested_hosts: set = field(default_factory=set)
     # Composite attack-surface score (0-100) and its human-readable contributors,
     # computed in core.run from this host's signals (see intel.risk_score).
     risk_score: int = 0
@@ -498,6 +502,7 @@ class Host:
         d = asdict(self)
         d["source"] = sorted(self.source)
         d["enrich_src"] = sorted(self.enrich_src)
+        d["harvested_hosts"] = sorted(self.harvested_hosts)
         return d
 
 

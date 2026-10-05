@@ -295,6 +295,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
     ap.add_argument("--asn-expand", action="store_true",
                     help="expand scope via ASN->netblocks + reverse-DNS sweep (aggressive)")
     ap.add_argument("--asn-cap", type=int, default=4096, help="max PTR lookups for --asn-expand")
+    ap.add_argument("--excavate-cap", type=int, default=200,
+                    help="max new in-scope hosts to wire back from hostnames mined out of "
+                         "response bodies/headers (excavate); 0 disables the wire-back/re-probe "
+                         "(harvested names still recorded in JSON)")
     ap.add_argument("--ip-cap", type=int, default=1024,
                     help="max host addresses to expand from a single CIDR target (default 1024)")
     ap.add_argument("--favicon-expand", action="store_true",

@@ -7210,6 +7210,50 @@ def test_summarize_entry_points_flags_squattable_handle_only():
 
 
 # --------------------------------------------------------------------------- #
+# Excavate — in-scope hostname harvesting from responses (BBOT-style)
+# --------------------------------------------------------------------------- #
+def test_extract_hostnames_from_body_and_headers():
+    from lrecon.excavate import extract_hostnames
+
+    class _H:   # mimics httpx.Headers.get
+        def __init__(self, d):
+            self._d = d
+        def get(self, k):
+            return self._d.get(k)
+
+    body = """
+    <script>fetch("https://api.corp.com/v1/users")</script>
+    <img src="//cdn.corp.com/logo.png"> version 1.2.3 app.min.js
+    """
+    headers = _H({"content-security-policy": "default-src 'self' https://assets.corp.com; "
+                                             "connect-src https://auth.corp.com",
+                  "location": "https://login.corp.com/"})
+    out = extract_hostnames(body, headers)
+    assert {"api.corp.com", "cdn.corp.com", "assets.corp.com",
+            "auth.corp.com", "login.corp.com"} <= out
+    assert "1.2.3" not in out                      # bare version, final label numeric
+
+
+def test_extract_hostnames_pure_without_headers():
+    from lrecon.excavate import extract_hostnames
+    assert extract_hostnames("see www.example.org and mail.example.org") == \
+        {"www.example.org", "mail.example.org"}
+    assert extract_hostnames("", None) == set()
+
+
+def test_excavate_scope_filter_matches_wire_back_logic():
+    # The wire-back keeps only harvested names in scope and not already known
+    # (same predicate core.run applies). Guard that contract directly.
+    from lrecon.sources import name_in_scope
+    harvested = {"api.corp.com", "evil-corp.com", "corp.com.attacker.net", "cdn.corp.com"}
+    domains = ["corp.com"]
+    known = {"corp.com"}
+    new = sorted(n for n in harvested
+                 if n not in known and any(name_in_scope(n, d) for d in domains))
+    assert new == ["api.corp.com", "cdn.corp.com"]   # lookalikes rejected
+
+
+# --------------------------------------------------------------------------- #
 # Repo hygiene
 # --------------------------------------------------------------------------- #
 def test_no_recon_output_is_tracked_in_the_repo():
