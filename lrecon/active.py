@@ -354,7 +354,9 @@ def _looks_env(b: str) -> bool:
 
 
 def _looks_ds_store(b: str) -> bool:
-    return b[:8].find("Bud1") != -1 or b[:4] == "\x00\x00\x00\x01"
+    # Full 8-byte header: 4-byte alignment 0x00000001 followed by the "Bud1"
+    # magic. Requiring both rejects any other binary that merely starts 0x00000001.
+    return b[:8] == "\x00\x00\x00\x01Bud1"
 
 
 _VCS_CONFIG_CHECKS = (

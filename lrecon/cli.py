@@ -183,7 +183,8 @@ def _print_dry_run(args) -> None:
     if getattr(args, "wayback_paths", False):
         plan.append(("Wayback path replay", "AGGRESSIVE — re-requests archived paths live at the target"))
     if getattr(args, "api_scan", False):
-        plan.append(("API-doc / JS-bundle fetch", "AGGRESSIVE — fetches live from the target"))
+        plan.append(("API-doc / JS-bundle fetch + exposed-VCS/config probe",
+                     "AGGRESSIVE — fetches live from the target, incl. /.git, /.env, /.svn, /.hg, /.DS_Store"))
     if args.verify_emails:
         plan.append(("SMTP RCPT-TO email verification", "AGGRESSIVE — SMTP dialog with the target's MX"))
     if getattr(args, "nuclei", False):
@@ -287,7 +288,9 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                     help="max archived paths to re-verify across all hosts (default 400)")
     ap.add_argument("--api-scan", action="store_true",
                     help="on live hosts, probe common API-doc routes (openapi/swagger/"
-                         "graphql) and scan same-origin JS bundles for secret leads "
+                         "graphql), scan same-origin JS bundles for secret leads, and "
+                         "probe for exposed VCS/config artifacts (/.git, /.env, /.svn, "
+                         "/.hg, /.DS_Store) with content validation "
                          "(aggressive; ROE-gated — fetches from the target). Never "
                          "enabled by --all")
     ap.add_argument("--js-max", type=int, default=8,
