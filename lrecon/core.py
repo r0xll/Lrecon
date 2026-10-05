@@ -581,6 +581,33 @@ async def run(domains, args, keys) -> list:
 
             await probe_hosts(active_hosts)
 
+            # ---- Excavate wire-back: in-scope hostnames mined from responses ----
+            # http_probe/discover_endpoints harvested FQDN-shaped strings from the
+            # bodies and headers they fetched (excavate.py). Scope-filter them,
+            # add the in-scope ones not already known as new hosts (like the
+            # TLS-SAN/rDNS wire-backs), and do ONE bounded re-probe so the new
+            # names get status/tech/findings — the single-level recursion that is
+            # BBOT's hallmark. Capped by --excavate-cap (0 disables the wire-back).
+            exc_cap = getattr(args, "excavate_cap", 200)
+            if exc_cap:
+                harvested = set()
+                for h in active_hosts:
+                    harvested |= h.harvested_hosts
+                new_names = sorted(n for n in harvested
+                                   if n not in hosts
+                                   and any(name_in_scope(n, d) for d in domains))[:exc_cap]
+                exc_hosts = []
+                for n in new_names:
+                    nh = Host(subdomain=n, source={"excavate"})
+                    nh.ips, nh.cname, nh.nxdomain = await resolve_full(n, ns)
+                    hosts[n] = nh
+                    exc_hosts.append(nh)
+                if exc_hosts:
+                    log(f"[+] excavate: {len(exc_hosts)} new in-scope host(s) mined from "
+                        f"response bodies/headers")
+                    await probe_hosts([h for h in exc_hosts if h.ips and not h.wildcard],
+                                      desc="excavate re-probe")
+
             if args.active_ports and not getattr(args, "no_banners", False):
                 n_ban = sum(len(h.banners) for h in active_hosts)
                 if n_ban:
