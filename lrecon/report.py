@@ -610,6 +610,38 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines.append(f"| {h} | {r['site']} | {status} | {r['url']} |")
         lines.append("")
 
+    org_assets = res.get("org_assets") or {}
+    oa_repos = org_assets.get("github_repos") or []
+    oa_imgs = org_assets.get("docker_images") or []
+    oa_pm = org_assets.get("postman") or []
+    oa_hits = org_assets.get("secret_hits") or []
+    if oa_repos or oa_imgs or oa_pm:
+        total = len(oa_repos) + len(oa_imgs) + len(oa_pm)
+        lines += [f"## Org public assets ({total})", "",
+                  "The org's public code/collaboration assets (third-party OSINT, no target "
+                  "contact): GitHub repos, Docker Hub images and Postman workspaces. A **secret "
+                  "lead** is a secret-shaped string in the asset's description/README — verify, "
+                  "it may be a public/placeholder key.", ""]
+        if oa_hits:
+            lines += [f"**{len(oa_hits)} secret lead(s):**", "",
+                      "| Source | Asset | Kind | Masked | URL |", "|---|---|---|---|---|"]
+            for hit in oa_hits:
+                lines.append(f"| {hit.get('source','')} | {hit.get('asset','')} "
+                             f"| {hit.get('kind','')} | {hit.get('masked','')} | {hit.get('url','')} |")
+            lines.append("")
+        lines += ["| Source | Asset | Detail | URL |", "|---|---|---|---|"]
+        for r in oa_repos:
+            det = "archived" if r.get("archived") else (r.get("description") or "")[:80]
+            lines.append(f"| github | {r.get('full_name','')} | {det} | {r.get('url','')} |")
+        for img in oa_imgs:
+            det = (img.get("description") or "")[:80]
+            lines.append(f"| dockerhub | {img.get('namespace','')}/{img.get('name','')} "
+                         f"| {det} | {img.get('url','')} |")
+        for p in oa_pm:
+            lines.append(f"| postman | {p.get('name','')} | {p.get('workspace') or ''} "
+                         f"| {p.get('url','')} |")
+        lines.append("")
+
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]
     if ep_hosts:
         n_ep = sum(len(h.endpoints) for h in ep_hosts)
@@ -1367,6 +1399,46 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
                 f'Inconclusive (rate-limited / bot-blocked) checks are omitted.</p>')
         sections.append(_html_section("social", f"Brand-handle presence ({n_squat} squattable)",
                                       len(srows), body))
+
+    # ---- Org public assets (GitHub repos / Docker images / Postman) ----
+    org_assets = res.get("org_assets") or {}
+    oa_repos = org_assets.get("github_repos") or []
+    oa_imgs = org_assets.get("docker_images") or []
+    oa_pm = org_assets.get("postman") or []
+    oa_hits = org_assets.get("secret_hits") or []
+    if oa_repos or oa_imgs or oa_pm:
+        total = len(oa_repos) + len(oa_imgs) + len(oa_pm)
+
+        def _asset_row(source, asset, detail, url):
+            return (f'<tr><td>{esc(source)}</td><td>{esc(asset)}</td><td>{esc(detail)}</td>'
+                    f'<td><a href="{esc(_safe_href(url))}" target="_blank" '
+                    f'rel="noopener">{esc(url)}</a></td></tr>')
+        arows = "".join(
+            [_asset_row("github", r.get("full_name") or "",
+                        "archived" if r.get("archived") else (r.get("description") or ""),
+                        r.get("url") or "") for r in oa_repos]
+            + [_asset_row("dockerhub", f"{img.get('namespace','')}/{img.get('name','')}",
+                          img.get("description") or "", img.get("url") or "") for img in oa_imgs]
+            + [_asset_row("postman", p.get("name") or "", p.get("workspace") or "",
+                          p.get("url") or "") for p in oa_pm])
+        hits_html = ""
+        if oa_hits:
+            hrows = "".join(
+                f'<tr><td>{esc(h.get("source",""))}</td><td>{esc(h.get("asset",""))}</td>'
+                f'<td>{esc(h.get("kind",""))}</td><td>{esc(h.get("masked",""))}</td>'
+                f'<td><a href="{esc(_safe_href(h.get("url","")))}" target="_blank" '
+                f'rel="noopener">{esc(h.get("url",""))}</a></td></tr>' for h in oa_hits)
+            hits_html = (f'<p><strong class="bad">{len(oa_hits)} secret lead(s)</strong></p>'
+                         f'<table id="t-orgsecrets"><tr><th>Source</th><th>Asset</th><th>Kind</th>'
+                         f'<th>Masked</th><th>URL</th></tr>{hrows}</table>')
+        body = (f'{_html_export_button("t-orgassets", "org_assets.csv")}'
+                f'{hits_html}'
+                f'<table id="t-orgassets"><tr><th>Source</th><th>Asset</th><th>Detail</th>'
+                f'<th>URL</th></tr>{arows}</table>'
+                f'<p class="note">The org\'s public code/collaboration assets (third-party OSINT, '
+                f'no target contact). A <strong>secret lead</strong> is a secret-shaped string in '
+                f'the asset\'s description/README — verify, it may be a public/placeholder key.</p>')
+        sections.append(_html_section("orgassets", f"Org public assets ({total})", total, body))
 
     # ---- Discovered endpoints (Wayback + API docs -> live) ----
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]

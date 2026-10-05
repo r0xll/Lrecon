@@ -12,6 +12,7 @@ from .active import *
 from .state import *
 from .people import *
 from .social import *
+from .orgassets import enumerate_org_assets
 from .dorking import *
 from .vt import *
 from . import backends
@@ -1086,6 +1087,24 @@ async def run(domains, args, keys) -> list:
             log(f"[+] brand handles: {n_pre} present, {n_abs} squattable across "
                 f"{len(social)} handle(s)")
 
+        # ---- Org public-asset enumeration (BBOT github_org/postman/dockerhub) ----
+        # Third-party OSINT only — no target contact. Opt-in (--org-assets),
+        # same disclosure posture as --brand-handles; never enabled by --all.
+        # Lists the org's public GitHub repos / Docker images / Postman assets
+        # and flags secret leads in their text (see orgassets.py).
+        org_assets = {}
+        if getattr(args, "org_assets", False):
+            org_assets = await enumerate_org_assets(
+                client, domains, args.company_name,
+                github_token=keys.get("github"), limiter=gh_limiter)
+            n_repos = len(org_assets.get("github_repos", []))
+            n_imgs = len(org_assets.get("docker_images", []))
+            n_pm = len(org_assets.get("postman", []))
+            n_sec = len(org_assets.get("secret_hits", []))
+            log(f"[+] org assets: {n_repos} github repo(s), {n_imgs} docker image(s), "
+                f"{n_pm} postman asset(s)"
+                + (f" — {n_sec} secret lead(s)" if n_sec else ""))
+
         if args.verify_emails and people and not args.passive_only:
             for d in domains:
                 d_people = [p for p in people if p.email.endswith(f"@{d}")]
@@ -1224,7 +1243,7 @@ async def run(domains, args, keys) -> list:
     # ---- Entry-point summary (red-team signal: what to chase first) ----
     entry_points = summarize_entry_points(host_list, cf, buckets, breach, github_findings,
                                           nuclei, dorks, auth_surfaces, whois=whois,
-                                          axfr=axfr, social=social)
+                                          axfr=axfr, social=social, org_assets=org_assets)
     if entry_points:
         log(f"[!] {len(entry_points)} potential entry point(s) identified:")
         for ep in entry_points:
@@ -1255,6 +1274,7 @@ async def run(domains, args, keys) -> list:
             "whois": whois, "dorks": dorks, "dns": dns_records, "mail_infra": mail_infra,
             "vt": vt_intel, "auth_surface": auth_surfaces, "certs": certs,
             "axfr": axfr, "security_txt": security_txts,
-            "tracking_correlation": tracking_correlation, "social": social}
+            "tracking_correlation": tracking_correlation, "social": social,
+            "org_assets": org_assets}
 
 

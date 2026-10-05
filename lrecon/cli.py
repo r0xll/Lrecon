@@ -374,6 +374,10 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                          "target contact): reports official accounts and flags squattable "
                          "(unregistered) brand handles as an impersonation/phishing lead. Opt-in "
                          "(not enabled by --all)")
+    ap.add_argument("--org-assets", dest="org_assets", action="store_true",
+                    help="enumerate the org's public GitHub repos / Docker Hub images / Postman "
+                         "assets and flag secret leads in their text (third-party OSINT, no target "
+                         "contact; uses the github key if set). Opt-in (not enabled by --all)")
     ap.add_argument("--verify-emails", action="store_true",
                     help="SMTP RCPT-TO probe discovered company emails against the domain's MX "
                          "(active — touches target mail infra; detects and flags catch-all domains "
@@ -570,7 +574,7 @@ def _recon(argv=None, emit_dossier: bool = False) -> None:
                                     "asn", "favicon_pivots", "nuclei", "diff", "per_source",
                                     "entry_points", "whois", "dorks", "dns", "mail_infra", "vt",
                                     "auth_surface", "certs", "axfr", "security_txt",
-                                    "tracking_correlation", "social")}
+                                    "tracking_correlation", "social", "org_assets")}
     full["hosts"] = [h.to_dict() for h in hosts]
     full["people"] = [p.to_dict() for p in res.get("people") or []]
     Path(json_path).write_text(json.dumps(full, indent=2, default=str))
