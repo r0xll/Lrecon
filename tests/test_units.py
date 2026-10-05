@@ -1,6 +1,7 @@
 """Unit tests for LRecon pure-logic and backend parsers (no network required)."""
 import argparse
 import asyncio
+import base64
 import csv
 import ipaddress
 import json
@@ -7251,6 +7252,73 @@ def test_excavate_scope_filter_matches_wire_back_logic():
     new = sorted(n for n in harvested
                  if n not in known and any(name_in_scope(n, d) for d in domains))
     assert new == ["api.corp.com", "cdn.corp.com"]   # lookalikes rejected
+
+
+# --------------------------------------------------------------------------- #
+# badsecrets — known-framework-secret / crypto misconfig detection
+# --------------------------------------------------------------------------- #
+def _jwt(header: dict, payload=None) -> str:
+    def seg(d):
+        return base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip("=")
+    return f"{seg(header)}.{seg(payload or {'u': 'admin'})}."
+
+
+def test_badsecrets_viewstate_is_low_pointer_not_rce_claim():
+    from lrecon import badsecrets
+    body = '<form><input type="hidden" name="__VIEWSTATE" value="/wEPaA==" /></form>'
+    fs = [f for f in badsecrets.check_response(body) if f["kind"] == "aspnet-viewstate"]
+    # Present → a single low-severity "test offline" pointer. We do NOT claim the
+    # MAC is disabled from a passive response (the generator token is not a MAC
+    # indicator), so severity is low, not high.
+    assert len(fs) == 1 and fs[0]["severity"] == "low"
+
+
+def test_badsecrets_scans_headers_and_cookies_for_jwt():
+    from lrecon import badsecrets
+
+    class _Headers:   # httpx.Headers-like: exposes .items()
+        def __init__(self, d):
+            self._d = d
+        def items(self):
+            return self._d.items()
+
+    none_tok = _jwt({"alg": "none", "typ": "JWT"})
+    # alg:none JWT carried only in a response header must still be caught.
+    hdr = _Headers({"x-access-token": none_tok})
+    assert any(f["kind"] == "jwt-alg-none" for f in badsecrets.check_response("", headers=hdr))
+    # …and in a cookie.
+    assert any(f["kind"] == "jwt-alg-none"
+               for f in badsecrets.check_response("", cookies=[f"s={none_tok}"]))
+
+
+def test_badsecrets_jwt_alg_none_and_symmetric():
+    from lrecon import badsecrets
+    none_tok = _jwt({"alg": "none", "typ": "JWT"})
+    f = badsecrets.check_response("", cookies=[f"session={none_tok}"])
+    assert any(x["kind"] == "jwt-alg-none" and x["severity"] == "high" for x in f)
+    hs_tok = _jwt({"alg": "HS256"}) + "sig"
+    assert any(x["kind"] == "jwt-hs-symmetric" for x in badsecrets.check_response(hs_tok))
+
+
+def test_badsecrets_no_false_positive_on_ordinary_text():
+    from lrecon import badsecrets
+    # Ordinary prose that merely contains the word "secret"/"secretary" must not
+    # produce a finding (the old unbounded default-secret substring did).
+    assert badsecrets.check_response("<p>Contact the secretary about our secret menu.</p>") == []
+    assert badsecrets.check_response("<html><body>nothing here</body></html>") == []
+    # Two ViewState forms → one finding (deduped by kind).
+    dbl = '<input name="__VIEWSTATE"><input name="__VIEWSTATE">'
+    assert sum(1 for f in badsecrets.check_response(dbl) if f["kind"] == "aspnet-viewstate") == 1
+
+
+def test_summarize_entry_points_flags_framework_secret():
+    h = Host(subdomain="app.example.com")
+    h.framework_secrets = [{"kind": "jwt-alg-none", "severity": "high",
+                            "detail": "alg:none JWT"}]
+    eps = intel.summarize_entry_points([h], {}, [], {}, [], [])
+    fw = [e for e in eps if e["type"] == "framework-secret"]
+    assert len(fw) == 1 and fw[0]["severity"] == "high"
+    assert fw[0]["target"] == "app.example.com (jwt-alg-none)"
 
 
 # --------------------------------------------------------------------------- #

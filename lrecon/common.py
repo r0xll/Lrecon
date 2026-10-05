@@ -468,6 +468,9 @@ class Host:
     # (excavate.py). Scope-filtered in core.run into new hosts; kept as
     # provenance for which page referenced which name.
     harvested_hosts: set = field(default_factory=set)
+    # Known-framework-secret / crypto misconfigs on the live page
+    # ([{kind, severity, detail}]) — see badsecrets.check_response.
+    framework_secrets: list = field(default_factory=list)
     # Composite attack-surface score (0-100) and its human-readable contributors,
     # computed in core.run from this host's signals (see intel.risk_score).
     risk_score: int = 0

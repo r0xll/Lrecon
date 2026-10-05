@@ -1891,6 +1891,16 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                                    f"({s.get('url', '')}) — verify; may be a public/placeholder key",
                         "attck": "T1552.001"})
 
+        # Known-framework-secret / crypto misconfigs on the live page
+        # (ViewState-no-MAC, alg:none JWT, Telerik, default secret). Severity
+        # comes from the check; all are leads the operator confirms.
+        for fs in getattr(h, "framework_secrets", []):
+            out.append({"type": "framework-secret",
+                        "target": f"{h.subdomain} ({fs['kind']})",
+                        "severity": fs.get("severity", "medium"),
+                        "summary": fs.get("detail", fs["kind"]),
+                        "attck": "T1552"})
+
     for domain, result in (axfr or {}).items():
         if not (result or {}).get("transferred"):
             continue

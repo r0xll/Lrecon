@@ -10,6 +10,7 @@ from .headers import security_headers
 from .waf import fingerprint_waf
 from .pixels import extract_tracking_ids
 from .excavate import extract_hostnames
+from .badsecrets import check_response
 from .tlsinfo import fetch_cert, TLS_PORTS
 
 
@@ -91,6 +92,7 @@ async def http_probe(client, host: Host) -> None:
             host.waf = fingerprint_waf(r.headers)
             host.tracking_ids = extract_tracking_ids(body)
             host.harvested_hosts |= extract_hostnames(body, r.headers)
+            host.framework_secrets = check_response(body, r.headers, _set_cookie_list(r))
             lo = body.lower()
             title = _extract_title(body)
             if title:
