@@ -1823,7 +1823,7 @@ def risk_score(host, host_entry_points) -> tuple:
 
 def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                            dorks=None, auth_surfaces=None, whois=None,
-                           axfr=None, social=None) -> list:
+                           axfr=None, social=None, org_assets=None) -> list:
     """
     Pull the findings that represent a likely initial-access vector out of the
     full result set into one ranked list, so they're stated explicitly instead
@@ -1846,6 +1846,18 @@ def summarize_entry_points(hosts, cf, buckets, breach, github_findings, nuclei,
                                    f"attacker could register it to impersonate the org for "
                                    f"phishing (verify before reporting)",
                         "attck": "T1585.001"})
+
+    # Secret leads in the org's public assets (GitHub repos / Docker images /
+    # Postman) — a leaked key in a public repo is a real initial-access vector.
+    # Leads, not proof: the summary says so (may be a public/placeholder key),
+    # and the operator verifies. Same shape as the host-JS leaked-secret block.
+    for hit in (org_assets or {}).get("secret_hits", []):
+        out.append({"type": "leaked-secret",
+                    "target": f"{hit.get('source')}:{hit.get('asset')} ({hit.get('kind')})",
+                    "severity": "high",
+                    "summary": f"Possible secret in a public org asset: {hit.get('masked')} "
+                               f"({hit.get('url', '')}) — verify; may be a public/placeholder key",
+                    "attck": "T1552.001"})
 
     for h in hosts:
         if h.takeover:

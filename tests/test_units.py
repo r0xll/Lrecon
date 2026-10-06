@@ -7389,3 +7389,192 @@ def test_no_recon_output_is_tracked_in_the_repo():
                  or f.endswith(".origin_ips.txt") or f.endswith(".targets.csv")
                  or f.endswith(".users.csv") or f.endswith(".live.txt")]
     assert offenders == [], f"recon output committed to the repo: {offenders}"
+
+
+# --------------------------------------------------------------------------- #
+# Org-asset enumeration — public GitHub / Docker Hub / Postman (BBOT-style)
+# --------------------------------------------------------------------------- #
+_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+
+
+async def test_github_org_repos_parses_and_scans_readme():
+    from lrecon import orgassets
+
+    class _C:
+        async def get(self, url, **kwargs):
+            if "/orgs/acme/repos" in url:
+                return _FakeResp(200, [
+                    {"name": "web", "full_name": "acme/web",
+                     "html_url": "https://github.com/acme/web",
+                     "description": "frontend", "archived": False,
+                     "pushed_at": "2026-01-01T00:00:00Z"},
+                ])
+            if "/repos/acme/web/readme" in url:
+                return _FakeRespText(200, f"# web\n\nAWS_KEY={_AWS_KEY}\n")
+            return _FakeResp(404, {})
+
+    repos = await orgassets.github_org_repos(_C(), "acme", token=None)
+    assert len(repos) == 1 and repos[0]["full_name"] == "acme/web"
+    assert any(s["kind"] == "aws-access-key" for s in repos[0]["secrets"])
+
+
+async def test_github_org_repos_404_is_empty():
+    from lrecon import orgassets
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _FakeResp(404, {"message": "Not Found"})
+
+    assert await orgassets.github_org_repos(_C(), "nope", token=None) == []
+
+
+async def test_docker_hub_images_parses_and_skips_private():
+    from lrecon import orgassets
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _FakeResp(200, {"results": [
+                {"name": "api", "description": "public api image",
+                 "is_private": False, "pull_count": 10, "last_updated": "x"},
+                {"name": "secret-internal", "description": f"token {_AWS_KEY}",
+                 "is_private": True},
+            ]})
+
+    imgs = await orgassets.docker_hub_images(_C(), "acme")
+    assert [i["name"] for i in imgs] == ["api"]   # private one skipped
+
+
+async def test_postman_search_degrades_on_error():
+    from lrecon import orgassets
+
+    class _C:
+        async def post(self, url, **kwargs):
+            return _FakeResp(500, None)
+
+    assert await orgassets.postman_search(_C(), "acme") == []
+
+
+async def test_enumerate_org_assets_flattens_secret_hits():
+    from lrecon import orgassets
+
+    class _C:
+        async def get(self, url, **kwargs):
+            if "/orgs/" in url and "/repos" in url:
+                # Only the "acme" org exists; slug variants 404.
+                if "/orgs/acme/repos" in url:
+                    return _FakeResp(200, [
+                        {"name": "infra", "full_name": "acme/infra",
+                         "html_url": "https://github.com/acme/infra",
+                         "description": f"deploy key {_AWS_KEY}", "archived": False}])
+                return _FakeResp(404, {})
+            if "/repos/acme/infra/readme" in url:
+                return _FakeRespText(404, "")
+            if "/repositories/" in url:
+                return _FakeResp(404, {})
+            return _FakeResp(404, {})
+
+        async def post(self, url, **kwargs):
+            return _FakeResp(200, {"data": []})
+
+    res = await orgassets.enumerate_org_assets(_C(), ["acme.com"], company_name="Acme")
+    assert "acme" in res["org_candidates"]
+    assert any(r["full_name"] == "acme/infra" for r in res["github_repos"])
+    hits = res["secret_hits"]
+    assert hits and hits[0]["source"] == "github" and hits[0]["kind"] == "aws-access-key"
+
+
+async def test_enumerate_org_assets_no_candidates_is_empty_shape():
+    from lrecon import orgassets
+    res = await orgassets.enumerate_org_assets(object(), [], company_name=None)
+    assert res["github_repos"] == [] and res["docker_images"] == []
+    assert res["postman"] == [] and res["secret_hits"] == []
+
+
+def test_summarize_entry_points_flags_org_asset_secret():
+    org_assets = {"secret_hits": [
+        {"source": "github", "asset": "acme/infra", "url": "https://github.com/acme/infra",
+         "kind": "aws-access-key", "masked": "AKIA…MPLE (20 chars)"}]}
+    eps = intel.summarize_entry_points([], {}, [], {}, [], [], org_assets=org_assets)
+    leaked = [e for e in eps if e["type"] == "leaked-secret"]
+    assert len(leaked) == 1
+    assert "github:acme/infra" in leaked[0]["target"] and leaked[0]["attck"] == "T1552.001"
+
+
+class _PageResp:
+    """Response stub carrying json(), headers (for GitHub Link pagination) and
+    text, so the paginated org-asset collectors can be exercised."""
+    def __init__(self, status_code, data=None, headers=None, text=""):
+        self.status_code = status_code
+        self._data = data
+        self.headers = headers or {}
+        self.text = text
+
+    def json(self):
+        return self._data
+
+
+async def test_github_org_repos_follows_link_pagination():
+    from lrecon import orgassets
+    p1 = [{"name": "a", "full_name": "acme/a", "html_url": "https://github.com/acme/a",
+           "description": "", "archived": False}]
+    p2 = [{"name": "b", "full_name": "acme/b", "html_url": "https://github.com/acme/b",
+           "description": "", "archived": False}]
+
+    class _C:
+        async def get(self, url, **kwargs):
+            if "readme" in url:
+                return _PageResp(404)
+            if "page=2" in url:
+                return _PageResp(200, p2, headers={})
+            return _PageResp(200, p1,
+                             headers={"link": '<https://api.github.com/orgs/acme/repos?page=2>; rel="next"'})
+
+    repos = await orgassets.github_org_repos(_C(), "acme", token=None)
+    assert {r["full_name"] for r in repos} == {"acme/a", "acme/b"}  # both pages
+
+
+async def test_docker_hub_images_follows_next_pagination():
+    from lrecon import orgassets
+    pages = {
+        "https://hub.docker.com/v2/repositories/acme/": {
+            "results": [{"name": "one", "description": "", "is_private": False}],
+            "next": "https://hub.docker.com/v2/repositories/acme/?page=2"},
+        "https://hub.docker.com/v2/repositories/acme/?page=2": {
+            "results": [{"name": "two", "description": "", "is_private": False}],
+            "next": None},
+    }
+
+    class _C:
+        async def get(self, url, **kwargs):
+            return _PageResp(200, pages[url])
+
+    imgs = await orgassets.docker_hub_images(_C(), "acme")
+    assert [i["name"] for i in imgs] == ["one", "two"]  # both pages
+
+
+def test_md_cell_escapes_pipe_and_newline():
+    assert report._md_cell("a|b") == "a\\|b"
+    assert report._md_cell("line1\nline2") == "line1 line2"
+    assert report._md_cell("r\r\nn") == "r  n"
+    assert report._md_cell(None) == ""
+
+
+def test_write_markdown_org_asset_description_cannot_break_table(tmp_path):
+    # A repo description with a pipe and newline must not add columns/rows.
+    res = {"org_assets": {
+        "github_repos": [{"name": "x", "full_name": "acme/x",
+                          "url": "https://github.com/acme/x",
+                          "description": "evil | col\ninjected row", "archived": False,
+                          "secrets": []}],
+        "docker_images": [], "postman": [], "secret_hits": []}}
+    out = tmp_path / "r.md"
+    report.write_markdown([], ["acme.com"], res, str(out))
+    body = out.read_text()
+    # The asset row is a single table row: exactly 4 cells (5 pipes), no raw
+    # newline inside the description, and the literal pipe is escaped.
+    row = [ln for ln in body.splitlines() if ln.startswith("| github |")]
+    assert len(row) == 1
+    # 5 structural delimiters (4 cells); the description's own pipe is escaped
+    # (\|) so it does not count as a column break.
+    assert row[0].replace("\\|", "").count("|") == 5
+    assert "evil \\| col" in row[0] and "injected row" in row[0]
