@@ -55,6 +55,15 @@ def _md_code(value) -> str:
     return "`" + str(value).replace("|", "\\|") + "`"
 
 
+def _md_cell(value) -> str:
+    """Plain externally-sourced text, safe inside a Markdown table cell: a `|`
+    adds a column and a newline adds a row, both of which corrupt the table when
+    the text comes from a third party (e.g. a GitHub repo description). Escape
+    the pipe and flatten newlines to spaces."""
+    return (str(value if value is not None else "")
+            .replace("|", "\\|").replace("\r", " ").replace("\n", " "))
+
+
 # Kept generic: several signals now feed each level, so the label states the
 # strength of the evidence and the per-host detail says which signal produced it.
 TAKEOVER_CONFIDENCE_LABELS = {
@@ -626,20 +635,22 @@ def write_markdown(hosts, domains, res, path) -> None:
             lines += [f"**{len(oa_hits)} secret lead(s):**", "",
                       "| Source | Asset | Kind | Masked | URL |", "|---|---|---|---|---|"]
             for hit in oa_hits:
-                lines.append(f"| {hit.get('source','')} | {hit.get('asset','')} "
-                             f"| {hit.get('kind','')} | {hit.get('masked','')} | {hit.get('url','')} |")
+                lines.append(f"| {_md_cell(hit.get('source',''))} | {_md_cell(hit.get('asset',''))} "
+                             f"| {_md_cell(hit.get('kind',''))} | {_md_cell(hit.get('masked',''))} "
+                             f"| {_md_cell(hit.get('url',''))} |")
             lines.append("")
         lines += ["| Source | Asset | Detail | URL |", "|---|---|---|---|"]
         for r in oa_repos:
             det = "archived" if r.get("archived") else (r.get("description") or "")[:80]
-            lines.append(f"| github | {r.get('full_name','')} | {det} | {r.get('url','')} |")
+            lines.append(f"| github | {_md_cell(r.get('full_name',''))} | {_md_cell(det)} "
+                         f"| {_md_cell(r.get('url',''))} |")
         for img in oa_imgs:
             det = (img.get("description") or "")[:80]
-            lines.append(f"| dockerhub | {img.get('namespace','')}/{img.get('name','')} "
-                         f"| {det} | {img.get('url','')} |")
+            lines.append(f"| dockerhub | {_md_cell(img.get('namespace','') + '/' + (img.get('name') or ''))} "
+                         f"| {_md_cell(det)} | {_md_cell(img.get('url',''))} |")
         for p in oa_pm:
-            lines.append(f"| postman | {p.get('name','')} | {p.get('workspace') or ''} "
-                         f"| {p.get('url','')} |")
+            lines.append(f"| postman | {_md_cell(p.get('name',''))} | {_md_cell(p.get('workspace') or '')} "
+                         f"| {_md_cell(p.get('url',''))} |")
         lines.append("")
 
     ep_hosts = [h for h in hosts if getattr(h, "endpoints", None)]

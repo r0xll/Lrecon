@@ -24,6 +24,7 @@ _GH_API = "https://api.github.com"
 _DOCKER_API = "https://hub.docker.com/v2"
 _POSTMAN_SEARCH = "https://www.postman.com/_api/ws/proxy"
 _UA = "lrecon"
+_MAX_PAGES = 10          # hard page cap per source — complete without unbounded fan-out
 
 
 def _gh_headers(token: str | None) -> dict:
@@ -33,43 +34,69 @@ def _gh_headers(token: str | None) -> dict:
     return h
 
 
+def _next_link(headers) -> str | None:
+    """The `rel="next"` URL from a GitHub-style Link header, or None. Tolerant of
+    a response stub without headers (returns None)."""
+    try:
+        link = headers.get("link") or headers.get("Link")
+    except Exception:
+        return None
+    if not link:
+        return None
+    for part in link.split(","):
+        if 'rel="next"' in part:
+            lb, rb = part.find("<"), part.find(">")
+            if lb != -1 and rb != -1 and rb > lb:
+                return part[lb + 1:rb]
+    return None
+
+
 async def github_org_repos(client, org: str, token: str | None, limiter=None,
                            readme_cap: int = 10, sem=None) -> list:
     """Public repos of GitHub org `org` as
     `[{name, full_name, url, description, archived, pushed_at, secrets:[...]}]`.
 
-    A 404 (no such org) or any error yields `[]`. `description` is always
-    scanned for secret leads; the README is fetched and scanned for up to
-    `readme_cap` repos (bounded, so a large org can't fan out without limit)."""
-    if limiter:
-        await limiter.wait()
-    try:
-        r = await client.get(f"{_GH_API}/orgs/{org}/repos",
-                             params={"per_page": 100, "type": "public"},
-                             headers=_gh_headers(token), timeout=25)
-    except Exception:
-        return []
-    if r.status_code != 200:
-        return []
-    try:
-        items = r.json()
-    except Exception:
-        return []
-    if not isinstance(items, list):
-        return []
-
+    A 404 (no such org) or any error yields `[]`. All pages are followed via the
+    Link header (up to `_MAX_PAGES`) so a large org isn't silently truncated.
+    `description` is always scanned for secret leads; the README is fetched and
+    scanned for up to `readme_cap` repos (bounded, so a large org can't fan out
+    without limit)."""
     repos = []
-    for it in items:
-        desc = it.get("description") or ""
-        repos.append({
-            "name": it.get("name"),
-            "full_name": it.get("full_name"),
-            "url": it.get("html_url"),
-            "description": desc,
-            "archived": bool(it.get("archived")),
-            "pushed_at": it.get("pushed_at"),
-            "secrets": list(scan_text(desc, it.get("html_url") or "")),
-        })
+    url = f"{_GH_API}/orgs/{org}/repos"
+    params = {"per_page": 100, "type": "public"}
+    for _ in range(_MAX_PAGES):
+        if limiter:
+            await limiter.wait()
+        try:
+            r = await client.get(url, params=params, headers=_gh_headers(token), timeout=25)
+        except Exception:
+            break
+        if r.status_code != 200:
+            break
+        try:
+            items = r.json()
+        except Exception:
+            break
+        if not isinstance(items, list):
+            break
+        for it in items:
+            desc = it.get("description") or ""
+            repos.append({
+                "name": it.get("name"),
+                "full_name": it.get("full_name"),
+                "url": it.get("html_url"),
+                "description": desc,
+                "archived": bool(it.get("archived")),
+                "pushed_at": it.get("pushed_at"),
+                "secrets": list(scan_text(desc, it.get("html_url") or "")),
+            })
+        nxt = _next_link(getattr(r, "headers", None))
+        if not nxt:
+            break
+        url, params = nxt, None          # the next link already carries the query
+
+    if not repos:
+        return []
 
     # README scan for the first `readme_cap` repos (bounded fan-out).
     sem = sem or asyncio.Semaphore(5)
@@ -100,36 +127,42 @@ async def github_org_repos(client, org: str, token: str | None, limiter=None,
 async def docker_hub_images(client, namespace: str) -> list:
     """Public Docker Hub images under `namespace` as
     `[{name, namespace, url, description, pull_count, last_updated, secrets:[...]}]`.
-    Keyless. A 404 or error yields `[]`; the image description is scanned."""
-    try:
-        r = await client.get(f"{_DOCKER_API}/repositories/{namespace}/",
-                             params={"page_size": 100}, headers={"User-Agent": _UA},
-                             timeout=20)
-    except Exception:
-        return []
-    if r.status_code != 200:
-        return []
-    try:
-        results = r.json().get("results", [])
-    except Exception:
-        return []
-
+    Keyless. A 404 or error yields `[]`; the image description is scanned. All
+    pages are followed via the API's `next` URL (up to `_MAX_PAGES`) so a large
+    namespace isn't silently truncated."""
     out = []
-    for it in results or []:
-        if it.get("is_private"):
-            continue
-        name = it.get("name")
-        desc = it.get("description") or ""
-        url = f"https://hub.docker.com/r/{namespace}/{name}"
-        out.append({
-            "name": name,
-            "namespace": namespace,
-            "url": url,
-            "description": desc,
-            "pull_count": it.get("pull_count"),
-            "last_updated": it.get("last_updated"),
-            "secrets": list(scan_text(desc, url)),
-        })
+    url = f"{_DOCKER_API}/repositories/{namespace}/"
+    params = {"page_size": 100}
+    for _ in range(_MAX_PAGES):
+        try:
+            r = await client.get(url, params=params, headers={"User-Agent": _UA}, timeout=20)
+        except Exception:
+            break
+        if r.status_code != 200:
+            break
+        try:
+            data = r.json()
+        except Exception:
+            break
+        for it in (data.get("results") or []):
+            if it.get("is_private"):
+                continue
+            name = it.get("name")
+            desc = it.get("description") or ""
+            u = f"https://hub.docker.com/r/{namespace}/{name}"
+            out.append({
+                "name": name,
+                "namespace": namespace,
+                "url": u,
+                "description": desc,
+                "pull_count": it.get("pull_count"),
+                "last_updated": it.get("last_updated"),
+                "secrets": list(scan_text(desc, u)),
+            })
+        nxt = data.get("next")           # Docker Hub returns a full next-page URL
+        if not nxt:
+            break
+        url, params = nxt, None
     return out
 
 
