@@ -873,7 +873,10 @@ async def run(domains, args, keys) -> list:
         # ---- ASN / netblock expansion (opt-in) ----
         asn_info = {}
         if args.asn_expand and not args.passive_only:
-            asns = {h.asn for h in hosts.values() if h.asn}
+            # Every ASN a host touches, not just its scalar — a multi-homed host
+            # spanning ASNs otherwise gets only one netblock swept.
+            asns = {a for h in hosts.values()
+                    for a in ([h.asn] if h.asn else []) + list(h.ip_asn.values()) if a}
             barren = []
             for asn in asns:
                 prefixes = await ripestat_prefixes(client, asn)
