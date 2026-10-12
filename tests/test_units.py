@@ -53,7 +53,10 @@ def test_apply_ipinfo_records_per_ip_asn_for_multi_ip_hosts():
     enrich.apply_ipinfo(h, {"org": "AS13335 Cloudflare"}, "5.6.7.8")
     assert h.ip_asn == {"1.2.3.4": "AS15169", "5.6.7.8": "AS13335"}
     assert h.ip_org == {"1.2.3.4": "Google LLC", "5.6.7.8": "Cloudflare"}
-    assert h.asn == "AS13335"                    # scalar field: still last-IP-wins
+    # Scalar asn+org are paired, first-IP-wins — never an ASN from one IP glued
+    # to another IP's org. The per-IP maps above hold the honest breakdown.
+    assert h.asn == "AS15169"
+    assert h.org == "Google LLC"
 
 
 def test_apply_ipinfo_records_per_ip_org_without_asn_prefix():
@@ -64,6 +67,40 @@ def test_apply_ipinfo_records_per_ip_org_without_asn_prefix():
     assert h.ip_org == {"1.2.3.4": "Some Hosting Co"}
     assert h.ip_asn == {}
     assert h.org == "Some Hosting Co"
+
+
+def test_apply_ipinfo_scalar_org_not_crossed_with_a_prior_shodan_org():
+    # Shodan's apply_ports runs first and sets h.org; ipinfo must not then glue
+    # its own ASN onto that unrelated org in the scalar pair. The per-IP ipinfo
+    # org is still recorded honestly.
+    h = Host("a.x.com", ips=["1.2.3.4"])
+    enrich.apply_ports(h, {"org": "A100 US LLC", "ports": []}, "shodan")
+    enrich.apply_ipinfo(h, {"org": "AS16509 Amazon.com, Inc."}, "1.2.3.4")
+    assert h.asn == "AS16509"
+    assert h.ip_org == {"1.2.3.4": "Amazon.com, Inc."}   # per-IP truth is ipinfo's
+    # Scalar org keeps Shodan's first-write, but the honest pair is read from the
+    # per-IP map by host_asn_orgs (below), not from the scalar.
+    assert report.host_asn_orgs(h) == "AS16509 Amazon.com, Inc."
+
+
+def test_host_asn_orgs_shows_distinct_pairs_for_multi_homed_host():
+    h = Host("a.x.com", ips=["1.2.3.4", "5.6.7.8"],
+             ip_asn={"1.2.3.4": "AS15169", "5.6.7.8": "AS13335"},
+             ip_org={"1.2.3.4": "Google LLC", "5.6.7.8": "Cloudflare"})
+    assert report.host_asn_orgs(h) == "AS13335 Cloudflare; AS15169 Google LLC"
+
+
+def test_host_asn_orgs_collapses_when_all_ips_share_asn():
+    h = Host("a.x.com", ips=["54.240.184.31", "54.240.184.18"],
+             ip_asn={"54.240.184.31": "AS16509", "54.240.184.18": "AS16509"},
+             ip_org={"54.240.184.31": "Amazon.com, Inc.", "54.240.184.18": "Amazon.com, Inc."})
+    assert report.host_asn_orgs(h) == "AS16509 Amazon.com, Inc."
+
+
+def test_host_asn_orgs_falls_back_to_scalar_when_maps_empty():
+    h = Host("a.x.com", ips=["1.2.3.4"], asn="AS15169", org="Google LLC")
+    assert report.host_asn_orgs(h) == "AS15169 Google LLC"
+    assert report.host_asn_orgs(Host("b.x.com")) == "—"   # nothing known
 
 
 def test_non_web_ports_filters_out_web_ports():

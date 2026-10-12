@@ -427,7 +427,7 @@ class Host:
     org: str | None = None
     isp: str | None = None
     asn: str | None = None
-    ip_asn: dict = field(default_factory=dict)   # {ip: "ASxxxxx"} — asn above is last-IP-wins
+    ip_asn: dict = field(default_factory=dict)   # {ip: "ASxxxxx"} — asn above is first-IP-wins (paired with org); this map is the per-IP truth
     ip_org: dict = field(default_factory=dict)   # {ip: "Org Name"} — parallel to ip_asn
     ip_country: dict = field(default_factory=dict)  # {ip: "US"} — parallel to ip_asn/ip_org
     rdns: str | None = None

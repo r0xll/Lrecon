@@ -1185,7 +1185,7 @@ def write_markdown(hosts, domains, res, path) -> None:
         if h.wildcard:
             continue
         ips = ", ".join(h.ips) or "—"
-        asn_org = " ".join(x for x in (h.asn, (h.org or "")[:20]) if x) or "—"
+        asn_org = host_asn_orgs(h)
         ports = _format_ports_md(h.ports)
         tech = h.server or h.powered_by or (h.cpes[0] if h.cpes else "—")
         http = f"{h.scheme} {h.http_status}" if h.http_status else "—"
@@ -1285,6 +1285,31 @@ def host_countries(h) -> str:
     """
     seen = sorted({c for c in (getattr(h, "ip_country", None) or {}).values() if c})
     return ", ".join(seen) or (h.country or "—")
+
+
+def host_asn_orgs(h) -> str:
+    """Every distinct "ASxxxx Org" pair across a host's IPs, not one scalar.
+
+    The scalar `h.asn`/`h.org` pair is unreliable for a multi-homed host: asn is
+    taken from one IP and org can come from another IP (or from Shodan), so a
+    host balanced across networks can show an ASN glued to the wrong org. The
+    per-IP `ip_asn`/`ip_org` maps are filled together from the same ipinfo lookup,
+    so they stay paired — prefer them. Collapses to one pair when every IP shares
+    an ASN (the common case). The scalar is the fallback only when the maps are
+    empty (a host enriched before they existed, or via a path with no per-IP
+    breakdown). Each org is trimmed so the cell stays compact.
+    """
+    ip_asn = getattr(h, "ip_asn", None) or {}
+    ip_org = getattr(h, "ip_org", None) or {}
+    pairs = []
+    for ip in (ip_asn.keys() | ip_org.keys()):
+        asn, org = ip_asn.get(ip), ip_org.get(ip)
+        label = " ".join(x for x in (asn, (org or "")[:24]) if x)
+        if label and label not in pairs:
+            pairs.append(label)
+    if pairs:
+        return "; ".join(sorted(pairs))
+    return " ".join(x for x in (h.asn, (h.org or "")[:24]) if x) or "—"
 
 
 def _html_export_button(table_id: str, filename: str) -> str:
@@ -2104,7 +2129,7 @@ def write_html(hosts, domains, res, path, shots_dir=None) -> None:
             any_nonweb = True
         rows.append(
             f"<tr><td>{esc(h.subdomain)}</td><td>{', '.join(h.ips) or '—'}</td>"
-            f"<td>{esc(((h.asn or '') + ' ' + (h.org or '')).strip())[:40] or '—'}</td>"
+            f"<td>{esc(host_asn_orgs(h))}</td>"
             f"<td>{esc(host_countries(h))}</td>"
             f"<td>{_format_ports_html(h.ports)}</td>"
             f"<td>{esc(h.server or h.powered_by or None)}</td>"

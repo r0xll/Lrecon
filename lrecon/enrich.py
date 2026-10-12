@@ -117,8 +117,13 @@ def apply_ipinfo(h: Host, data: dict, ip: str | None = None) -> None:
         parts = org.split(" ", 1)
         if parts[0].startswith("AS"):
             org_name = parts[1] if len(parts) > 1 else org
-            h.asn = parts[0]
-            h.org = h.org or org_name
+            # Set the scalar asn+org together (first IP with an ASN wins) so the
+            # fallback pair always comes from the same IP/source — never an
+            # ipinfo ASN glued to another IP's (or Shodan's) org. The honest
+            # per-IP breakdown lives in ip_asn/ip_org below.
+            if not h.asn:
+                h.asn = parts[0]
+                h.org = h.org or org_name
             if ip:
                 h.ip_asn[ip] = parts[0]
                 h.ip_org[ip] = org_name
