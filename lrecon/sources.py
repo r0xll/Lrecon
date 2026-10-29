@@ -1,0 +1,784 @@
+from __future__ import annotations
+import asyncio, ipaddress, random, shutil, string
+from .common import *
+from . import backends
+try:
+    import dns.asyncresolver, dns.rdatatype, dns.resolver
+except Exception:
+    pass
+
+# --------------------------------------------------------------------------- #
+# Phase 1 — passive enumeration sources (keyless unless noted)
+# --------------------------------------------------------------------------- #
+async def enum_crtsh_best(client, domain: str, use_psql: bool = True) -> set:
+    """
+    Prefer a direct query against crt.sh's public Postgres replica (psql, if
+    on PATH) over its HTTP/JSON frontend — the direct-DB path bypasses that
+    frontend's well-documented flakiness (429s/5xx/outright outages) entirely
+    rather than just retrying it. Falls back to enum_crtsh() (HTTP, already
+    hardened with its own retry/backoff) when psql isn't available, or when
+    it ran but produced nothing — cheap insurance against a silent
+    connection failure looking identical to a genuinely empty result.
+
+    The psql tier is bounded by short timeouts (see backends.crtsh_psql):
+    where raw TCP :5432 is firewalled the connect hangs rather than refusing,
+    so an unbounded first tier would stall every domain before the HTTP tier
+    ever runs — which presents as "crt.sh doesn't work" even though the HTTP
+    path is fine.
+    """
+    if use_psql:
+        rows = await backends.crtsh_psql(domain)
+        if rows:
+            # Same label-boundary scoping as the HTTP tier — see
+            # _crtsh_name_in_scope (a bare endswith would accept
+            # testexample.com for example.com).
+            out = {n.strip().lstrip("*.").lower().rstrip(".") for n in rows}
+            out = {n for n in out if _crtsh_name_in_scope(n, domain)}
+            if out:
+                return out
+        log(f"[i] crt.sh {domain}: direct-DB tier unavailable/empty — using HTTP frontend "
+            f"(--no-pd skips the psql tier entirely)")
+    return await enum_crtsh(client, domain)
+
+
+# crt.sh returns 502/504 mostly when its own query planner times out on a big
+# result set, so these are worth retrying — and worth shrinking the query for.
+_CRTSH_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+def name_in_scope(name: str, domain: str) -> bool:
+    """
+    True only for the apex itself or a real subdomain of it.
+
+    A bare `endswith(domain)` test is wrong at the label boundary: it accepts
+    `testexample.com` for `example.com` (confirmed live — crt.sh's
+    `%.example.com` pattern does return names like `m.testexample.com`, and OTX
+    and Anubis return third-party lookalikes too). Adding an out-of-scope third
+    party's host to an engagement's scope is an ROE problem, not a cosmetic one:
+    on a non-passive run that host gets resolved, probed and port-scanned.
+
+    Used by every passive source and again by passive_enum's own filter, so a
+    source added later cannot reintroduce the hole by reaching for `endswith`.
+
+    Email addresses are also rejected: certificate subjects can carry an
+    rfc822Name (e.g. `subjectname@example.com`), which is not a host to scan.
+    The psql tier already excludes these server-side (`NOT ILIKE '%@%'`); this
+    keeps every other tier consistent with it.
+    """
+    if not name or " " in name or "@" in name:
+        return False
+    name = name.rstrip(".").lower()
+    domain = (domain or "").rstrip(".").lower()
+    if not domain:
+        return False
+    return name == domain or name.endswith("." + domain)
+
+
+# Kept so the crt.sh-specific name still resolves for anything importing it.
+_crtsh_name_in_scope = name_in_scope
+
+
+def _parse_crtsh_rows(rows, domain: str) -> set:
+    """Names out of crt.sh's JSON rows, scoped to `domain`. Each row carries a
+    newline-separated `name_value` (SAN list) plus a `common_name`."""
+    out = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        names = f"{row.get('name_value', '')}\n{row.get('common_name') or ''}"
+        for n in names.splitlines():
+            n = n.strip().lstrip("*.").lower().rstrip(".")
+            if _crtsh_name_in_scope(n, domain):
+                out.add(n)
+    return out
+
+
+async def enum_crtsh(client, domain: str) -> set:
+    """
+    crt.sh's web frontend is notoriously flaky under load (slow queries, 429s,
+    5xx, or a truncated/non-JSON body on a 200) — retry with exponential
+    backoff + jitter rather than giving up after one retry. Non-200/bad-JSON
+    responses are retried too, not just network exceptions.
+
+    Two query forms are alternated across attempts. Both are documented and
+    cover the same identity pattern, but they take different paths through
+    crt.sh's backend, so one frequently succeeds while the other 502s
+    (measured: `identity=` returned 77 names while `q=` was 502-ing, and vice
+    versa minutes later):
+
+      1. ?q=%.{domain}          — wildcard match on the identity
+      2. ?identity=%.{domain}   — explicit identity lookup
+
+    Deliberately does NOT send `exclude=expired`. It looks attractive (smaller
+    result set = fewer planner timeouts) but measured against example.com it
+    dropped 77 names to 20 — and expired certs are exactly where forgotten
+    dev/staging hostnames live, which is the point of CT enumeration. It also
+    didn't actually stop the 502s.
+
+    On total failure the per-attempt statuses are logged, so a bad run is
+    diagnosable instead of looking like a silent empty result.
+    """
+    out = set()
+    errors = []
+    attempts = 5
+    for attempt in range(attempts):
+        # Alternate the two query forms so a planner timeout on one doesn't
+        # burn every attempt.
+        if attempt % 2 == 0:
+            url = f"https://crt.sh/?q=%25.{domain}&output=json"
+        else:
+            url = f"https://crt.sh/?identity=%25.{domain}&output=json"
+        try:
+            r = await client.get(url, headers={"Accept": "application/json"}, timeout=45)
+            if r.status_code == 200:
+                try:
+                    rows = r.json()
+                except Exception as e:
+                    # A 200 carrying a truncated/HTML body is a crt.sh failure
+                    # mode, not an empty result — retry rather than accept it.
+                    errors.append(f"200 but bad JSON ({e})")
+                    rows = None
+                if isinstance(rows, list):
+                    if rows:
+                        return _parse_crtsh_rows(rows, domain)
+                    # An empty list is a legitimate "no certs" answer, but it's
+                    # also what a truncated response looks like. Accept it only
+                    # on the final attempt.
+                    errors.append("200 with empty result")
+                elif rows is not None:
+                    errors.append(f"200 but unexpected JSON type ({type(rows).__name__})")
+            else:
+                errors.append(f"HTTP {r.status_code}")
+                if r.status_code not in _CRTSH_RETRY_STATUS:
+                    break      # 4xx other than 429 won't fix itself
+        except Exception as e:
+            errors.append(f"{type(e).__name__}: {e}")
+        if attempt < attempts - 1:
+            await asyncio.sleep(min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
+    if errors:
+        log(f"[!] crt.sh {domain}: no data after {len(errors)} attempt(s) "
+            f"[{'; '.join(errors[:5])}] — other CT sources (certspotter/OTX) still cover this")
+    return out
+
+
+async def enum_certspotter(client, domain: str) -> set:
+    """CT via Cert Spotter — independent of crt.sh (survives crt.sh outages)."""
+    out = set()
+    url = (f"https://api.certspotter.com/v1/issuances?domain={domain}"
+           f"&include_subdomains=true&expand=dns_names")
+    try:
+        r = await client.get(url, timeout=30)
+        if r.status_code == 200:
+            for cert in r.json():
+                for n in cert.get("dns_names", []):
+                    n = n.strip().lstrip("*.").lower()
+                    if name_in_scope(n, domain):
+                        out.add(n)
+    except Exception as e:
+        log(f"[!] certspotter {domain}: {e}")
+    return out
+
+
+class SourceSet(set):
+    """Hosts a source found, plus whether the source actually worked.
+
+    A blocked, rate-limited or relocated source returns an empty set — exactly
+    what a working source with nothing to say returns. The per-source
+    attribution line then reads `otx=0` for both, which is the difference
+    between a fact about the target and a fact about lrecon being broken.
+    Carrying the outcome alongside the hosts keeps the two apart.
+
+    Subclasses `set` so every existing consumer (`isinstance(res, set)`, set
+    comparisons in tests, iteration) keeps working untouched.
+    """
+    def __init__(self, *args, failed: bool = False, detail: str | None = None):
+        super().__init__(*args)
+        self.failed = failed
+        self.detail = detail
+
+
+def _source_failed(source: str, domain: str, detail: str) -> SourceSet:
+    log(f"[!] {source} {domain}: {detail}")
+    return SourceSet(failed=True, detail=detail)
+
+
+def _exc_detail(e: Exception) -> str:
+    """Exception text that still says something when str(e) is empty.
+
+    httpx's timeout exceptions stringify to "", so a bare str(e) produced
+    `wayback github.com: ` — a failure notice naming no failure.
+    """
+    return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
+async def enum_otx(client, domain: str, api_key: str | None = None) -> set:
+    """AlienVault OTX passive DNS — needs an API key.
+
+    Not keyless any more: anonymous callers get 429 "Anonymous access to this
+    endpoint is limited. Please authenticate." The key goes in `X-OTX-API-KEY`
+    (`--otx-key` / `OTX_API_KEY` / `otx_api_key` in config). Without one the
+    refusal is reported rather than left to look like a domain with no passive
+    DNS.
+    """
+    url = f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns"
+    headers = {"X-OTX-API-KEY": api_key} if api_key else {}
+    try:
+        r = await client.get(url, headers=headers, timeout=30)
+        if r.status_code in (401, 403):
+            return _source_failed("otx", domain,
+                                  f"HTTP {r.status_code} — OTX rejected the API key")
+        if r.status_code == 429:
+            return _source_failed(
+                "otx", domain,
+                "HTTP 429 — " + ("rate limited despite an API key; retry later"
+                                 if api_key else
+                                 "OTX refuses anonymous access to passive DNS. Set "
+                                 "--otx-key/OTX_API_KEY to use this source; not a sign "
+                                 "the domain is clean"))
+        if r.status_code != 200:
+            return _source_failed("otx", domain, f"HTTP {r.status_code}")
+        out = SourceSet()
+        for rec in r.json().get("passive_dns", []):
+            h = rec.get("hostname", "").strip().lower()
+            if name_in_scope(h, domain):
+                out.add(h)
+        return out
+    except Exception as e:
+        return _source_failed("otx", domain, _exc_detail(e))
+
+
+# Anubis-DB's canonical host. jldc.me — the address lrecon used to call — now
+# redirects to jonlu.ca, which sits behind bot protection and answers 403, so
+# the source looked dead when it was only at a different address.
+ANUBIS_HOST = "https://anubisdb.com"
+
+
+async def enum_anubis(client, domain: str) -> set:
+    """Anubis-DB subdomain database — keyless."""
+    try:
+        r = await client.get(f"{ANUBIS_HOST}/anubis/subdomains/{domain}",
+                             timeout=30, follow_redirects=True)
+        if r.status_code == 404:
+            return SourceSet()          # a real "nothing on this domain" answer
+        if r.status_code != 200:
+            return _source_failed("anubis", domain, f"HTTP {r.status_code}")
+        out = SourceSet()
+        for n in (r.json() or []):
+            n = str(n).strip().lower().lstrip("*.")
+            if name_in_scope(n, domain):
+                out.add(n)
+        return out
+    except Exception as e:
+        return _source_failed("anubis", domain, _exc_detail(e))
+
+
+# The archive rate-limits hard and its CDX endpoint drops connections under
+# load. Same treatment as crt.sh: retry the transient statuses rather than
+# losing the source for the whole run on one bad response.
+_WAYBACK_RETRY_STATUS = (429, 500, 502, 503, 504)
+
+
+async def enum_wayback(client, domain: str, attempts: int = 4) -> set:
+    """Wayback CDX index — keyless.
+
+    HTTPS is required, not cosmetic: web.archive.org answers plain HTTP with a
+    301 to the same URL over TLS, and the shared enum client is
+    `follow_redirects=False`, so the old `http://` URL never returned a single
+    host on any target.
+
+    Retries with backoff because a single 429 or dropped connection used to end
+    the source for the run — and 429 is the archive's normal response under any
+    load, not an exceptional one. `Retry-After` is honoured when sent, since
+    guessing shorter than the server asked just earns another 429.
+    """
+    url = (f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
+           f"&output=json&fl=original&collapse=urlkey&limit=10000")
+    errors = []
+    for attempt in range(attempts):
+        try:
+            r = await client.get(url, timeout=45, follow_redirects=True)
+            if r.status_code == 200:
+                out = SourceSet()
+                for row in (r.json() or [])[1:]:
+                    host = row[0].split("//")[-1].split("/")[0].split(":")[0].lower()
+                    if name_in_scope(host, domain):
+                        out.add(host)
+                return out
+            errors.append(f"HTTP {r.status_code}")
+            if r.status_code not in _WAYBACK_RETRY_STATUS:
+                break
+            delay = _retry_after_seconds(r)
+        except Exception as e:
+            errors.append(_exc_detail(e))
+            delay = None
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay if delay is not None
+                                else min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
+    return _source_failed("wayback", domain,
+                          f"no data after {len(errors)} attempt(s) [{'; '.join(errors[:4])}]")
+
+
+def _retry_after_seconds(r) -> float | None:
+    """`Retry-After` in seconds, if the server sent a usable one."""
+    raw = (r.headers.get("retry-after") or "").strip()
+    try:
+        return min(float(raw), 30.0) if raw else None
+    except ValueError:
+        return None                     # HTTP-date form — fall back to backoff
+
+
+# Extensions that are static assets, not app paths — re-requesting them just
+# confirms a CDN serves images, never a forgotten admin panel. Dropped from the
+# stale-endpoint verify set (`.map`/`.js` are handled by the later JS scan).
+_WAYBACK_ASSET_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css",
+                      ".woff", ".woff2", ".ttf", ".eot", ".webp", ".mp4", ".webm",
+                      ".pdf", ".zip", ".gz", ".map", ".js")
+
+
+def _wayback_split(raw: str):
+    """`(host, path)` from a raw archived URL, path query/fragment stripped."""
+    rest = raw.split("://", 1)[-1]
+    hostpart, _, pathpart = rest.partition("/")
+    host = hostpart.split("@")[-1].split(":")[0].lower()
+    path = "/" + pathpart.split("#")[0].split("?")[0]
+    return host, path
+
+
+async def wayback_paths(client, domain: str, per_host_cap: int = 50,
+                        attempts: int = 4) -> dict:
+    """Archived URL *paths* per in-scope host, from the Wayback CDX index.
+
+    Extends the subdomain-only `enum_wayback` to keep the full path, grouped by
+    host: the raw material for hunting forgotten admin panels and old apps that
+    no passive source surfaces directly. Static-asset paths are dropped, paths
+    are deduped, and each host is capped. Returns `{host: [path, ...]}`; `{}` on
+    a total failure (same 429/backoff handling as `enum_wayback`).
+    """
+    url = (f"https://web.archive.org/cdx/search/cdx?url=*.{domain}/*"
+           f"&output=json&fl=original&collapse=urlkey&limit=20000")
+    for attempt in range(attempts):
+        try:
+            r = await client.get(url, timeout=45, follow_redirects=True)
+            if r.status_code == 200:
+                out, seen = defaultdict(list), defaultdict(set)
+                for row in (r.json() or [])[1:]:
+                    host, path = _wayback_split(row[0])
+                    if not name_in_scope(host, domain):
+                        continue
+                    if any(path.lower().endswith(e) for e in _WAYBACK_ASSET_EXT):
+                        continue
+                    if path in seen[host] or len(out[host]) >= per_host_cap:
+                        continue
+                    seen[host].add(path)
+                    out[host].append(path)
+                return dict(out)
+            if r.status_code not in _WAYBACK_RETRY_STATUS:
+                break
+            delay = _retry_after_seconds(r)
+        except Exception:
+            delay = None
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay if delay is not None
+                                else min(2 ** (attempt + 1), 20) + random.uniform(0, 1))
+    return {}
+
+
+async def enum_shodan_dns(client, domain: str, key: str) -> set:
+    out = set()
+    try:
+        r = await client.get(f"https://api.shodan.io/dns/domain/{domain}?key={key}", timeout=30)
+        if r.status_code == 200:
+            for sub in r.json().get("subdomains", []):
+                out.add(f"{sub}.{domain}".lower())
+        elif r.status_code == 401:
+            log("[!] Shodan: invalid API key")
+    except Exception as e:
+        log(f"[!] shodan dns {domain}: {e}")
+    return out
+
+
+async def enum_subfinder(domain: str) -> set:
+    if not shutil.which("subfinder"):
+        return set()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "subfinder", "-silent", "-d", domain,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=180)
+        return {l.strip().lower() for l in out.decode().splitlines() if l.strip()}
+    except Exception as e:
+        log(f"[!] subfinder {domain}: {e}")
+        return set()
+
+
+async def passive_enum(client, domains, keys, no_pd: bool = False) -> tuple[dict, dict]:
+    """
+    Returns (host_sources, per_source_counts, failed_sources):
+      host_sources: {hostname -> set(source_names)}
+      per_source_counts: {source_name -> count of in-scope hosts it found}
+      failed_sources: {source_name -> why it didn't work}
+    Every source is fanned out across every domain concurrently.
+
+    `failed_sources` exists because a count of 0 is ambiguous on its own: it
+    means "this domain has no hosts here" for a working source and "this source
+    is blocked" for a broken one, and only the first is a finding about the
+    target.
+    """
+    jobs = []                                       # (source_name, coroutine)
+    for d in domains:
+        jobs += [
+            ("crtsh",       enum_crtsh_best(client, d, use_psql=not no_pd)),
+            ("certspotter", enum_certspotter(client, d)),
+            ("otx",         enum_otx(client, d, keys.get("otx"))),
+            ("anubis",      enum_anubis(client, d)),
+            ("wayback",     enum_wayback(client, d)),
+            ("subfinder",   enum_subfinder(d)),
+        ]
+        if keys.get("shodan"):
+            jobs.append(("shodan_dns", enum_shodan_dns(client, d, keys["shodan"])))
+
+    results = await asyncio.gather(*(c for _, c in jobs), return_exceptions=True)
+
+    host_sources: dict = defaultdict(set)
+    per_source: dict = defaultdict(int)
+    failed: dict = {}
+    for (src, _), res in zip(jobs, results):
+        if isinstance(res, BaseException):
+            failed.setdefault(src, str(res))
+            continue
+        if isinstance(res, set):
+            if getattr(res, "failed", False):
+                failed.setdefault(src, res.detail or "source unavailable")
+            in_scope = {n for n in res if any(name_in_scope(n, d) for d in domains)}
+            per_source[src] += len(in_scope)
+            for n in in_scope:
+                host_sources[n].add(src)
+    # A source that worked for one domain isn't broken, whatever it did on
+    # another — don't let one domain's failure indict the whole source.
+    failed = {s: why for s, why in failed.items() if not per_source.get(s)}
+    for d in domains:                               # seed apexes
+        host_sources[d].add("seed")
+    return host_sources, per_source, failed
+
+
+
+# --------------------------------------------------------------------------- #
+# Phase 2 — resolution
+# --------------------------------------------------------------------------- #
+_RESOLVER = None
+
+
+def get_resolver(nameservers):
+    global _RESOLVER
+    if _RESOLVER is None:
+        r = dns.asyncresolver.Resolver(configure=True)
+        if nameservers:
+            r.nameservers = nameservers
+        r.timeout, r.lifetime = 2.0, 4.0
+        _RESOLVER = r
+    return _RESOLVER
+
+
+async def ns_records(name: str, nameservers) -> list:
+    """The delegated nameserver hostnames for `name` (its NS RRset), lowercased.
+    Empty on NXDOMAIN/NoAnswer/failure — the caller decides what an absence
+    means."""
+    if not _HAVE_DNS:
+        return []
+    res = get_resolver(nameservers)
+    try:
+        ans = await res.resolve(name, "NS")
+        return sorted({str(r.target).rstrip(".").lower() for r in ans})
+    except Exception:
+        return []
+
+
+async def resolve_full(subdomain: str, nameservers) -> tuple:
+    """Resolve a name to `(ips, cname, nxdomain)`.
+
+    `nxdomain` is True only when the name *definitively does not exist* — the
+    resolver returned NXDOMAIN, not a timeout or SERVFAIL. That distinction is
+    load-bearing for the scope sheet: an empty IP list from a transient DNS
+    failure must not be mistaken for a dead host and dropped, the same
+    "inconclusive is not negative" rule applied to SPF/MTA-STS/source failures
+    elsewhere. NoAnswer (the name exists but has no A/AAAA — e.g. MX-only) is
+    also *not* nxdomain: the host is real, just not web-facing.
+    """
+    if not _HAVE_DNS:
+        return [], None, False
+    res = get_resolver(nameservers)
+
+    async def q(name, rtype):
+        try:
+            return rtype, await res.resolve(name, rtype), None
+        except Exception as e:
+            return rtype, None, e
+
+    ips, cname = [], None
+    results = await asyncio.gather(q(subdomain, "A"), q(subdomain, "AAAA"), q(subdomain, "CNAME"))
+    for rtype, ans, _err in results:
+        if ans is None:
+            continue
+        if rtype == "CNAME":
+            cname = str(ans[0].target).rstrip(".").lower()
+        else:
+            ips.extend(str(r) for r in ans)
+
+    # Follow the CNAME chain to its terminal target when the name has a CNAME but
+    # no address of its own. A CDN double-CNAME (app -> app.cdn.example -> dangling)
+    # otherwise leaves `cname` at the live middle hop, so takeover detection
+    # checks the wrong name and misses the unclaimed end of the chain. Bounded to
+    # 5 hops and loop-guarded; the terminal hop is what we classify.
+    if cname and not ips:
+        seen = {subdomain.rstrip(".").lower(), cname}
+        terminal = cname
+        for _ in range(5):
+            _rt, ans, _err = await q(terminal, "CNAME")
+            if not ans:
+                break
+            nxt = str(ans[0].target).rstrip(".").lower()
+            if nxt in seen:
+                break
+            seen.add(nxt)
+            terminal = nxt
+        cname = terminal
+
+    # Confirmed-dead only if nothing resolved AND a query actually said
+    # NXDOMAIN. NXDOMAIN is a property of the name, so any of the three queries
+    # raising it settles the name's non-existence.
+    nxdomain = (not ips and not cname
+                and any(isinstance(err, dns.resolver.NXDOMAIN) for _, _, err in results))
+    return ips, cname, nxdomain
+
+
+def _closest_zone_from_nxdomain(exc) -> str | None:
+    """The deepest zone that *does* exist above a non-existent name.
+
+    An NXDOMAIN answer carries the SOA of the closest enclosing zone, and that
+    single fact separates the two very different situations behind an identical
+    rcode:
+
+      * `typo.partner-company.example` -> SOA owner `partner-company.example` — a live
+        zone is merely missing one label, so an attacker cannot create the name.
+      * `gone.no-such-domain.example`  -> SOA owner `example` — nothing below the
+        TLD exists, so the domain itself is unregistered and can simply be bought.
+
+    Best-effort: returns None when the resolver surfaced no authority section.
+    """
+    try:
+        responses = exc.responses() or {}
+        best = None
+        for resp in responses.values():
+            for rrset in getattr(resp, "authority", None) or []:
+                if getattr(rrset, "rdtype", None) != dns.rdatatype.SOA:
+                    continue
+                zone = str(rrset.name).rstrip(".").lower()
+                # If responses disagree, the deepest zone is the tightest bound.
+                if zone and (best is None or zone.count(".") > best.count(".")):
+                    best = zone
+        return best
+    except Exception:
+        return None
+
+
+async def cname_target_status(cname: str, nameservers) -> tuple:
+    """Whether a CNAME's target exists — the dangling-CNAME test.
+
+    Returns `(status, closest_zone)` where status is "nxdomain" (the target's
+    name does not exist), "resolves" (it does), or "unknown" (timeout/SERVFAIL —
+    inconclusive, and never to be reported as a finding).
+
+    `closest_zone` accompanies an "nxdomain" result: the deepest zone that still
+    exists above the target. NXDOMAIN proves the target is *broken*, not that it
+    is *claimable* — an attacker can only take it over if they can create the
+    name, which depends on whether the enclosing domain is theirs to register.
+    Callers use the zone to tell those apart instead of assuming the worst.
+
+    This is what catches the takeovers TAKEOVER_SIGS cannot. The classic
+    dangling CNAME has no A/AAAA record at all, so the host is filtered out
+    before the HTTP probe and no body signature can ever match; NXDOMAIN on the
+    target needs no HTTP request and no per-provider signature, so it works for
+    providers nobody has written a signature for yet.
+
+    A query for A/AAAA follows the CNAME chain, so a chain ending at a
+    non-existent name reports NXDOMAIN here even when intermediate links exist.
+    """
+    if not _HAVE_DNS or not cname:
+        return "unknown", None
+    res = get_resolver(nameservers)
+    nxdomain = False
+    closest_zone = None
+    for rtype in ("A", "AAAA"):
+        try:
+            if await res.resolve(cname, rtype):
+                return "resolves", None
+        except Exception as e:
+            kind = type(e).__name__
+            if kind == "NXDOMAIN":
+                nxdomain = True
+                closest_zone = closest_zone or _closest_zone_from_nxdomain(e)
+            elif kind == "NoAnswer":
+                return "resolves", None   # the name exists, just not with this type
+            # anything else (timeout, SERVFAIL, ...) stays inconclusive
+    return ("nxdomain", closest_zone) if nxdomain else ("unknown", None)
+
+
+async def detect_wildcard(domain: str, nameservers, probes: int = 4) -> set:
+    if not _HAVE_DNS:
+        return set()
+    # Fire several random labels, not one: a load-balanced wildcard returns a
+    # different IP from its pool per query, so a single probe captures only one
+    # pool member and the rest leak phantoms past the issubset filter. Union the
+    # answers to learn the whole pool.
+    labels = ["".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+              for _ in range(max(1, probes))]
+    results = await asyncio.gather(
+        *(resolve_full(f"{label}.{domain}", nameservers) for label in labels))
+    wc = set()
+    for ips, _cname, _nx in results:
+        wc.update(ips)
+    if wc:
+        log(f"[!] wildcard DNS on {domain} -> {', '.join(sorted(wc))} (filtering phantoms)")
+    return wc
+
+
+def is_wildcard_phantom(host, wildcard_ips) -> bool:
+    """Whether `host` should be dropped as a wildcard phantom.
+
+    A host whose addresses are entirely within a wildcard pool is normally a
+    phantom the catch-all invented — EXCEPT one the operator named explicitly
+    (source `seed`). A SaaS/PaaS target like `app.tenant.example.app` legitimately
+    resolves into the platform's shared wildcard ingress pool; it is a real,
+    in-scope target, not a phantom, so it must never be filtered out (that would
+    empty the attack surface for the one host the operator asked about).
+    Brute/passive-discovered names carry no `seed` source and are still filtered.
+    """
+    if "seed" in (getattr(host, "source", None) or set()):
+        return False
+    ips = getattr(host, "ips", None) or []
+    return bool(wildcard_ips and ips and set(ips).issubset(set(wildcard_ips)))
+
+
+# --------------------------------------------------------------------------- #
+# Active subdomain brute-force / permutation (opt-in, ROE-gated)
+# --------------------------------------------------------------------------- #
+# Affixes applied to already-known labels — the names an org actually uses tend
+# to have sibling environments (`app` -> `app-dev`, `dev.app`), which a flat
+# wordlist rarely reaches on its own.
+_PERMUTE_AFFIXES = ("dev", "test", "staging", "stage", "uat", "qa", "prod",
+                    "old", "new", "internal", "api", "admin", "beta", "demo")
+
+
+def load_wordlist(path: str | None = None) -> list:
+    """Brute-force labels — from `path`, else the bundled compact default.
+
+    One label per line; blank lines and `#`-comments skipped (same shape as the
+    domains file). The default ships with the package so `--brute` works with no
+    SecLists install; `--wordlist` points at a fuller list for depth.
+    """
+    if path:
+        text = Path(path).read_text()
+    else:
+        import importlib.resources
+        text = importlib.resources.files("lrecon").joinpath("data/subdomains.txt").read_text()
+    return [ln.strip() for ln in text.splitlines()
+            if ln.strip() and not ln.strip().startswith("#")]
+
+
+def brute_candidates(domains, known_hosts, wordlist, permute: bool = True,
+                     cap: int = 5000) -> set:
+    """Candidate hostnames for the active brute-force phase.
+
+    Two sources, both kept strictly in-scope via `name_in_scope` (so a stray
+    wordlist entry or a lookalike known host can never widen scope):
+      * `word.domain` for every wordlist label × seed domain;
+      * permutations of the leftmost label of each already-known host
+        (`app.example.com` -> `app-dev`, `dev-app`, `dev.app.example.com`),
+        which catch sibling environments a flat list misses.
+
+    Pure and deterministic so the scope decision is unit-testable. Already-known
+    hosts are removed from the result (nothing to re-resolve). The base
+    wordlist sweep is prioritised over permutations when truncating to `cap`, so
+    a tight cap still runs the core list rather than being flooded by the
+    permutations of a large passively-enumerated host set.
+    """
+    words = list(dict.fromkeys(w.lower() for w in wordlist if w))
+    roots = [d.lower() for d in domains]
+    base = [f"{w}.{root}" for root in roots for w in words
+            if name_in_scope(f"{w}.{root}", root)]
+    perms = []
+    if permute:
+        for h in known_hosts:
+            hl = h.lower().rstrip(".")
+            root = next((r for r in roots if hl == r or hl.endswith("." + r)), None)
+            if not root or hl == root:
+                continue
+            sub = hl[: -(len(root) + 1)]           # label(s) left of the root
+            labels = sub.split(".")
+            first, tail = labels[0], ".".join(labels[1:])
+            suffix = (f"{tail}." if tail else "") + root
+            for aff in _PERMUTE_AFFIXES:
+                perms += [f"{first}-{aff}.{suffix}", f"{aff}-{first}.{suffix}",
+                          f"{aff}.{first}.{suffix}"]
+    known = {h.lower().rstrip(".") for h in known_hosts}
+    seen, ordered = set(), []
+    for name in base + perms:                      # base first, so the cap favours it
+        if name not in seen and name not in known:
+            seen.add(name)
+            ordered.append(name)
+    return set(ordered[:cap])
+
+
+
+# --------------------------------------------------------------------------- #
+# ASN / netblock expansion (RIPEstat, keyless) + reverse-DNS sweep
+# --------------------------------------------------------------------------- #
+async def ripestat_prefixes(client, asn: str) -> list:
+    """Announced prefixes for an ASN via RIPEstat (keyless)."""
+    asn_num = asn.replace("AS", "").strip()
+    out = []
+    try:
+        r = await client.get("https://stat.ripe.net/data/announced-prefixes/data.json",
+                            params={"resource": f"AS{asn_num}"}, timeout=25)
+        if r.status_code == 200:
+            for p in r.json().get("data", {}).get("prefixes", []):
+                out.append(p["prefix"])
+    except Exception as e:
+        log(f"[!] ripestat AS{asn_num}: {e}")
+    return out
+
+
+async def reverse_dns_sweep(prefixes, resolver_ns, cap=4096) -> dict:
+    """PTR-sweep IPv4 prefixes (bounded). Returns {ip: hostname}."""
+    if not _HAVE_DNS:
+        return {}
+    res = get_resolver(resolver_ns)
+    targets = []
+    for pfx in prefixes:
+        try:
+            net = ipaddress.ip_network(pfx, strict=False)
+        except Exception:
+            continue
+        if net.version != 4 or net.num_addresses > 65536:   # skip v6 + huge nets
+            continue
+        for ip in net.hosts():
+            targets.append(str(ip))
+            if len(targets) >= cap:
+                break
+        if len(targets) >= cap:
+            break
+    sem = asyncio.Semaphore(100)
+    found = {}
+
+    async def ptr(ip):
+        async with sem:
+            try:
+                ans = await res.resolve_address(ip)
+                if ans:
+                    found[ip] = str(ans[0].target).rstrip(".").lower()
+            except Exception:
+                pass
+    await asyncio.gather(*(ptr(ip) for ip in targets))
+    return found
+
+

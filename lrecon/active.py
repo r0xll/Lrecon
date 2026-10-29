@@ -1,0 +1,556 @@
+from __future__ import annotations
+import asyncio
+import re
+from urllib.parse import urljoin
+import httpx
+from .common import *
+from .secrets import scan_text
+from .techfp import fingerprint
+from .headers import security_headers
+from .waf import fingerprint_waf
+from .pixels import extract_tracking_ids
+from .excavate import extract_hostnames
+from .badsecrets import check_response
+from .tlsinfo import fetch_cert, TLS_PORTS
+
+
+def _set_cookie_list(r) -> list:
+    """Every Set-Cookie header on the response (httpx multidict or a plain
+    dict stub in tests)."""
+    h = r.headers
+    if hasattr(h, "get_list"):
+        return h.get_list("set-cookie")
+    v = h.get("set-cookie") if hasattr(h, "get") else None
+    return [v] if v else []
+
+# --------------------------------------------------------------------------- #
+# Phase 4 — active
+# --------------------------------------------------------------------------- #
+def _extract_title(body: str) -> str | None:
+    """The <title> text of an HTML body, trimmed to 120 chars, or None."""
+    lo = (body or "").lower()
+    if "<title" not in lo:
+        return None
+    s = lo.find(">", lo.find("<title")) + 1
+    e = lo.find("</title", s)
+    if s > 0 and e > s:
+        return body[s:e].strip()[:120] or None
+    return None
+
+
+# Non-standard web ports the port scan may find that the main HTTP probe (80/443
+# only) never touches. https for the TLS-ish ones, http for the rest.
+_TLS_WEB_PORTS = {443, 8443, 9443}
+
+
+async def probe_web_ports(client, host: Host) -> None:
+    """HTTP-probe open non-standard web ports (8080/8443/8000/... from the port
+    scan) that http_probe never reaches — a live service on one is often a
+    forgotten admin panel, staging app, or management console. Each hit is
+    recorded on host.endpoints so it rides the existing report/JSON path."""
+    if not host.ips:
+        return
+    extra = sorted(p for p in host.ports if p in WEB_PORTS and p not in (80, 443))
+    for port in extra:
+        scheme = "https" if port in _TLS_WEB_PORTS else "http"
+        try:
+            r = await client.get(f"{scheme}://{host.subdomain}:{port}/",
+                                 timeout=8, follow_redirects=True)
+        except Exception:
+            continue
+        host.endpoints.append({
+            "path": f":{port}/",
+            "status": r.status_code,
+            "source": f"web-port ({scheme})",
+            "title": _extract_title(r.text[:30000]),
+        })
+
+
+async def http_probe(client, host: Host) -> None:
+    for scheme in ("https", "http"):
+        try:
+            r = await client.get(f"{scheme}://{host.subdomain}",
+                                timeout=10, follow_redirects=True)
+            host.http_status = r.status_code
+            host.scheme = scheme
+            host.server = r.headers.get("server")
+            host.powered_by = r.headers.get("x-powered-by")
+            host.final_url = str(r.url)
+            # Feed the same field the ProjectDiscovery httpx backend fills, so
+            # confirm_tech_stack() has something to compare CPEs against. It
+            # previously only ever got data on runs where PD httpx was on PATH,
+            # which meant CVE tech-confirmation silently did nothing for anyone
+            # on the pure-Python path — always None, never True or False.
+            body = r.text[:30000]
+            # Server/X-Powered-By plus a real fingerprint of the served page, so
+            # confirm_tech_stack() has meaningful vendor/product names to match a
+            # CVE's CPE against — headers alone almost never carried them.
+            base_tech = [t for t in (host.server, host.powered_by) if t]
+            fp = fingerprint(r.headers, body, list(getattr(r, "cookies", {}).keys()))
+            host.tech = list(dict.fromkeys(base_tech + fp))
+            host.sec_headers = security_headers(r.headers, _set_cookie_list(r))
+            host.waf = fingerprint_waf(r.headers)
+            host.tracking_ids = extract_tracking_ids(body)
+            host.harvested_hosts |= extract_hostnames(body, r.headers)
+            host.framework_secrets = check_response(body, r.headers, _set_cookie_list(r))
+            lo = body.lower()
+            title = _extract_title(body)
+            if title:
+                host.http_title = title
+            _check_takeover(host, lo, r.status_code)
+            return
+        except Exception:
+            continue
+
+
+async def takeover_check_host(client, host: Host) -> None:
+    """Takeover-only body fetch, used when a backend already did the HTTP probe."""
+    if not host.cname or not any(sig in host.cname for sig in TAKEOVER_SIGS):
+        return
+    for scheme in ("https", "http"):
+        try:
+            r = await client.get(f"{scheme}://{host.subdomain}",
+                                timeout=8, follow_redirects=True)
+            _check_takeover(host, r.text[:30000].lower(), r.status_code)
+            return
+        except Exception:
+            continue
+
+
+def mark_dangling_cname(host: Host, status: str, closest_zone: str | None = None) -> None:
+    """Record a takeover lead from the CNAME target's DNS status.
+
+    Only "nxdomain" is a finding. "resolves" and "unknown" (timeout/SERVFAIL) are
+    not reported: an inconclusive lookup must not become a client-facing finding.
+
+    Confidence turns on *claimability*, not on brokenness. NXDOMAIN proves the
+    target does not exist; it does not prove an attacker could create it. A
+    broken CNAME to a typo under a partner's domain is NXDOMAIN too, yet nobody
+    outside that partner can register the name — calling that a confirmed
+    takeover would be a critical-severity false positive.
+
+    So "confirmed" is reserved for SELF_SERVE providers, where re-registering the
+    exact name is the service on offer. ACCOUNT_BOUND targets stay "possible" —
+    the hostname is provider-assigned, and only the provider's domain
+    verification decides whether the domain can be attached elsewhere.
+    NOT_CLAIMABLE targets are not takeover findings at all; they are recorded as
+    stale DNS, because the name can never be issued again.
+
+    An unrecognised provider is "possible", carrying the closest still-existing
+    zone as the evidence an operator needs to judge: a zone of `com` means the
+    whole domain is unregistered and can simply be bought, while
+    `partner-company.example` means only a label is missing inside someone else's
+    live zone.
+
+    This still covers what _check_takeover() structurally cannot see: a host with
+    no A record never reaches the HTTP probe, which is the normal shape of a
+    dangling CNAME. An existing signature-based finding is left in place — it
+    already carries corroborating body evidence.
+    """
+    if status != "nxdomain" or host.takeover:
+        return
+    entry = next(((sig, claim) for sig, (claim, _b) in TAKEOVER_SIGS.items()
+                  if host.cname and sig in host.cname), None)
+    if entry:
+        provider, claim = entry
+        if claim == NOT_CLAIMABLE:
+            # Dead, but nobody can have it. Reporting this as a takeover lead
+            # sends an operator chasing a name the provider will never issue
+            # again; the finding is the stale record itself.
+            host.stale_dns = (f"CNAME -> {host.cname} ({provider}); target no longer exists "
+                              f"(NXDOMAIN). The name is provider-assigned and cannot be "
+                              f"re-created, so this is not a takeover — remove the record")
+            return
+        if claim == ACCOUNT_BOUND:
+            host.takeover = (f"Dangling CNAME -> {host.cname} ({provider}); target name does "
+                             f"not exist (NXDOMAIN). The hostname itself is provider-assigned, "
+                             f"but the domain pointing at it may be attachable to another "
+                             f"account — the provider's domain verification decides it")
+            host.takeover_confidence = "possible"
+            return
+        host.takeover = (f"Dangling CNAME -> {host.cname} ({provider}); target name does "
+                         f"not exist (NXDOMAIN) and the provider allows re-registration "
+                         f"— claimable")
+        host.takeover_confidence = "confirmed"
+        return
+    host.takeover = (f"Dangling CNAME -> {host.cname}; target name does not exist "
+                     f"(NXDOMAIN)"
+                     + (f", closest existing zone is {closest_zone}" if closest_zone else "")
+                     + ". Broken, but claimability is unverified — confirm whether the "
+                       "target is registrable before treating this as a takeover")
+    host.takeover_confidence = "possible"
+
+
+GITHUB_PAGES_SUFFIX = ".github.io"
+
+
+def github_pages_account(cname: str | None) -> str | None:
+    """The GitHub account a Pages CNAME target names, or None if it isn't one.
+
+    Only `<account>.github.io` is a Pages host. Deeper names like
+    `a.b.github.io` are not served by Pages, so there is no account to check and
+    guessing one would produce a claim about the wrong thing.
+    """
+    if not cname:
+        return None
+    norm = cname.lower().rstrip(".")
+    if not norm.endswith(GITHUB_PAGES_SUFFIX):
+        return None
+    label = norm[: -len(GITHUB_PAGES_SUFFIX)]
+    return label if label and "." not in label else None
+
+
+async def resolve_github_pages_claimability(client, host: Host, token=None) -> None:
+    """Decide whether a GitHub Pages takeover lead is actually claimable.
+
+    A Pages site is named after the account that owns it, and claiming a domain
+    that points at one requires owning that account — so the username in the
+    CNAME target settles it. The body signature cannot: GitHub serves the same
+    "Site not found" page whether the account is unregistered or simply has no
+    site published, so a working org's stale DNS looks exactly like a free name.
+
+      * account 404 — the username is unregistered. Anyone can take it and serve
+        content at that hostname: a real, confirmed takeover.
+      * account 200 — the username is taken, so no third party can claim it. The
+        record is stale rather than dangerous, and drops out of the takeover list.
+
+    Any other outcome (rate limit, network failure) leaves the existing finding
+    exactly as it was. A lookup that didn't happen is not evidence in either
+    direction, and quietly downgrading on a 403 would hide real takeovers.
+
+    Note this reasoning is specific to CNAMEs. A domain pointed at the Pages
+    A records names no account at all; lrecon's takeover path is CNAME-keyed and
+    never sees that shape.
+    """
+    account = github_pages_account(host.cname)
+    if not account or not host.takeover:
+        return
+    headers = {"User-Agent": "lrecon", "Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        r = await client.get(f"https://api.github.com/users/{account}",
+                             headers=headers, timeout=15)
+    except Exception:
+        return
+    if r.status_code == 404:
+        host.takeover = (f"Dangling CNAME -> {host.cname} (github.io); GitHub account "
+                         f"'{account}' does not exist — registering the username claims "
+                         f"this hostname")
+        host.takeover_confidence = "confirmed"
+    elif r.status_code == 200:
+        host.stale_dns = (f"CNAME -> {host.cname} (github.io); no Pages site is published, "
+                          f"but the GitHub account '{account}' exists, so no one else can "
+                          f"claim it — not a takeover, remove the record")
+        host.takeover = None
+        host.takeover_confidence = None
+
+
+def _check_takeover(host: Host, body_lower: str, status: int | None = None) -> None:
+    """Match the served body against the provider's unclaimed-service signature.
+
+    A signature match is the finding. A CNAME *into* a takeover-prone provider is
+    not one: every healthy site on GitHub Pages, Fastly, Heroku or S3 has exactly
+    that, and reporting it produced a takeover row for every working host on the
+    target — noise that buries the real leads.
+
+    An error status with no recognised signature is kept as a weak lead, since a
+    provider that has reworded its unclaimed page still errors. A 2xx serving
+    ordinary content is a working site and produces nothing.
+    """
+    if not host.cname:
+        return
+    for cname_sig, (_claim, body_sigs) in TAKEOVER_SIGS.items():
+        if cname_sig not in host.cname:
+            continue
+        if any(bsig in body_lower for bsig in body_sigs):
+            host.takeover = (f"Dangling CNAME -> {host.cname} "
+                             f"({cname_sig}); unclaimed-service signature matched")
+            host.takeover_confidence = "likely"
+        elif status in TAKEOVER_ERROR_STATUSES:
+            host.takeover = (f"CNAME -> {host.cname} ({cname_sig}); provider returned "
+                             f"HTTP {status} with no known unclaimed-service signature "
+                             f"— verify service ownership")
+            host.takeover_confidence = "possible"
+        return
+
+
+# Statuses worth recording for a re-requested archived path: a live app
+# response (200), an auth wall (401/403 — a real endpoint, just gated), or a
+# server error (500 — the code still runs). A 404 means it's genuinely gone.
+_WAYBACK_KEEP_STATUS = (200, 401, 403, 500)
+
+
+async def verify_wayback_paths(client, host: Host, paths, sem) -> None:
+    """Re-request archived paths on a live host now; record the ones that still
+    respond with something other than 404 onto `host.endpoints`. This is the
+    forgotten-admin-panel / old-app find that no passive source surfaces."""
+    if not (host.scheme and host.http_status and paths):
+        return
+    base = f"{host.scheme}://{host.subdomain}"
+
+    async def one(path):
+        async with sem:
+            try:
+                r = await client.get(base + path, timeout=8, follow_redirects=False)
+            except Exception:
+                return
+            if r.status_code in _WAYBACK_KEEP_STATUS:
+                host.endpoints.append({"path": path, "status": r.status_code,
+                                       "source": "wayback"})
+    await asyncio.gather(*(one(p) for p in paths))
+
+
+# Common API-documentation / spec routes worth a direct probe. The spec files
+# (openapi/swagger/api-docs/graphql) are entry points when exposed;
+# robots/sitemap/security.txt are recorded as context, not raised.
+_APIDOC_PATHS = ("/openapi.json", "/swagger.json", "/swagger-ui.html", "/api-docs",
+                 "/v2/api-docs", "/v3/api-docs", "/graphql", "/robots.txt",
+                 "/sitemap.xml", "/.well-known/security.txt")
+_SCRIPT_SRC_RE = re.compile(r"""<script[^>]+src=["']([^"']+)["']""", re.I)
+_JS_MAX_BYTES = 512 * 1024        # a bundle bigger than this is scanned truncated
+
+# Exposed VCS / config artifacts worth a direct probe. Each entry pairs a path
+# with a content validator: a webserver that answers every path with a styled
+# 200 HTML error ("soft 404") would false-positive on status alone, so a hit
+# only counts when the body actually looks like the artifact it claims to be.
+# BBOT-style, but tightly scoped and keyless.
+_VCS_HEAD_RE = re.compile(r"^(?:ref:\s|[0-9a-f]{40}\b)", re.I)
+
+
+def _looks_git_head(b: str) -> bool:
+    return bool(_VCS_HEAD_RE.match(b.lstrip()))
+
+
+def _looks_git_config(b: str) -> bool:
+    return "[core]" in b.lower()
+
+
+def _looks_svn_entries(b: str) -> bool:
+    # Old working-copy format: first line is a format integer or "dir".
+    first = b.lstrip().split("\n", 1)[0].strip()
+    return first.isdigit() or first == "dir"
+
+
+def _looks_hg_requires(b: str) -> bool:
+    toks = {"revlogv1", "dotencode", "store", "fncache", "generaldelta"}
+    return any(t in b.lower() for t in toks)
+
+
+def _looks_env(b: str) -> bool:
+    # A dotenv file is KEY=value lines, not markup. Reject anything HTML-ish.
+    s = b.lstrip()
+    if s[:1] == "<" or "<html" in s[:400].lower():
+        return False
+    for line in s.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        k, sep, _ = line.partition("=")
+        if sep and k.strip().replace("_", "").isalnum():
+            return True
+        return False
+    return False
+
+
+def _looks_ds_store(b: str) -> bool:
+    # Full 8-byte header: 4-byte alignment 0x00000001 followed by the "Bud1"
+    # magic. Requiring both rejects any other binary that merely starts 0x00000001.
+    return b[:8] == "\x00\x00\x00\x01Bud1"
+
+
+_VCS_CONFIG_CHECKS = (
+    ("/.git/HEAD", _looks_git_head),
+    ("/.git/config", _looks_git_config),
+    ("/.svn/entries", _looks_svn_entries),
+    ("/.hg/requires", _looks_hg_requires),
+    ("/.env", _looks_env),
+    ("/.DS_Store", _looks_ds_store),
+)
+
+
+async def probe_vcs_config(client, host: Host, sem) -> None:
+    """Directly request a small fixed set of exposed-VCS/config paths and record
+    only content-validated hits (status 200 AND body matches the artifact shape)
+    as `host.endpoints` with source "vcs-config". Content validation avoids the
+    soft-404 false positives a status-only probe would raise. The recorded paths
+    (`/.git`, `/.svn`, `/.hg`, `/.env`, `/.DS_Store`) are all sensitive, so they
+    auto-flow into entry points via the existing exposed-endpoint block."""
+    if not (host.scheme and host.http_status):
+        return
+    base = f"{host.scheme}://{host.subdomain}"
+    seen = {ep.get("path") for ep in host.endpoints}
+
+    async def probe(path, validator):
+        async with sem:
+            try:
+                r = await client.get(base + path, timeout=8, follow_redirects=False)
+            except Exception:
+                return
+            if r.status_code != 200:
+                return
+            try:
+                ok = validator(r.text[:4096])
+            except Exception:
+                ok = False
+        if ok and path not in seen:
+            host.endpoints.append({"path": path, "status": 200, "source": "vcs-config"})
+
+    await asyncio.gather(*(probe(p, v) for p, v in _VCS_CONFIG_CHECKS))
+
+
+def _same_origin(url: str, host: str) -> bool:
+    netloc = url.split("://", 1)[-1].split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+    return netloc == host.lower()
+
+
+async def discover_endpoints(client, host: Host, sem, js_max: int = 8) -> None:
+    """API-doc probing + same-origin JS secret/endpoint scan on a live host.
+
+    Probes a fixed set of API-doc routes (200 → `host.endpoints`), then fetches
+    the page, pulls its same-origin `<script src>` bundles (bounded), and scans
+    each for secret leads (`host.js_secrets`) and a source-map reference. Only
+    same-origin JS is fetched — a third-party CDN bundle is out of scope and
+    pure noise. All findings are leads to verify, never confirmations.
+    """
+    if not (host.scheme and host.http_status):
+        return
+    base = f"{host.scheme}://{host.subdomain}"
+
+    async def probe_doc(path):
+        async with sem:
+            try:
+                r = await client.get(base + path, timeout=8, follow_redirects=False)
+            except Exception:
+                return
+            if r.status_code == 200:
+                host.endpoints.append({"path": path, "status": 200, "source": "api-doc"})
+    await asyncio.gather(*(probe_doc(p) for p in _APIDOC_PATHS))
+    await probe_vcs_config(client, host, sem)
+
+    try:
+        root = await client.get(base, timeout=10, follow_redirects=True)
+        body = root.text[:200000]
+    except Exception:
+        return
+    host.harvested_hosts |= extract_hostnames(body, root.headers)
+    js_urls, seen = [], set()
+    for src in _SCRIPT_SRC_RE.findall(body):
+        u = urljoin(base + "/", src)
+        if u.startswith(("http://", "https://")) and _same_origin(u, host.subdomain) and u not in seen:
+            seen.add(u)
+            js_urls.append(u)
+
+    async def scan_js(u):
+        async with sem:
+            try:
+                jr = await client.get(u, timeout=8, follow_redirects=True)
+            except Exception:
+                return
+            if jr.status_code != 200:
+                return
+            content = jr.text[:_JS_MAX_BYTES]
+        for f in scan_text(content, u):
+            if f not in host.js_secrets:
+                host.js_secrets.append(f)
+        if "sourceMappingURL=" in content:
+            mref = content.split("sourceMappingURL=", 1)[1].split()[0].strip()
+            mpath = urljoin(u, mref)
+            if _same_origin(mpath, host.subdomain):
+                ep = {"path": "/" + mpath.split("://", 1)[-1].split("/", 1)[-1],
+                      "status": 200, "source": "js-sourcemap"}
+                if ep not in host.endpoints:
+                    host.endpoints.append(ep)
+    await asyncio.gather(*(scan_js(u) for u in js_urls[:js_max]))
+
+
+_SSH_PORTS = (22, 2222)
+
+
+def _ssh_tech(banner: str) -> str | None:
+    """A tech entry from an SSH ident line, so `OpenSSH_8.9p1` feeds
+    confirm_tech_stack() the same way an HTTP fingerprint does."""
+    m = re.search(r"OpenSSH[_/]([0-9][0-9.]*)", banner or "", re.I)
+    if m:
+        return f"OpenSSH:{m.group(1)}"
+    parts = (banner or "").split("-", 2)
+    tok = parts[2].split()[0] if len(parts) > 2 and parts[2].split() else ""
+    return tok or None
+
+
+async def _read_banner(ip, port, timeout: float = 4.0) -> str | None:
+    """First bytes a service volunteers on connect (SSH/SMTP/FTP greet; HTTP
+    stays silent and yields nothing)."""
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(ip, port),
+                                                timeout=timeout)
+        data = await asyncio.wait_for(reader.read(256), timeout=timeout)
+        return data.decode("latin-1", "replace").strip() or None
+    except Exception:
+        return None
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+
+async def grab_banners(host: Host, ports, sem) -> None:
+    """Grab a service banner on each open port: a TLS cert summary on TLS ports,
+    the SSH ident on 22/2222, otherwise the first line the service volunteers.
+    Records onto `host.banners`; an SSH version also lands in `host.tech`."""
+    if not host.ips:
+        return
+    ip = host.ips[0]
+
+    async def one(port):
+        async with sem:
+            if port in TLS_PORTS:
+                cert = await fetch_cert(ip, port)
+                if cert:
+                    exp = (cert.get("not_after") or "")[:10]
+                    banner = (f"TLS cert: CN={cert.get('cn') or '?'}"
+                              f" issuer={cert.get('issuer') or '?'}"
+                              + (f" expires={exp}" if exp else ""))
+                    host.banners.append({"port": port, "service": "tls", "banner": banner})
+                    return
+            line = await _read_banner(ip, port)
+            if not line:
+                return
+            is_ssh = port in _SSH_PORTS or line.startswith("SSH-")
+            host.banners.append({"port": port, "service": "ssh" if is_ssh else "banner",
+                                 "banner": line[:200]})
+            if is_ssh:
+                t = _ssh_tech(line)
+                if t:
+                    host.tech = list(dict.fromkeys((host.tech or []) + [t]))
+    await asyncio.gather(*(one(p) for p in ports))
+
+
+async def tcp_scan(host: Host, ports, sem) -> None:
+    async def probe(ip, port):
+        async with sem:
+            try:
+                _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout=3)
+                w.close()
+                try:
+                    await w.wait_closed()
+                except Exception:
+                    pass
+                return port
+            except Exception:
+                return None
+    if not host.ips:
+        return
+    # Scan every resolved IP, not just the first — a round-robin/multi-homed host
+    # otherwise gets 1/N port coverage reported as if complete. The union of open
+    # ports across all IPs lands on host.ports.
+    results = await asyncio.gather(*(probe(ip, p) for ip in host.ips for p in ports))
+    open_ports = [p for p in results if p]
+    if open_ports:
+        host.ports = sorted(set(host.ports) | set(open_ports))
+
+
