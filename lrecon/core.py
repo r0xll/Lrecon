@@ -916,16 +916,20 @@ async def run(domains, args, keys) -> list:
                     + (f" +{len(barren) - 6} more" if len(barren) > 6 else "") + ")")
 
         # ---- Intel phase: email posture, github, buckets, breach ----
+        # Email posture is an organizational-domain property, so it is keyed on
+        # the registrable root (deduped) — not per seed. Two subdomains of one
+        # root would otherwise each run the check and yield the same org posture
+        # twice. Mirrors the WHOIS / breach / people-enum modules above.
         email = {}
         if not args.passive_only:
-            async def _email(d):
-                return d, await email_security(d, ns, client)
-            for d, e in await _gather_with_progress(
-                    (_email(d) for d in domains), "email posture", use_prog):
-                email[d] = e
+            async def _email(rd):
+                return rd, await email_security(rd, ns, client)
+            for rd, e in await _gather_with_progress(
+                    (_email(rd) for rd in roots), "email posture", use_prog):
+                email[rd] = e
                 g = e.get("grade")
                 if g:
-                    log(f"[+] email {d}: {g} ({len(e.get('issues', []))} issue(s))")
+                    log(f"[+] email {rd}: {g} ({len(e.get('issues', []))} issue(s))")
 
         # ---- DNS records + mail infrastructure ----
         # Raw apex DNS snapshot (A/AAAA/MX/NS/SOA) for the report's DNS
@@ -961,12 +965,12 @@ async def run(domains, args, keys) -> list:
             # Phishing read-out, once both the email posture and the MX
             # infrastructure are known — the gateway is what decides whether
             # lookalike mail is filtered on arrival, and it comes from mail_infra.
-            for d, entry in email.items():
-                entry["phishing_posture"] = phishing_posture(entry, mail_infra.get(d))
+            for rd, entry in email.items():
+                entry["phishing_posture"] = phishing_posture(entry, mail_infra.get(rd))
                 services = ((entry.get("dmarc_vendors") or [])
                             + (entry.get("spf_vendors") or []))
                 if services:
-                    log(f"[i] email services {d}: {', '.join(services)}")
+                    log(f"[i] email services {rd}: {', '.join(services)}")
 
         # ---- DNS zone transfer (AXFR) ----
         # One query per authoritative nameserver, reusing the NS list the DNS

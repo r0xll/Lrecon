@@ -4596,6 +4596,11 @@ def test_write_html_minimal_data_does_not_crash_and_has_attack_surface():
     assert content.startswith("<!doctype html>")
     assert 'id="attacksurface"' in content
     assert "a.target.example" in content
+    # Removable filter chips: a per-table chip container plus the render helper
+    # that builds them with an x-to-remove button.
+    assert 'class="filterchips"' in content
+    assert "function renderFilterChips(" in content
+    assert "chip-x" in content
     # sections with no data must not render at all
     for absent in ("id=\"sources\"", "id=\"takeover\"", "id=\"cforigin\"", "id=\"people\""):
         assert absent not in content
