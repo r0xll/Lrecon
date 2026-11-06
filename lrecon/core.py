@@ -54,6 +54,24 @@ def _scrub(text: str, keys: dict) -> str:
     return out
 
 
+def _email_subject(e: dict) -> str:
+    """The key an email-posture result is stored under.
+
+    A seeded subdomain that publishes nothing of its own (no SPF/DMARC/DKIM/
+    MTA-STS/TLS-RPT) resolves to the organizational root's inherited posture, so
+    those collapse under the root — two subdomains of one org don't duplicate the
+    same result. An apex, or a subdomain carrying its OWN records (e.g. a
+    dedicated sending host), keeps its own key so a distinct sender policy is
+    never hidden."""
+    dom, org = e.get("domain"), e.get("org_domain")
+    if not e.get("is_subdomain"):
+        return dom
+    own = (e.get("spf_domain") == dom                       # its own SPF record
+           or (e.get("dmarc") and not e.get("dmarc_inherited"))  # its own DMARC
+           or e.get("dkim") or e.get("mta_sts") or e.get("tls_rpt"))
+    return dom if own else org
+
+
 async def verify_keys(client, keys: dict, dorking: bool = False) -> None:
     """
     On-boot API key verification — one cheap, non-quota-consuming call per
@@ -916,20 +934,27 @@ async def run(domains, args, keys) -> list:
                     + (f" +{len(barren) - 6} more" if len(barren) > 6 else "") + ")")
 
         # ---- Intel phase: email posture, github, buckets, breach ----
-        # Email posture is an organizational-domain property, so it is keyed on
-        # the registrable root (deduped) — not per seed. Two subdomains of one
-        # root would otherwise each run the check and yield the same org posture
-        # twice. Mirrors the WHOIS / breach / people-enum modules above.
+        # Check each seed (a subdomain can publish its OWN SPF/DMARC/DKIM — e.g.
+        # a dedicated sending host — and that distinct policy must not be hidden),
+        # but collapse the entries that are pure organizational-root fallbacks so
+        # two subdomains of one root don't duplicate the same inherited posture.
+        # _email_subject() decides: a subdomain with nothing of its own keys under
+        # the root; an apex or a subdomain with its own records keys under itself.
         email = {}
         if not args.passive_only:
-            async def _email(rd):
-                return rd, await email_security(rd, ns, client)
-            for rd, e in await _gather_with_progress(
-                    (_email(rd) for rd in roots), "email posture", use_prog):
-                email[rd] = e
+            async def _email(d):
+                return d, await email_security(d, ns, client)
+            for d, e in await _gather_with_progress(
+                    (_email(d) for d in domains), "email posture", use_prog):
+                subj = _email_subject(e)
+                # When a subdomain's root fallback collides with the apex's own
+                # check, keep the apex result (its records, not an inherited view).
+                if subj in email and e.get("is_subdomain") and not email[subj].get("is_subdomain"):
+                    continue
+                email[subj] = e
                 g = e.get("grade")
                 if g:
-                    log(f"[+] email {rd}: {g} ({len(e.get('issues', []))} issue(s))")
+                    log(f"[+] email {d}: {g} ({len(e.get('issues', []))} issue(s))")
 
         # ---- DNS records + mail infrastructure ----
         # Raw apex DNS snapshot (A/AAAA/MX/NS/SOA) for the report's DNS

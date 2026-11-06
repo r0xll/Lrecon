@@ -7774,3 +7774,30 @@ async def test_scrape_site_emails_scope_widens_to_root(monkeypatch):
     got = await people.scrape_site_emails(_C(), "pen-test.quantum-staging.caseiq.example",
                                           [host], scope="caseiq.example")
     assert "security@caseiq.example" in got
+
+
+# --------------------------------------------------------------------------- #
+# Email posture dedup: collapse root fallbacks, keep a subdomain's own records
+# --------------------------------------------------------------------------- #
+def test_email_subject_collapses_root_fallback_but_keeps_own_records():
+    es = core._email_subject
+    # Apex keys under itself.
+    assert es({"domain": "acme.example", "org_domain": "acme.example",
+               "is_subdomain": False}) == "acme.example"
+    # Subdomain with NOTHING of its own -> inherited root posture -> keys by root
+    # (so two such subdomains of one org collapse to one entry).
+    fallback = {"domain": "a.acme.example", "org_domain": "acme.example",
+                "is_subdomain": True, "spf_domain": "acme.example", "spf": "v=spf1 -all",
+                "dmarc": "v=DMARC1; p=reject", "dmarc_inherited": True,
+                "dkim": False, "mta_sts": None, "tls_rpt": None}
+    assert es(fallback) == "acme.example"
+    assert es({**fallback, "domain": "b.acme.example"}) == "acme.example"   # dedups
+    # Subdomain with its OWN SPF -> distinct policy -> keeps its own key.
+    own_spf = {**fallback, "domain": "mail.acme.example", "spf_domain": "mail.acme.example"}
+    assert es(own_spf) == "mail.acme.example"
+    # Subdomain with its OWN DMARC (not inherited) -> its own key.
+    own_dmarc = {**fallback, "domain": "mail.acme.example", "dmarc_inherited": False}
+    assert es(own_dmarc) == "mail.acme.example"
+    # Subdomain with its own DKIM / MTA-STS -> its own key.
+    assert es({**fallback, "domain": "m.acme.example", "dkim": True}) == "m.acme.example"
+    assert es({**fallback, "domain": "m.acme.example", "mta_sts": "v=STSv1; id=x"}) == "m.acme.example"
