@@ -1277,6 +1277,7 @@ def _html_filter_toolbar(table_id: str) -> str:
         f'</div>'
         f'<div class="filterbar"><span class="filtercount" '
         f'data-for="{table_id}"></span>'
+        f'<span class="filterchips" data-for="{table_id}"></span>'
         f'<button class="export-btn" type="button" '
         f'onclick="resetFilters(\'{table_id}\')">Reset filters</button></div>')
 
@@ -2285,8 +2286,15 @@ th, td {{ border: 1px solid #ddd; padding: 4px 8px; text-align: left; vertical-a
 th {{ background: #f4f4f4; position: sticky; top: 0; }}
 code {{ background: #f0f0f0; padding: 1px 4px; border-radius: 3px; }}
 tr:nth-child(even) {{ background: #fafafa; }}
-.filterbar {{ display: flex; align-items: center; gap: .6rem; margin-bottom: .5rem; }}
+.filterbar {{ display: flex; align-items: center; flex-wrap: wrap; gap: .6rem; margin-bottom: .5rem; }}
 .filtercount {{ font-size: .8rem; color: #666; }}
+.filterchips {{ display: flex; flex-wrap: wrap; gap: .35rem; }}
+.chip {{ display: inline-flex; align-items: center; gap: .3rem; font-size: .76rem;
+         background: #eef1f5; border: 1px solid #d0d7de; border-radius: 10px;
+         padding: 1px 6px; color: #222; }}
+.chip-x {{ border: 0; background: transparent; cursor: pointer; font: inherit;
+           line-height: 1; padding: 0; color: #888; }}
+.chip-x:hover {{ color: #b31b1b; }}
 /* Sits above the boxes it describes — the old note was below the table, which
    is not where anyone looks before typing into a filter at the top. */
 .filterhint {{ font-size: .78rem; line-height: 1.5; color: #555; background: #f7f7f7;
@@ -2349,6 +2357,9 @@ pre.handoff {{ background: #f0f0f0; padding: .6rem .8rem; border-radius: 4px; ov
   tr.filter-row {{ background: #23262c !important; }}
   .filter-input {{ background: #16181c; border-color: #555; color: #e6e6e6; }}
   .filter-input:focus {{ outline-color: #ff8a80; }}
+  .chip {{ background: #23262c; border-color: #3a3d44; color: #e6e6e6; }}
+  .chip-x {{ color: #999; }}
+  .chip-x:hover {{ color: #ff8a80; }}
   .note {{ color: #aaa; }}
   .bad {{ color: #ff8a80; }}
   .warn {{ color: #ffb74d; }}
@@ -2459,6 +2470,33 @@ function applyFilters(table) {{
       ? ('showing all ' + body.length + ' row(s)')
       : ('showing ' + shown + ' of ' + body.length + ' row(s) — filtered');
   }}
+  renderFilterChips(table, inputs);
+}}
+// One removable chip per active column filter. The chips mirror the column
+// boxes (the filter engine is unchanged — several columns still AND together);
+// each chip's x clears just that column and re-applies, so multiple filters can
+// be dropped one at a time without hunting for the box.
+function renderFilterChips(table, inputs) {{
+  var bar = document.querySelector('.filterchips[data-for="' + table.id + '"]');
+  if (!bar) return;
+  bar.textContent = '';
+  inputs.forEach(function(input) {{
+    if (!input.value.trim()) return;
+    var label = input.getAttribute('placeholder') || 'filter';
+    var chip = document.createElement('span');
+    chip.className = 'chip';
+    var txt = document.createElement('span');
+    txt.className = 'chip-label';
+    txt.textContent = label + ': ' + input.value.trim();
+    var x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'chip-x';
+    x.setAttribute('aria-label', 'Remove filter ' + label);
+    x.textContent = '\\u2715';
+    x.addEventListener('click', function() {{ input.value = ''; applyFilters(table); }});
+    chip.appendChild(txt); chip.appendChild(x);
+    bar.appendChild(chip);
+  }});
 }}
 function resetFilters(tableId) {{
   var table = document.getElementById(tableId);
